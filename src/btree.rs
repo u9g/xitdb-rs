@@ -2,7 +2,7 @@
 
 use crate::core::Core;
 use crate::database::Database;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::format::*;
 #[allow(unused_imports)]
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
@@ -327,8 +327,9 @@ impl<C: Core> Database<C> {
         crate::btree_io::btree_write_node(&mut DbStore::new(self), node, old_ptr, limit)
     }
 
+    // verified in btree_join.rs
     pub(crate) fn btree_new_root(&self) -> Result<i64> {
-        self.write_btree_node(&BTreeNode::empty(BTreeNodeKind::Leaf, 0))
+        crate::btree_join::btree_new_root(&mut DbStore::new(self))
     }
 
     // descend to the value slot at the given rank (0-based), returning a
@@ -364,171 +365,20 @@ impl<C: Core> Database<C> {
         crate::btree_io::btree_remove(&mut DbStore::new(self), node_ptr, rank, limit)
     }
 
-    // height of a tree = number of branch levels above the leaves
-    fn btree_height(&self, root_ptr: i64) -> Result<usize> {
-        let mut ptr = root_ptr;
-        let mut height = 0;
-        loop {
-            let node = self.read_btree_node(ptr)?;
-            if node.kind == BTreeNodeKind::Leaf {
-                return Ok(height);
-            }
-            height += 1;
-            ptr = node.children[0].value;
-        }
-    }
-
     // turns a join result into a root pointer, growing the tree a level if
-    // the old root split
+    // the old root split. verified in btree_join.rs
     pub(crate) fn btree_make_root(&self, result: JoinResult) -> Result<i64> {
-        match result.split {
-            Some(split) => {
-                let root = branch(
-                    &[index_slot(result.node_ptr), index_slot(split.node_ptr)],
-                    &[result.count, split.count],
-                );
-                self.write_btree_node(&root)
-            }
-            None => Ok(result.node_ptr),
-        }
+        crate::btree_join::btree_make_root(&mut DbStore::new(self), result)
     }
 
-    // write `vals` as one leaf, or split into two balanced leaves if it
-    // exceeds the node capacity
-    fn btree_assemble_leaf(&self, vals: &[Slot]) -> Result<JoinResult> {
-        let total = vals.len();
-        if total <= BTREE_SLOT_COUNT {
-            let ptr = self.write_btree_node(&leaf(vals))?;
-            return Ok(JoinResult { node_ptr: ptr, count: total as i64, split: None });
-        }
-        let left_n = total / 2;
-        let left_ptr = self.write_btree_node(&leaf(&vals[..left_n]))?;
-        let right_ptr = self.write_btree_node(&leaf(&vals[left_n..]))?;
-        Ok(JoinResult {
-            node_ptr: left_ptr,
-            count: left_n as i64,
-            split: Some(NodeRef { node_ptr: right_ptr, count: (total - left_n) as i64 }),
-        })
-    }
-
-    // write `children`/`counts` as one branch, or split into two balanced branches
-    fn btree_assemble_branch(&self, children: &[Slot], counts: &[i64]) -> Result<JoinResult> {
-        let total = children.len();
-        if total <= BTREE_SLOT_COUNT {
-            let node = branch(children, counts);
-            let ptr = self.write_btree_node(&node)?;
-            return Ok(JoinResult { node_ptr: ptr, count: node.subtree_count(), split: None });
-        }
-        let left_n = total / 2;
-        let left = branch(&children[..left_n], &counts[..left_n]);
-        let right = branch(&children[left_n..], &counts[left_n..]);
-        let left_ptr = self.write_btree_node(&left)?;
-        let right_ptr = self.write_btree_node(&right)?;
-        Ok(JoinResult {
-            node_ptr: left_ptr,
-            count: left.subtree_count(),
-            split: Some(NodeRef { node_ptr: right_ptr, count: right.subtree_count() }),
-        })
-    }
-
-    // merge two nodes of equal height (a precedes b) into one or two nodes
-    fn btree_merge_nodes(&self, a: &BTreeNode, b: &BTreeNode) -> Result<JoinResult> {
-        if a.kind == BTreeNodeKind::Leaf {
-            let vals = [&a.values[..a.num], &b.values[..b.num]].concat();
-            return self.btree_assemble_leaf(&vals);
-        }
-        let children = [&a.children[..a.num], &b.children[..b.num]].concat();
-        let counts = [&a.counts[..a.num], &b.counts[..b.num]].concat();
-        self.btree_assemble_branch(&children, &counts)
-    }
-
-    // join b (shorter) into the rightmost spine of a (taller), at height hb
-    fn btree_join_right(&self, a_ptr: i64, ha: usize, b_ptr: i64, hb: usize) -> Result<JoinResult> {
-        let a = self.read_btree_node(a_ptr)?;
-        let last = a.num.checked_sub(1).ok_or(Error::InvalidBTreeNode)?;
-        let sub = if ha - 1 == hb {
-            let last_child = self.read_btree_node(a.children[last].value)?;
-            let b = self.read_btree_node(b_ptr)?;
-            self.btree_merge_nodes(&last_child, &b)?
-        } else {
-            self.btree_join_right(a.children[last].value, ha - 1, b_ptr, hb)?
-        };
-
-        let mut children = a.children[..a.num].to_vec();
-        let mut counts = a.counts[..a.num].to_vec();
-        children[last] = index_slot(sub.node_ptr);
-        counts[last] = sub.count;
-        if let Some(split) = sub.split {
-            children.push(index_slot(split.node_ptr));
-            counts.push(split.count);
-        }
-        self.btree_assemble_branch(&children, &counts)
-    }
-
-    // join a (shorter) into the leftmost spine of b (taller), at height ha
-    fn btree_join_left(&self, a_ptr: i64, ha: usize, b_ptr: i64, hb: usize) -> Result<JoinResult> {
-        let b = self.read_btree_node(b_ptr)?;
-        let sub = if hb - 1 == ha {
-            let a = self.read_btree_node(a_ptr)?;
-            let first_child = self.read_btree_node(b.children[0].value)?;
-            self.btree_merge_nodes(&a, &first_child)?
-        } else {
-            self.btree_join_left(a_ptr, ha, b.children[0].value, hb - 1)?
-        };
-
-        let mut children = vec![index_slot(sub.node_ptr)];
-        let mut counts = vec![sub.count];
-        if let Some(split) = sub.split {
-            children.push(index_slot(split.node_ptr));
-            counts.push(split.count);
-        }
-        children.extend_from_slice(&b.children[1..b.num]);
-        counts.extend_from_slice(&b.counts[1..b.num]);
-        self.btree_assemble_branch(&children, &counts)
-    }
-
+    // verified in btree_join.rs
     pub(crate) fn btree_join(&self, root_a: i64, root_b: i64) -> Result<i64> {
-        let ha = self.btree_height(root_a)?;
-        let hb = self.btree_height(root_b)?;
-        let result = if ha == hb {
-            let a = self.read_btree_node(root_a)?;
-            let b = self.read_btree_node(root_b)?;
-            self.btree_merge_nodes(&a, &b)?
-        } else if ha > hb {
-            self.btree_join_right(root_a, ha, root_b, hb)?
-        } else {
-            self.btree_join_left(root_a, ha, root_b, hb)?
-        };
-        self.btree_make_root(result)
-    }
-
-    // build a tree from a run of sibling children (already height-h-1
-    // subtrees): empty -> a new empty leaf, one -> that child unwrapped,
-    // many -> a branch
-    fn btree_subtree(&self, children: &[Slot], counts: &[i64]) -> Result<i64> {
-        match children.len() {
-            0 => self.btree_new_root(),
-            1 => Ok(children[0].value),
-            _ => Ok(self.btree_assemble_branch(children, counts)?.node_ptr),
-        }
+        crate::btree_join::btree_join(&mut DbStore::new(self), root_a, root_b)
     }
 
     /// Splits the tree at `rank`, returning the roots of the left and
-    /// right parts.
+    /// right parts. verified in btree_join.rs
     pub(crate) fn btree_split(&self, root_ptr: i64, rank: i64) -> Result<(i64, i64)> {
-        let node = self.read_btree_node(root_ptr)?;
-        if node.kind == BTreeNodeKind::Leaf {
-            let r = check_rank(rank, node.num, true)?;
-            let left_ptr = self.write_btree_node(&leaf(&node.values[..r]))?;
-            let right_ptr = self.write_btree_node(&leaf(&node.values[r..node.num]))?;
-            return Ok((left_ptr, right_ptr));
-        }
-        let (i, rem) = child_for_rank(&node, rank, true);
-        let (child_left, child_right) = self.btree_split(node.children[i].value, rem)?;
-        let left_sub = self.btree_subtree(&node.children[..i], &node.counts[..i])?;
-        let right_sub = self.btree_subtree(&node.children[i + 1..node.num], &node.counts[i + 1..node.num])?;
-        let joined_left = self.btree_join(left_sub, child_left)?;
-        let joined_right = self.btree_join(child_right, right_sub)?;
-        Ok((joined_left, joined_right))
+        crate::btree_join::btree_split(&mut DbStore::new(self), root_ptr, rank)
     }
 }
