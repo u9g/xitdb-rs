@@ -45,3 +45,6 @@ tempfile = "3"
 [[example]]
 name = "ts_replication"
 required-features = ["serde"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_keep_ghost)"] }

@@ -26,7 +26,7 @@ pub open spec fn u64_be_spec(x: u64) -> Seq<u8> {
     ]
 }
 
-proof fn lemma_u64_bytes(x: u64)
+pub proof fn lemma_u64_bytes(x: u64)
     by (bit_vector)
     ensures
         ((((x >> 56u64) as u8) as u64) << 56u64) | ((((x >> 48u64) as u8) as u64) << 48u64) | ((((x
@@ -36,7 +36,7 @@ proof fn lemma_u64_bytes(x: u64)
 {
 }
 
-proof fn lemma_bytes_u64(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8)
+pub proof fn lemma_bytes_u64(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8)
     by (bit_vector)
     ensures
         ({
@@ -86,14 +86,14 @@ pub open spec fn u2i(x: u64) -> i64 {
     (x as i64)
 }
 
-proof fn lemma_i2u_bv(x: i64)
+pub proof fn lemma_i2u_bv(x: i64)
     by (bit_vector)
     ensures
         (#[verifier::truncate] ((#[verifier::truncate] (x as u64)) as i64)) == x,
 {
 }
 
-proof fn lemma_u2i_bv(x: u64)
+pub proof fn lemma_u2i_bv(x: u64)
     by (bit_vector)
     ensures
         (#[verifier::truncate] ((#[verifier::truncate] (x as i64)) as u64)) == x,
@@ -145,14 +145,14 @@ pub open spec fn u16_be_spec(x: u16) -> Seq<u8> {
     seq![(x >> 8u16) as u8, x as u8]
 }
 
-proof fn lemma_u16_bytes(x: u16)
+pub proof fn lemma_u16_bytes(x: u16)
     by (bit_vector)
     ensures
         ((((x >> 8u16) as u8) as u16) << 8u16) | ((x as u8) as u16) == x,
 {
 }
 
-proof fn lemma_bytes_u16(b0: u8, b1: u8)
+pub proof fn lemma_bytes_u16(b0: u8, b1: u8)
     by (bit_vector)
     ensures
         ((((b0 as u16) << 8u16) | (b1 as u16)) >> 8u16) as u8 == b0,
@@ -168,7 +168,7 @@ pub open spec fn u32_be_spec(x: u32) -> Seq<u8> {
     seq![(x >> 24u32) as u8, (x >> 16u32) as u8, (x >> 8u32) as u8, x as u8]
 }
 
-proof fn lemma_u32_bytes(x: u32)
+pub proof fn lemma_u32_bytes(x: u32)
     by (bit_vector)
     ensures
         ((((x >> 24u32) as u8) as u32) << 24u32) | ((((x >> 16u32) as u8) as u32) << 16u32) | ((((x
@@ -176,7 +176,7 @@ proof fn lemma_u32_bytes(x: u32)
 {
 }
 
-proof fn lemma_bytes_u32(b0: u8, b1: u8, b2: u8, b3: u8)
+pub proof fn lemma_bytes_u32(b0: u8, b1: u8, b2: u8, b3: u8)
     by (bit_vector)
     ensures
         ({

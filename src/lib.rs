@@ -56,6 +56,7 @@ mod bulk;
 mod collections;
 mod compact;
 mod core;
+mod arith;
 mod bytes;
 mod crc64;
 mod cursor;
