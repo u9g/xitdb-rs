@@ -6,7 +6,7 @@ use crate::core::{Core, DynCore};
 #[cfg(feature = "sha1")]
 use crate::core::{CoreBufferedFile, CoreMemory};
 use crate::cursor::WriteCursor;
-use crate::data::Data;
+use crate::data::{Data, Encoded};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::hasher::Hasher;
@@ -1300,21 +1300,9 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let mut slot = match data {
-                    Data::None => Slot::default(),
-                    Data::Slot(slot) => *slot,
-                    Data::Uint(value) => Slot::new(*value as i64, Tag::Uint),
-                    Data::Int(value) => Slot::new(*value, Tag::Int),
-                    Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
-                    Data::Bytes(bytes) if bytes.is_short() => {
-                        let mut buf = [0u8; 8];
-                        buf[..bytes.value.len()].copy_from_slice(&bytes.value);
-                        if let Some(format_tag) = bytes.format_tag {
-                            buf[6..].copy_from_slice(&format_tag);
-                        }
-                        Slot::new(i64::from_be_bytes(buf), Tag::ShortBytes).with_full(bytes.format_tag.is_some())
-                    }
-                    Data::Bytes(bytes) => {
+                let slot = match data.encode() {
+                    Encoded::Inline(slot) => slot,
+                    Encoded::Long(bytes) => {
                         let mut cursor = WriteCursor::new(slot_ptr, self);
                         let mut writer = cursor.writer()?;
                         writer.format_tag = bytes.format_tag;
@@ -1323,9 +1311,6 @@ impl<C: Core> Database<C> {
                         writer.slot
                     }
                 };
-                if slot.tag == Tag::None {
-                    slot = slot.with_full(true);
-                }
                 self.write_slot_at(position, slot)?;
                 next(SlotPointer::new(slot_ptr.position, slot), ctx)
             }

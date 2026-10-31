@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::slot::Slot;
+use crate::slot::{Slot, Tag};
 
 /// A byte array, optionally with a 2-byte format tag that tells readers
 /// how to interpret it (for example `b"bi"` for a big integer).
@@ -62,6 +62,36 @@ impl<'a> Data<'a> {
     pub fn tagged_string(value: &'a str, format_tag: [u8; 2]) -> Data<'a> {
         Data::Bytes(Bytes::tagged(value.as_bytes(), format_tag))
     }
+
+    /// How writing this stores it. An empty slot is marked as written, so
+    /// it isn't treated as empty.
+    pub(crate) fn encode(&self) -> Encoded<'_, 'a> {
+        let slot = match self {
+            Data::None => Slot::default(),
+            Data::Slot(slot) => *slot,
+            Data::Uint(value) => Slot::new(*value as i64, Tag::Uint),
+            Data::Int(value) => Slot::new(*value, Tag::Int),
+            Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
+            Data::Bytes(bytes) if bytes.is_short() => {
+                let mut buf = [0u8; 8];
+                buf[..bytes.value.len()].copy_from_slice(&bytes.value);
+                if let Some(format_tag) = bytes.format_tag {
+                    buf[6..].copy_from_slice(&format_tag);
+                }
+                Slot::new(i64::from_be_bytes(buf), Tag::ShortBytes).with_full(bytes.format_tag.is_some())
+            }
+            Data::Bytes(bytes) => return Encoded::Long(bytes),
+        };
+        Encoded::Inline(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
+    }
+}
+
+/// How [`Data`] is stored, as [`Data::encode`] returns it.
+pub(crate) enum Encoded<'s, 'a> {
+    /// In the slot itself.
+    Inline(Slot),
+    /// A byte array too long for a slot, which is stored elsewhere.
+    Long(&'s Bytes<'a>),
 }
 
 impl From<Slot> for Data<'_> {

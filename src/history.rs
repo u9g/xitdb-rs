@@ -148,7 +148,8 @@ impl<'a, C: Core> History<'a, C> {
     /// when `f` makes no writes, but not in general. Most writes count as a
     /// change even if they leave the same contents, because they copy what
     /// they write to: putting a value that's already there usually commits
-    /// a new moment, so compare before writing to avoid that. A write
+    /// a new moment, so use [`WriteHashMap::put_if_changed`] or
+    /// [`WriteHashMap::put_path_if_changed`], which write nothing then. A write
     /// that's undone before `f` returns, such as a put followed by a remove
     /// of the same key, can leave the top level identical, and then counts
     /// as unchanged.
