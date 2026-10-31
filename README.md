@@ -19,7 +19,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * Incrementally reads and writes, so file-based databases can contain larger-than-memory datasets.
 * Reads never block writes, and a database can be read from multiple threads/processes without locks.
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
-* Dependencies: `getrandom` (for file and commit IDs) and, behind the default `sha1` feature, `sha1`.
+* Dependencies: `getrandom` (for file and commit IDs) and, behind the default `sha1` feature, `sha1`. The optional `serde` feature adds `serde` and `serde_json`.
 
 * [Example](#example)
 * [Initializing a Database](#initializing-a-database)
@@ -29,6 +29,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Large Byte Arrays](#large-byte-arrays)
 * [Iterators](#iterators)
 * [Accessors](#accessors)
+* [Typed Collections](#typed-collections)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
 * [Replication](#replication)
@@ -618,6 +619,72 @@ fn main() -> xitdb::Result<()> {
     Ok(())
 }
 ```
+
+## Typed Collections
+
+When the same collections are used all over an app, naming them and converting their keys and values by hand gets repetitive. A `Map<K, V>` or `Set<K>` declares a collection once, as a `const`, with its name in the parent map and its types. Each method takes the parent: reads take a `&ReadHashMap` (a moment, or any nested map; a `WriteHashMap` dereferences to one), and writes take a `&mut WriteHashMap`.
+
+* A missing collection reads as empty: `get` returns `None`, `contains` returns `false`, and `iter` yields nothing. Writes create it with `put_map`/`put_set`, so they run inside a transaction like those. `remove`, and `Set::insert` of a key that's already there, write nothing.
+* Like the typed getters, an empty value (`Data::None`) reads as a missing key, for `get`, `contains`, `remove` and `iter` alike.
+* `iter` yields owned `(key, value)` pairs (or keys, for a set) as `Result`s.
+* A value that doesn't decode is an `Error::Decode`, with the collection's name, the key and what was wrong, rather than being skipped. So is anything under the name that isn't the right kind of collection, for reads and writes alike. I/O errors stay `Error::Io`.
+* The data is a plain hash map or set under the name, so untyped code and the other implementations read and write the same collections.
+
+Keys are converted by a `KeyCodec`, implemented for `str`, `String`, `[u8]`, `Vec<u8>` and the integer types (big-endian at the type's full width). Values are converted by a `ValueCodec`, which reads from a `ReadCursor` and writes through a `WriteCursor`, so a value can be a nested structure. It's implemented for `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` (stored as the `Uint` `0` or `1`), and `Option<T>` (with `None` stored as an empty value). With the `serde` feature, `Json<T>` stores any serde type as JSON, tagged `js`; it also reads untagged JSON strings, so `Map<str, Json<Proposal>>` reads collections written with `serde_json::to_string`.
+
+```rust
+use xitdb::*;
+
+const NAMES: Map<u64, String> = Map::new("names");
+const SCORES: Map<str, i64> = Map::new("scores");
+const STARTED: Set<str> = Set::new("started");
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+
+    // a missing collection reads as empty
+    assert_eq!(NAMES.get(&history.latest()?, &1)?, None);
+
+    history.transact(|moment| {
+        NAMES.put(moment, &1, "alice")?;
+        NAMES.put(moment, &2, "bob")?;
+        SCORES.put(moment, "alice", &10)?;
+        STARTED.insert(moment, "alice")?;
+
+        // definitions work on nested maps too
+        let mut lobby = moment.put_map("rooms")?.put_map("lobby")?;
+        STARTED.insert(&mut lobby, "bob")?;
+        Ok::<_, xitdb::Error>(())
+    })?;
+
+    let moment = history.latest()?;
+    assert_eq!(NAMES.get(&moment, &1)?.as_deref(), Some("alice"));
+    assert_eq!(SCORES.get(&moment, "alice")?, Some(10));
+    assert!(STARTED.contains(&moment, "alice")?);
+    assert!(!STARTED.contains(&moment, "bob")?);
+
+    let mut names = Vec::new();
+    for entry in NAMES.iter(&moment)? {
+        let (id, name) = entry?;
+        names.push((id, name));
+    }
+    names.sort();
+    assert_eq!(names, [(1, "alice".to_string()), (2, "bob".to_string())]);
+
+    let lobby = moment.get_map("rooms")?.unwrap().get_map("lobby")?.unwrap();
+    assert!(STARTED.contains(&lobby, "bob")?);
+
+    // a value of the wrong type is an error, not a silent None
+    history.transact(|moment| moment.put_map("scores")?.put("bob", "ten"))?;
+    let err = SCORES.get(&history.latest()?, "bob").unwrap_err();
+    assert!(matches!(err, Error::Decode(_)));
+    assert_eq!(err.to_string(), r#"couldn't decode "scores" at key "bob": expected an integer, found ShortBytes"#);
+    Ok(())
+}
+```
+
+Values can't be typed collections themselves. To keep one collection per key, like the rooms above, open the nested map with `put_map` and `get_map` (or a `Map`'s `collection_mut` and `collection`) and use the definitions on it.
 
 ## Hashing
 
