@@ -4,7 +4,7 @@
 //!
 //! None of them changes a committed byte other than the root header
 //! ([`tx_hdr_ok`]): they write new data at the end of the file, headers and
-//! slots from `limit` on (the crate's `max(tx_start, frozen_at)`), and the
+//! slots from `limit` on (where the transaction started), and the
 //! slot that points at the collection, which is either from `limit` on or
 //! the root slot in the root header. Sizes read from a corrupt file fail
 //! with an error instead of overflowing.
@@ -34,6 +34,23 @@ pub open spec fn tx_hdr_ok(f: Seq<u8>, g: Seq<u8>, limit: int) -> bool {
 /// A position that may be written: from `limit` on, or the root slot.
 pub open spec fn writable(pos: int, limit: int, len: int) -> bool {
     pos >= limit || (pos == ROOT_HEADER_START && ROOT_HEADER_END <= len)
+}
+
+/// Checks `writable` at run time, with `limit` within the file.
+pub fn check_writable<S: Store>(s: &mut S, position: i64, limit: i64) -> (r: Result<()>)
+    ensures
+        final(s).file() == old(s).file(),
+        r is Ok ==> 0 <= limit <= old(s).file().len() && writable(position as int, limit as int, old(s).file().len() as int),
+{
+    let len = s.len()?;
+    if limit < 0 || limit > len {
+        return Err(Error::InvalidOffset);
+    }
+    if position >= limit || (position == ROOT_HEADER_START && ROOT_HEADER_END <= len) {
+        Ok(())
+    } else {
+        Err(Error::InvalidOffset)
+    }
 }
 
 pub proof fn lemma_kept_hdr(f: Seq<u8>, g: Seq<u8>, limit: int)
@@ -130,7 +147,7 @@ pub fn append_tx<S: Store>(s: &mut S, data: &[u8], limit: i64) -> (r: Result<i64
     Ok(p)
 }
 
-fn read_array_list_header<S: Store>(s: &mut S, pos: i64) -> (r: Result<ArrayListHeader>)
+pub fn read_array_list_header<S: Store>(s: &mut S, pos: i64) -> (r: Result<ArrayListHeader>)
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> r.unwrap().size >= 0 && r.unwrap().ptr >= 0,
@@ -153,15 +170,16 @@ pub fn read_btree_header<S: Store>(s: &mut S, pos: i64) -> (r: Result<BTreeHeade
 
 /// `ArrayListInit`: creates an empty array list, or copies a committed one
 /// into this transaction, and points the slot at `position` at it.
-pub fn array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
+pub fn array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> final(s).file().len() >= old(s).file().len(),
         r is Ok ==> r.unwrap().slot.value >= limit,
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_writable(s, position, limit)?;
     let ghost f0 = s.file();
     let array_list_start = match slot.tag {
         Tag::None => {
@@ -182,7 +200,7 @@ pub fn array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i6
         Tag::ArrayList => {
             let mut start = slot.value;
             // copy it to the end unless it was made in this transaction
-            if start < limit {
+            if start < copy_at {
                 let header = read_array_list_header(s, start)?;
                 let mut block = [0u8; INDEX_BLOCK_SIZE];
                 s.read_at(header.ptr, &mut block)?;
@@ -218,8 +236,9 @@ pub fn array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i6
 }
 
 /// `copy_header_if_old`: a committed b-tree header, copied to the end.
-pub fn copy_header_if_old<S: Store>(s: &mut S, header_ptr: i64, limit: i64) -> (r: Result<i64>)
+pub fn copy_header_if_old<S: Store>(s: &mut S, header_ptr: i64, limit: i64, copy_at: i64) -> (r: Result<i64>)
     requires
+        limit <= copy_at,
         0 <= limit <= old(s).file().len(),
     ensures
         r is Ok ==> r.unwrap() >= limit || r.unwrap() == header_ptr,
@@ -227,7 +246,7 @@ pub fn copy_header_if_old<S: Store>(s: &mut S, header_ptr: i64, limit: i64) -> (
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> final(s).file().len() >= old(s).file().len(),
 {
-    if header_ptr >= limit {
+    if header_ptr >= copy_at {
         proof {
             lemma_hdr_refl(s.file(), limit as int);
         }
@@ -241,14 +260,15 @@ pub fn copy_header_if_old<S: Store>(s: &mut S, header_ptr: i64, limit: i64) -> (
 /// `LinkedArrayListInit`: creates an empty linked array list, or copies a
 /// committed header into this transaction, and points the slot at
 /// `position` at it.
-pub fn linked_array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
+pub fn linked_array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> final(s).file().len() >= old(s).file().len(),
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_writable(s, position, limit)?;
     let ghost f0 = s.file();
     let header_ptr = match slot.tag {
         Tag::None => {
@@ -264,7 +284,7 @@ pub fn linked_array_list_init<S: Store>(s: &mut S, position: i64, slot: Slot, li
             }
             p
         },
-        Tag::LinkedArrayList => copy_header_if_old(s, slot.value, limit)?,
+        Tag::LinkedArrayList => copy_header_if_old(s, slot.value, limit, copy_at)?,
         _ => return Err(Error::UnexpectedTag),
     };
     let ghost f2 = s.file();
@@ -314,17 +334,18 @@ fn write_header<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, limit
 
 /// `LinkedArrayListGet` in write mode: the value slot, with the nodes on the
 /// way copied, and the header updated if the root moved.
-pub fn linked_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
+pub fn linked_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().position is Some && r.unwrap().position.unwrap() >= limit,
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_limit(s, limit, header_ptr)?;
     let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let write_slot = btree_get_for_write(s, header.root_ptr, rank, Some(limit), fuel)?;
+    let write_slot = btree_get_for_write(s, header.root_ptr, rank, Some(limit), copy_at, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -341,21 +362,22 @@ pub fn linked_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeH
 
 /// `LinkedArrayListAppend` and `LinkedArrayListInsert`: a placeholder
 /// inserted at `rank`, the header updated, and the slot to fill in.
-pub fn linked_insert<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
+pub fn linked_insert<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().position is Some && r.unwrap().position.unwrap() >= limit,
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_limit(s, limit, header_ptr)?;
     let size = match header.size.checked_add(1) {
         Some(n) => n,
         None => return Err(Error::InvalidDatabase),
     };
     let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let result = btree_insert(s, header.root_ptr, rank, Some(limit), fuel)?;
+    let result = btree_insert(s, header.root_ptr, rank, Some(limit), copy_at, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -377,12 +399,10 @@ pub fn linked_insert<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
 
 /// `LinkedArrayListSlice`: the items `offset..offset + size`.
 pub fn linked_slice<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, offset: i64, size: i64, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_limit(s, limit, header_ptr)?;
     // bounds-checked without overflow (offset + size could wrap)
     if offset < 0 || size < 0 || offset > header.size || size > header.size - offset {
         return Err(Error::KeyNotFound);
@@ -409,12 +429,10 @@ pub fn linked_slice<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, o
 /// `LinkedArrayListConcat`, after the caller freezes everything written so
 /// far: the join of two lists' trees.
 pub fn linked_concat<S: Store>(s: &mut S, header_ptr: i64, header_a: BTreeHeader, header_b: BTreeHeader, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_limit(s, limit, header_ptr)?;
     let size = match header_a.size.checked_add(header_b.size) {
         Some(n) => n,
         None => return Err(Error::InvalidDatabase),
@@ -434,14 +452,17 @@ pub fn linked_concat<S: Store>(s: &mut S, header_ptr: i64, header_a: BTreeHeader
 
 /// `LinkedArrayListRemove`: the item at `rank` removed. A list of one item
 /// gets a new empty root, and a root left with one child is replaced by it.
-pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
-        header.size >= 0,
+pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64, copy_at: i64) -> (r: Result<()>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_limit(s, limit, header_ptr)?;
+    if header.size < 0 {
+        return Err(Error::InvalidDatabase);
+    }
     if header.size == 0 {
         return Err(Error::KeyNotFound);
     }
@@ -454,12 +475,12 @@ pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
         p
     } else {
         let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
-        let mut root = btree_remove(s, header.root_ptr, rank, Some(limit), fuel)?;
+        let mut root = btree_remove(s, header.root_ptr, rank, Some(limit), copy_at, fuel)?;
         let ghost f1 = s.file();
         proof {
             lemma_tx_hdr(f0, f1, Some(limit));
         }
-        let mut new_root_ptr = btree_write_node(s, &root, header.root_ptr, Some(limit))?;
+        let mut new_root_ptr = btree_write_node(s, &root, header.root_ptr, Some(limit), copy_at)?;
         proof {
             lemma_tx_hdr(f1, s.file(), Some(limit));
             lemma_hdr_trans(f0, f1, s.file(), limit as int);
@@ -493,14 +514,15 @@ pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
 
 /// `HashMapInit`: creates an empty hash map, or copies a committed one into
 /// this transaction, and points the slot at `position` at it.
-pub fn hash_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, counted: bool, tag: Tag, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
+pub fn hash_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, counted: bool, tag: Tag, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> final(s).file().len() >= old(s).file().len(),
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_writable(s, position, limit)?;
     let ghost f0 = s.file();
     let map_start = match slot.tag {
         Tag::None => {
@@ -525,7 +547,7 @@ pub fn hash_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, counted: bo
             }
             let mut map_start = slot.value;
             // copy it to the end unless it was made in this transaction
-            if map_start < limit {
+            if map_start < copy_at {
                 let len: usize = INDEX_BLOCK_SIZE + if counted { 8 } else { 0 };
                 let mut buf = zeros_vec(len);
                 s.read_at(map_start, buf.as_mut_slice())?;
@@ -582,12 +604,10 @@ pub fn map_index_pos(map_start: i64, counted: bool) -> (r: Result<i64>)
 
 /// A counted hash map's count, plus `delta` (wrapping, like the crate).
 pub fn update_map_count<S: Store>(s: &mut S, map_start: i64, add: bool, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= map_start,
-        limit <= old(s).file().len(),
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_limit(s, limit, map_start)?;
     let mut buf = [0u8; 8];
     s.read_at(map_start, &mut buf)?;
     let count = read_i64(&buf);
@@ -597,14 +617,15 @@ pub fn update_map_count<S: Store>(s: &mut S, map_start: i64, add: bool, limit: i
 
 /// `SortedMapInit`: creates an empty sorted map, or copies a committed
 /// header into this transaction, and points the slot at `position` at it.
-pub fn sorted_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, tag: Tag, limit: i64) -> (r: Result<SlotPointer>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
+pub fn sorted_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, tag: Tag, limit: i64, copy_at: i64) -> (r: Result<SlotPointer>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> final(s).file().len() >= old(s).file().len(),
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    check_writable(s, position, limit)?;
     let ghost f0 = s.file();
     let header_ptr = match slot.tag {
         Tag::None => {
@@ -624,7 +645,7 @@ pub fn sorted_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, tag: Tag,
                 return Err(Error::UnexpectedTag);
             }
             // copy the header into this transaction unless it was made in it
-            copy_header_if_old(s, slot.value, limit)?
+            copy_header_if_old(s, slot.value, limit, copy_at)?
         },
         _ => return Err(Error::UnexpectedTag),
     };
@@ -639,18 +660,21 @@ pub fn sorted_map_init<S: Store>(s: &mut S, position: i64, slot: Slot, tag: Tag,
 
 /// `SortedMapGet` in write mode: the entry for `key`, inserted if new, with
 /// the header updated before the value is filled in.
-pub fn sorted_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, key: &[u8], limit: i64, hash_size: usize) -> (r: Result<Slot>)
-    requires
-        hash_size <= 0xffff,
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
+pub fn sorted_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, key: &[u8], limit: i64, copy_at: i64, hash_size: usize) -> (r: Result<Slot>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().value >= limit,
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
+    check_limit(s, limit, header_ptr)?;
     let fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let result = crate::sorted_store::sorted_put(s, header.root_ptr, key, Some(limit), hash_size, fuel)?;
+    let result = crate::sorted_store::sorted_put(s, header.root_ptr, key, Some(limit), copy_at, hash_size, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -677,17 +701,20 @@ pub fn sorted_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeH
 }
 
 /// `SortedMapRemove`: removes `key` and updates the header.
-pub fn sorted_remove_key<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, key: &[u8], limit: i64, hash_size: usize) -> (r: Result<()>)
-    requires
-        hash_size <= 0xffff,
-        0 <= limit <= old(s).file().len(),
-        header_ptr >= limit,
+pub fn sorted_remove_key<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, key: &[u8], limit: i64, copy_at: i64, hash_size: usize) -> (r: Result<()>)
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    if copy_at < limit {
+        return Err(Error::InvalidOffset);
+    }
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
+    check_limit(s, limit, header_ptr)?;
     let fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let (node_ptr, found) = crate::sorted_store::sorted_remove(s, header.root_ptr, key, Some(limit), hash_size, fuel)?;
+    let (node_ptr, found) = crate::sorted_store::sorted_remove(s, header.root_ptr, key, Some(limit), copy_at, hash_size, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -708,12 +735,10 @@ pub fn sorted_remove_key<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHead
 
 /// `WriteData`'s write: the slot for the data, at its position.
 pub fn write_data_slot<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_writable(s, position, limit)?;
     write_slot_tx(s, position, slot, limit)
 }
 
@@ -721,12 +746,10 @@ pub fn write_data_slot<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i6
 /// belongs to this transaction (it was copied if not), so its header is
 /// from `limit` on.
 pub fn write_array_list_header<S: Store>(s: &mut S, start: i64, header: ArrayListHeader, limit: i64) -> (r: Result<()>)
-    requires
-        0 <= limit <= start,
-        limit <= old(s).file().len(),
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_limit(s, limit, start)?;
     write_tx(s, start, &header.to_bytes(), limit)
 }
 

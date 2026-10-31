@@ -12,7 +12,7 @@ use vstd::prelude::*;
 use crate::format::*;
 use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
-use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::slot::{Slot, SlotPointer, Tag};
 use crate::map_store::MapTarget;
 use crate::store::{DbStore, IoSink, IoSource};
 
@@ -57,6 +57,10 @@ pub struct Database<C: Core> {
     hasher: Hasher,
     header: Cell<Header>,
     pub(crate) tx_start: Cell<Option<i64>>,
+    // where the current transaction started: everything before it is
+    // committed. tx_start can move past it (freezing, concatenation), but
+    // this doesn't.
+    pub(crate) tx_floor: Cell<Option<i64>>,
     pub(crate) transaction: Cell<Option<Transaction>>,
     next_transaction_id: Cell<u64>,
 }
@@ -88,12 +92,13 @@ verus! {
 /// Resolves a possibly-negative index against `size`, or returns
 /// [`Error::KeyNotFound`] if it's out of range.
 fn resolve_index(index: i64, size: i64) -> (r: Result<i64>)
-    requires
-        size >= 0,
     ensures
         r is Err <==> !(-size <= index < size),
         r matches Ok(i) ==> 0 <= i < size && i == if index < 0 { size + index } else { index as int },
 {
+    if size < 0 {
+        return Err(Error::KeyNotFound);
+    }
     if index >= size || index < -size {
         return Err(Error::KeyNotFound);
     }
@@ -155,6 +160,7 @@ impl<C: Core> Database<C> {
             }),
             hasher,
             tx_start: Cell::new(None),
+            tx_floor: Cell::new(None),
             transaction: Cell::new(None),
             next_transaction_id: Cell::new(1),
         };
@@ -287,21 +293,15 @@ impl<C: Core> Database<C> {
     }
 
     pub(crate) fn read_slot_at(&self, pos: i64) -> Result<Slot> {
-        let mut buf = [0u8; SLOT_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        Slot::from_bytes(&buf)
+        crate::array_list_store::read_slot_at(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn read_array_list_header(&self, pos: i64) -> Result<ArrayListHeader> {
-        let mut buf = [0u8; ARRAY_LIST_HEADER_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        ArrayListHeader::from_bytes(&buf)
+        crate::path_store::read_array_list_header(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn read_btree_header(&self, pos: i64) -> Result<BTreeHeader> {
-        let mut buf = [0u8; BTREE_HEADER_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        BTreeHeader::from_bytes(&buf)
+        crate::path_store::read_btree_header(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn hash_size(&self) -> usize {
@@ -553,16 +553,19 @@ impl<C: Core> Database<C> {
         Ok(())
     }
 
-    // copy frozen collection storage before mutation to preserve existing readers
+    // copy frozen or committed collection storage before mutation to
+    // preserve existing readers. a path can reach a collection without its
+    // init part (such as through a copied hash map), and a collection from a
+    // past transaction must not change in place.
     fn copy_collection_if_frozen(
         &self,
         slot_ptr: SlotPointer,
         init: PathPart<'_>,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        if let Some(tx_frozen_at) = self.transaction.get().and_then(|t| t.frozen_at)
-            && slot_ptr.slot.value < tx_frozen_at
-        {
+        let frozen = self.transaction.get().and_then(|t| t.frozen_at).is_some_and(|f| slot_ptr.slot.value < f);
+        let committed = self.tx_floor.get().is_some_and(|floor| slot_ptr.slot.value < floor);
+        if frozen || committed {
             return self.read_part(init, WriteMode::ReadWrite, &[init], 0, slot_ptr, frozen_at, &mut None);
         }
         Ok(slot_ptr)
@@ -644,6 +647,8 @@ impl<C: Core> Database<C> {
         let scratch_pos = self.len()?;
         self.tx_start.set(Some(scratch_pos));
         let _reset_tx_start = ResetOnDrop(&self.tx_start);
+        self.tx_floor.set(Some(scratch_pos));
+        let _reset_tx_floor = ResetOnDrop(&self.tx_floor);
         // the copy is the transaction's root, so it stays writable after freezing
         if let Some(mut active) = self.transaction.get() {
             active.root_position = Some(scratch_pos);
@@ -707,9 +712,9 @@ impl<C: Core> Database<C> {
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let next_slot_ptr =
-                    crate::path_store::array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit)?;
+                    crate::path_store::array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -781,9 +786,9 @@ impl<C: Core> Database<C> {
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let next_slot_ptr =
-                    crate::path_store::linked_array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit)?;
+                    crate::path_store::linked_array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -809,9 +814,9 @@ impl<C: Core> Database<C> {
 // path-copy down to the value slot so the write is persistent,
                 // updating the header before callbacks can freeze it.
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let slot_ptr =
-                    crate::path_store::linked_get_for_write(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
+                    crate::path_store::linked_get_for_write(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
                 next(slot_ptr, ctx)
             }
 
@@ -819,9 +824,9 @@ impl<C: Core> Database<C> {
                 let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 // the header is updated before the value is filled in via the
                 // rest of the path. verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let slot_ptr =
-                    crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, header.size, limit)?;
+                    crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, header.size, limit, copy_at)?;
                 next(slot_ptr, ctx)
             }
 
@@ -860,8 +865,8 @@ impl<C: Core> Database<C> {
                 let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
-                let slot_ptr = crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let slot_ptr = crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
                 next(slot_ptr, ctx)
             }
 
@@ -870,8 +875,8 @@ impl<C: Core> Database<C> {
                 let rank = resolve_index(index, header.size)?;
                 // the header is updated before recursing into the rest of the
                 // path. verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
-                crate::path_store::linked_remove(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                crate::path_store::linked_remove(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
                 next(slot_ptr, ctx)
             }
 
@@ -882,9 +887,9 @@ impl<C: Core> Database<C> {
                 let tag = hash_map_tag(counted, set);
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let next_slot_ptr =
-                    crate::path_store::hash_map_init(&mut DbStore::new(self), position, slot_ptr.slot, counted, tag, limit)?;
+                    crate::path_store::hash_map_init(&mut DbStore::new(self), position, slot_ptr.slot, counted, tag, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -950,9 +955,9 @@ impl<C: Core> Database<C> {
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 let tag = sorted_map_tag(set);
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let next_slot_ptr =
-                    crate::path_store::sorted_map_init(&mut DbStore::new(self), position, slot_ptr.slot, tag, limit)?;
+                    crate::path_store::sorted_map_init(&mut DbStore::new(self), position, slot_ptr.slot, tag, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -980,13 +985,14 @@ impl<C: Core> Database<C> {
                 // the entry for the key, inserted if new, with the header
                 // updated before the value is filled in. verified in
                 // path_store.rs
-                let limit = self.write_limit(frozen_at)?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
                 let kv_slot = crate::path_store::sorted_get_for_write(
                     &mut DbStore::new(self),
                     header_ptr,
                     header,
                     key,
                     limit,
+                    copy_at,
                     self.hash_size(),
                 )?;
                 let target_slot = self.sorted_target_slot(kv_slot, target)?;
@@ -1023,8 +1029,8 @@ impl<C: Core> Database<C> {
                 let header_ptr = slot_ptr.slot.value;
                 let header = self.read_btree_header(header_ptr)?;
                 // verified in path_store.rs
-                let limit = self.write_limit(frozen_at)?;
-                crate::path_store::sorted_remove_key(&mut DbStore::new(self), header_ptr, header, key, limit, self.hash_size())?;
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                crate::path_store::sorted_remove_key(&mut DbStore::new(self), header_ptr, header, key, limit, copy_at, self.hash_size())?;
                 Ok(slot_ptr)
             }
 
@@ -1073,11 +1079,23 @@ impl<C: Core> Database<C> {
     }
 
     // copies a b-tree header to the end unless it was made in this transaction
-    // the copy-on-write limit of a write: max(tx_start, frozen_at). writes
-    // only happen inside a transaction.
+    // the bounds of a write: nothing before the transaction's start may
+    // change (the verified guarantee), and what a path reaches before
+    // max(tx_start, frozen_at) is copied rather than changed in place. a
+    // collection's own header or root block, once in the transaction, is
+    // still written in place after a freeze. writes only happen inside a
+    // transaction.
+    fn write_bounds(&self, frozen_at: i64) -> Result<(i64, i64)> {
+        self.tx_bounds(frozen_at).ok_or(Error::ExpectedTxStart)
+    }
+
+    fn tx_bounds(&self, frozen_at: i64) -> Option<(i64, i64)> {
+        Some((self.tx_floor.get()?, self.tx_start.get()?.max(frozen_at)))
+    }
+
+    // the bound below which nothing changes: the transaction's start
     fn write_limit(&self, frozen_at: i64) -> Result<i64> {
-        let tx_start = self.tx_start.get().ok_or(Error::ExpectedTxStart)?;
-        Ok(tx_start.max(frozen_at))
+        Ok(self.write_bounds(frozen_at)?.0)
     }
 
     // hash map
@@ -1092,14 +1110,15 @@ impl<C: Core> Database<C> {
         target: HashMapGetTarget<'_>,
         frozen_at: i64,
     ) -> Result<HashMapGetResult> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
         let target = match target {
             HashMapGetTarget::KvPair(_) => MapTarget::KvPair,
             HashMapGetTarget::Key(_) => MapTarget::Key,
             HashMapGetTarget::Value(_) => MapTarget::Value,
         };
         let write = write_mode == WriteMode::ReadWrite;
-        let res = crate::map_store::read_map_slot(
+        let res = crate::map_store::read_map_slot_checked(
             &mut DbStore::new(self),
             index_pos,
             key_hash,
@@ -1107,6 +1126,7 @@ impl<C: Core> Database<C> {
             write,
             target,
             limit,
+            copy_at,
             self.hash_size(),
         )?;
         Ok(HashMapGetResult { slot_ptr: res.slot_ptr, is_empty: res.is_empty })
@@ -1114,8 +1134,9 @@ impl<C: Core> Database<C> {
 
     // verified in map_store.rs
     fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: usize, frozen_at: i64) -> Result<Slot> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::map_store::remove_map_slot(&mut DbStore::new(self), index_pos, key_hash, key_offset, limit, self.hash_size())
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::map_store::remove_map_slot_checked(&mut DbStore::new(self), index_pos, key_hash, key_offset, limit, copy_at, self.hash_size())
     }
 
     // array list
@@ -1127,8 +1148,9 @@ impl<C: Core> Database<C> {
         _write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<(ArrayListHeader, SlotPointer)> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::array_list_store::read_array_list_slot_append(&mut DbStore::new(self), header, limit)
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::array_list_store::read_array_list_slot_append(&mut DbStore::new(self), header, limit, copy_at)
     }
 
     // verified in array_list_store.rs
@@ -1140,14 +1162,16 @@ impl<C: Core> Database<C> {
         write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
         let write = write_mode == WriteMode::ReadWrite;
-        crate::array_list_store::read_array_list_slot(&mut DbStore::new(self), index_pos, key, shift, write, limit)
+        crate::array_list_store::read_array_list_slot_checked(&mut DbStore::new(self), index_pos, key, shift, write, limit, copy_at)
     }
 
     // verified in array_list_store.rs
     fn read_array_list_slice(&self, header: ArrayListHeader, size: i64, frozen_at: i64) -> Result<ArrayListHeader> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::array_list_store::read_array_list_slice(&mut DbStore::new(self), header, size, limit)
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::array_list_store::read_array_list_slice(&mut DbStore::new(self), header, size, limit, copy_at)
     }
 }

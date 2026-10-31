@@ -153,11 +153,12 @@ pub fn reader_range(size: u64, start: u64, relative: u64, len: usize) -> (r: Opt
 
 /// The positions of a key/value pair's key and value slots.
 pub fn kv_slot_positions(kv_value: i64, key_offset: i64) -> (r: Result<(i64, i64)>)
-    requires
-        0 <= key_offset,
     ensures
         r is Ok ==> r.unwrap().0 == kv_value + key_offset && r.unwrap().1 == kv_value + key_offset + 9,
 {
+    if key_offset < 0 {
+        return Err(Error::InvalidOffset);
+    }
     let key_slot_pos = match kv_value.checked_add(key_offset) {
         Some(p) => p,
         None => return Err(Error::InvalidOffset),
@@ -172,13 +173,12 @@ pub fn kv_slot_positions(kv_value: i64, key_offset: i64) -> (r: Result<(i64, i64
 /// `WriteCursor::writer`: appends the byte array's length placeholder.
 /// Returns where it is, and where the bytes start.
 pub fn writer_begin<S: Store>(s: &mut S, limit: i64) -> (r: Result<(i64, i64)>)
-    requires
-        0 <= limit <= old(s).file().len(),
     ensures
         r is Ok ==> r.unwrap().0 >= limit && r.unwrap().1 == r.unwrap().0 + 8,
         r is Ok ==> r.unwrap().1 == final(s).file().len(),
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_limit(s, limit, limit)?;
     let ptr_pos = append_tx(s, &[0u8; 8], limit)?;
     let start_position = s.len()?;
     Ok((ptr_pos, start_position))
@@ -187,15 +187,14 @@ pub fn writer_begin<S: Store>(s: &mut S, limit: i64) -> (r: Result<(i64, i64)>)
 /// `CursorWriter::write_bytes`: writes `buf` at the writer's position.
 /// Returns the new position and size.
 pub fn writer_write<S: Store>(s: &mut S, start: i64, size: i64, relative: i64, buf: &[u8], limit: i64) -> (r: Result<(i64, i64)>)
-    requires
-        0 <= limit <= start,
-        limit <= old(s).file().len(),
-        0 <= size,
-        0 <= relative,
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().0 >= 0 && r.unwrap().1 >= r.unwrap().0 && r.unwrap().1 >= size,
 {
+    check_limit(s, limit, start)?;
+    if size < 0 || relative < 0 {
+        return Err(Error::InvalidOffset);
+    }
     if size < relative {
         return Err(Error::EndOfStream);
     }
@@ -237,13 +236,13 @@ pub fn writer_finish<S: Store>(
     position: i64,
     limit: i64,
 ) -> (r: Result<Slot>)
-    requires
-        0 <= limit <= slot.value,
-        limit <= old(s).file().len(),
-        writable(position as int, limit as int, old(s).file().len() as int),
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    check_writable(s, position, limit)?;
+    if limit > slot.value {
+        return Err(Error::InvalidOffset);
+    }
     let ghost f0 = s.file();
     let mut slot = slot;
     if let Some(format_tag) = format_tag {
@@ -288,16 +287,37 @@ pub open spec fn short_packed(value: Seq<u8>, format_tag: Option<[u8; 2]>) -> Se
     })
 }
 
+/// Bytes that fit in a slot: at most 8 (6 with a format tag), none zero.
+pub open spec fn short_ok(value: Seq<u8>, format_tag: Option<[u8; 2]>) -> bool {
+    &&& value.len() <= (if format_tag is Some { 6int } else { 8int })
+    &&& forall|i: int| 0 <= i < value.len() ==> #[trigger] value[i] != 0
+}
+
 /// `WriteData` for short bytes: the slot holding them inline.
-pub fn short_bytes_slot(value: &[u8], format_tag: Option<[u8; 2]>) -> (r: Slot)
-    requires
-        value@.len() <= (if format_tag is Some { 6int } else { 8int }),
-        forall|i: int| 0 <= i < value@.len() ==> #[trigger] value@[i] != 0,
+pub fn short_bytes_slot(value: &[u8], format_tag: Option<[u8; 2]>) -> (r: Option<Slot>)
     ensures
-        r.tag == Tag::ShortBytes,
-        r.full == (format_tag is Some),
-        crate::bytes::u64_be_spec(crate::bytes::i2u(r.value)) == short_packed(value@, format_tag),
+        r is Some <==> short_ok(value@, format_tag),
+        r is Some ==> r.unwrap().tag == Tag::ShortBytes,
+        r is Some ==> r.unwrap().full == (format_tag is Some),
+        r is Some ==> crate::bytes::u64_be_spec(crate::bytes::i2u(r.unwrap().value)) == short_packed(value@, format_tag),
 {
+    // too long, or holding a zero byte, which would read back as padding
+    let max: usize = if format_tag.is_some() { 6 } else { 8 };
+    if value.len() > max {
+        return None;
+    }
+    let mut j: usize = 0;
+    while j < value.len()
+        invariant
+            j <= value@.len(),
+            forall|k: int| 0 <= k < j ==> #[trigger] value@[k] != 0,
+        decreases value.len() - j,
+    {
+        if value[j] == 0 {
+            return None;
+        }
+        j += 1;
+    }
     let mut buf = [0u8; 8];
     let mut i: usize = 0;
     while i < value.len()
@@ -320,7 +340,7 @@ pub fn short_bytes_slot(value: &[u8], format_tag: Option<[u8; 2]>) -> (r: Slot)
         crate::bytes::lemma_i64_u64_roundtrip(v, crate::bytes::be_u64_spec(buf@));
         assert(buf@ =~= short_packed(value@, format_tag));
     }
-    Slot::new(v, Tag::ShortBytes).with_full(format_tag.is_some())
+    Some(Slot::new(v, Tag::ShortBytes).with_full(format_tag.is_some()))
 }
 
 /// Unpacking short bytes gives back the value and format tag they were

@@ -830,13 +830,14 @@ fn populate_kv_pair<S: Store, T: Store, M: OffsetMapping>(
 /// Compacts the data `slot` points to into the target, and returns the slot
 /// as it reads there. Nothing the target held before changes.
 pub fn compact_slot<S: Store, T: Store, M: OffsetMapping>(src: &mut S, tgt: &mut T, map: &mut M, slot: Slot, hash_size: usize) -> (r: Result<Slot>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(src).file() == old(src).file(),
         r is Ok ==> final(tgt).file().len() >= old(tgt).file().len()
             && final(tgt).file().subrange(0, old(tgt).file().len() as int) == old(tgt).file(),
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let fuel = walk_bound(src, ARRAY_LIST_HEADER_LENGTH as u64)?;
     let ghost base = tgt.file().len() as int;
     let r = remap_slot(src, tgt, map, slot, hash_size, Ghost(base), fuel);

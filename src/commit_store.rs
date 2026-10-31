@@ -227,11 +227,10 @@ pub fn commit_root<S: Store>(s: &mut S, root: Slot, commit_id: u64, file_id: u64
 /// `truncate`, when nothing is frozen past the committed bytes: anything
 /// after them, such as the remains of a failed transaction, is cut off.
 pub fn truncate_to_committed<S: Store>(s: &mut S, committed: i64) -> (r: Result<()>)
-    requires
-        0 <= committed <= old(s).file().len(),
     ensures
         r is Ok ==> final(s).file() == old(s).file().subrange(0, committed as int),
 {
+    check_limit(s, committed, committed)?;
     if s.len()? > committed {
         s.set_length(committed as u64)?;
     } else {
@@ -244,11 +243,13 @@ pub fn truncate_to_committed<S: Store>(s: &mut S, committed: i64) -> (r: Result<
 /// kept without publishing the failed transaction, by cutting off what
 /// follows them and committing the current root again after them.
 pub fn truncate_to_frozen<S: Store>(s: &mut S, frozen_at: i64, commit_id: u64, file_id: u64) -> (r: Result<()>)
-    requires
-        ROOT_HEADER_END <= frozen_at <= old(s).file().len(),
     ensures
         r is Ok ==> same_outside_header(old(s).file(), final(s).file(), frozen_at as int),
 {
+    check_limit(s, frozen_at, frozen_at)?;
+    if frozen_at < ROOT_HEADER_END {
+        return Err(Error::InvalidOffset);
+    }
     let ghost f0 = s.file();
     if s.len()? > frozen_at {
         s.set_length(frozen_at as u64)?;
@@ -383,11 +384,10 @@ pub fn read_committed<S: Store, W: Sink>(s: &mut S, w: &mut W, start: i64, end: 
 /// The copying part of `apply_replicated`: `length` bytes from `r`,
 /// written from `start` on. Nothing before `start` changes.
 pub fn write_replicated<S: Store, R: Source>(s: &mut S, r: &mut R, start: i64, length: i64) -> (res: Result<()>)
-    requires
-        0 <= start <= old(s).file().len(),
     ensures
         res is Ok ==> kept_below(old(s).file(), final(s).file(), start as int),
 {
+    check_limit(s, start, start)?;
     let cap: usize = if length <= 0 { 0 } else if length > 4096 { 4096 } else { length as usize };
     let mut pos = start;
     let mut remaining = length;
@@ -426,11 +426,12 @@ pub fn write_replicated<S: Store, R: Source>(s: &mut S, r: &mut R, start: i64, l
 /// The end of an incremental `apply_replicated`: the bytes must end with
 /// a trailer, and the root header is pointed at it.
 pub fn finish_replicated<S: Store>(s: &mut S, start: i64, length: i64, file_id: u64) -> (r: Result<()>)
-    requires
-        old(s).file().len() >= ROOT_HEADER_END,
     ensures
         r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
 {
+    if s.len()? < ROOT_HEADER_END {
+        return Err(Error::InvalidDatabase);
+    }
     let end = match start.checked_add(length) {
         Some(e) => e,
         None => return Err(Error::InvalidRange),
@@ -448,12 +449,13 @@ pub fn finish_replicated<S: Store>(s: &mut S, start: i64, length: i64, file_id: 
 /// the first commit (whose ID is 0, so a new database's bytes only depend
 /// on its file ID).
 pub fn init_file<S: Store>(s: &mut S, header: Header) -> (r: Result<()>)
-    requires
-        old(s).file().len() == 0,
     ensures
         r is Ok ==> final(s).file().len() == HEADER_LENGTH + ROOT_HEADER_LENGTH + ROOT_TRAILER_LENGTH,
         r is Ok ==> final(s).file().subrange(0, HEADER_LENGTH as int) == header_encode_spec(header),
 {
+    if s.len()? != 0 {
+        return Err(Error::InvalidDatabase);
+    }
     let h = header.to_bytes();
     append(s, &h)?;
     let ghost f1 = s.file();
@@ -494,11 +496,12 @@ pub fn begin_transaction<S: Store>(s: &mut S, root: Slot) -> (r: Result<i64>)
 /// Finishing a transaction: the copy of the root slot holds the new root,
 /// so it is committed. Only the root header and the trailer change.
 pub fn finish_transaction<S: Store>(s: &mut S, scratch_pos: i64, commit_id: u64, file_id: u64) -> (r: Result<Slot>)
-    requires
-        old(s).file().len() >= ROOT_HEADER_END,
     ensures
         r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
 {
+    if s.len()? < ROOT_HEADER_END {
+        return Err(Error::InvalidDatabase);
+    }
     let next_root = read_slot_at(s, scratch_pos)?;
     commit_root(s, next_root, commit_id, file_id)?;
     Ok(next_root)

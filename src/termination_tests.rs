@@ -50,11 +50,11 @@ fn cyclic_btree_writes_fail() {
     let s = &mut DbStore::new(&db);
     let root = cyclic_branch(s);
     let fuel = walk_bound(s, crate::format::BTREE_BRANCH_BLOCK_SIZE as u64).unwrap();
-    assert!(matches!(crate::btree_io::btree_insert(s, root, 0, None, fuel), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(crate::btree_io::btree_insert(s, root, 0, None, 0, fuel), Err(Error::InvalidBTreeNode)));
     let fuel = walk_bound(s, crate::format::BTREE_BRANCH_BLOCK_SIZE as u64).unwrap();
-    assert!(matches!(crate::btree_io::btree_get_for_write(s, root, 0, None, fuel), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(crate::btree_io::btree_get_for_write(s, root, 0, None, 0, fuel), Err(Error::InvalidBTreeNode)));
     let fuel = walk_bound(s, crate::format::BTREE_BRANCH_BLOCK_SIZE as u64).unwrap();
-    assert!(matches!(crate::btree_io::btree_remove(s, root, 0, None, fuel), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(crate::btree_io::btree_remove(s, root, 0, None, 0, fuel), Err(Error::InvalidBTreeNode)));
     let fuel = walk_bound(s, crate::format::BTREE_BRANCH_BLOCK_SIZE as u64).unwrap();
     assert!(matches!(crate::btree_join::btree_split(s, root, 0, fuel), Err(Error::InvalidBTreeNode)));
 }

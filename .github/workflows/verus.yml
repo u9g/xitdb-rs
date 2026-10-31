@@ -42,3 +42,5 @@ jobs:
           echo "$RUNNER_TEMP/verus-x86-linux" >> "$GITHUB_PATH"
       - name: Verify the crate
         run: cargo-verus verus verify
+      - name: Check the boundary between verified and unverified code
+        run: python3 verus/check_boundary.py

@@ -21,8 +21,35 @@ and written at positions (`Store`). The algorithms are written against
 - a write past the end keeps every byte that was there;
 - `set_length` truncates or zero-extends, and `sync` changes nothing.
 
-Positions before `limit`, the crate's `max(tx_start, frozen_at)`, belong to
-committed transactions.
+Writing functions take a `limit`: the position where the current
+transaction started (`tx_floor` in `database.rs`). Everything before it
+belongs to committed transactions, and the verified guarantee is that none
+of it changes, apart from the root header that a commit rewrites.
+
+They also take `copy_at`, the crate's `max(tx_start, frozen_at)`, which
+only decides what is copied rather than changed in place: a block reached
+through a path is copied if it lies before `copy_at`. Freezing and
+concatenation move `copy_at` forward so that shared data gets copied. The
+proofs need nothing from `copy_at` except that it is at least `limit`, so
+they hold whatever it is.
+
+## The boundary
+
+Verus checks verified code against its specification, but code outside
+`verus!` blocks could call a verified function without meeting its
+`requires`, and then the function's guarantees wouldn't hold. So no
+verified function that unverified code calls has a `requires`: each one
+checks its preconditions at run time and returns an error if they fail.
+`verus/check_boundary.py`, run in CI, fails if unverified code calls a
+verified function that has one.
+
+So whatever the unverified orchestration does, every write it makes to the
+file goes through a verified function that changes nothing before `limit`
+except the root header. Nothing else writes to the file, apart from the
+full replication apply's deliberate `set_length(0)`.
+
+This boundary found a bug (below): the orchestration had been calling
+verified functions without meeting their preconditions.
 
 ## What is verified
 
@@ -111,17 +138,24 @@ before the bound is reached. That is a crash, not a hang.
 - **The offset map adapter** (`compact.rs`) forwards to the caller's
   `OffsetMap`. Nothing is assumed about what it returns.
 - **Error constructors** that use `format!`.
+- **The limit the orchestration passes.** `tx_floor` is set, when a
+  transaction starts, to the file's length right after the verified
+  truncation to the committed size, and doesn't change until the
+  transaction ends.
 - **Verus, its standard library `vstd`, and the Z3 solver.**
 
 ## Not verified
 
-This code doesn't compute file offsets or write to the file itself. It
-calls the verified functions above.
+This code doesn't write to the file itself: it calls the verified
+functions above, which check their preconditions (see "The boundary"). It
+decides what to read and write, so a bug in it can produce wrong results,
+but it can't change committed data.
 
 - **Orchestration in `database.rs`:**
   - the path dispatcher (`read_slot_pointer` and the `match` in
     `read_part`), which threads closures;
-  - transaction state (`tx_start`, `transaction`, `run_context`, `freeze`);
+  - transaction state (`tx_start`, `tx_floor`, `transaction`,
+    `run_context`, `freeze`);
   - `copy_collection_if_frozen`, `check_frozen_slot`, `check_hash`;
   - `Database::new`'s control flow;
   - `compact`'s entry point.
@@ -142,4 +176,11 @@ Each was confirmed with a test and fixed:
   in sorted maps);
 - the first version of the trusted `Store` specification, which claimed
   `CoreMemory` zero-pads writes past its end. It doesn't: it writes at the
-  end.
+  end;
+- a copy-on-write violation. Changing a collection reached without its
+  init part (for example a list inside a hash map that a new moment
+  copied) changed the collection in place, so the previous, committed
+  moment changed too. The boundary checks rejected the write. Now
+  `copy_collection_if_frozen` also copies collections from before the
+  transaction (`remove_without_init_keeps_old_moment` in
+  `tests/regressions.rs`).

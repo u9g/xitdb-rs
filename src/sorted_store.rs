@@ -2,11 +2,11 @@
 //! methods), checked by Verus.
 //!
 //! Reads leave the file unchanged. Writes change nothing before `limit`
-//! (the crate's `max(tx_start, frozen_at)`): a node is written in place only
-//! from `limit` on and appended otherwise, and the entry `sorted_put`
-//! returns for its value to be written is at or after `limit`. Every
-//! offset computation is checked, so corrupt pointers and counts fail with
-//! an error instead of overflowing.
+//! (where the transaction started): a node is written in place only from
+//! `copy_at` on, which is at least `limit`, and appended otherwise, and the
+//! entry `sorted_put` returns for its value to be written is at or after
+//! `limit`. Every offset computation is checked, so corrupt pointers and
+//! counts fail with an error instead of overflowing.
 
 use std::cmp::Ordering;
 
@@ -170,15 +170,16 @@ pub fn write_sorted_node<S: Store>(s: &mut S, node: &SortedNode) -> (r: Result<i
 
 /// `sorted_write_node`: in place at `old_ptr` if that is at or after
 /// `limit`, appended otherwise.
-pub fn sorted_write_node<S: Store>(s: &mut S, node: &SortedNode, old_ptr: i64, limit: Option<i64>) -> (r: Result<i64>)
+pub fn sorted_write_node<S: Store>(s: &mut S, node: &SortedNode, old_ptr: i64, limit: Option<i64>, copy_at: i64) -> (r: Result<i64>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
         (r is Ok && limit is Some) ==> r.unwrap() >= limit.unwrap(),
 {
     let reusable = match limit {
-        Some(l) => old_ptr >= l,
+        Some(_) => old_ptr >= copy_at,
         None => false,
     };
     if reusable {
@@ -199,11 +200,12 @@ pub fn sorted_write_node<S: Store>(s: &mut S, node: &SortedNode, old_ptr: i64, l
 
 /// `read_kv_pair`.
 pub fn read_kv_pair<S: Store>(s: &mut S, kv_slot: Slot, hash_size: usize) -> (r: Result<KeyValuePair>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let len = KeyValuePair::encoded_len(kv_slot.tag, hash_size)?;
     let mut buf = zero_vec(len);
     s.read_at(kv_slot.value, buf.as_mut_slice())?;
@@ -224,11 +226,10 @@ pub fn write_kv_pair<S: Store>(s: &mut S, tag: Tag, kv: &KeyValuePair) -> (r: Re
 }
 
 /// `kv_key_offset`: where the key slot is in an entry.
-pub fn kv_key_offset(tag: Tag, hash_size: usize) -> (r: i64)
-    requires
-        hash_size <= 0xffff,
+pub fn kv_key_offset(tag: Tag, hash_size: u16) -> (r: i64)
     ensures
         0 <= r <= 0xffff,
+        r == (if tag == Tag::KvPair { hash_size as int } else { 0 }),
 {
     if matches!(tag, Tag::KvPair) { hash_size as i64 } else { 0 }
 }
@@ -364,11 +365,12 @@ fn entry_position(node_ptr: i64, i: usize) -> (r: Result<i64>)
 
 /// `sorted_get`: the entry with `key`, if any.
 pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<Option<SortedSlot>>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let mut node_ptr = root_ptr;
     let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
@@ -441,11 +443,12 @@ pub fn sorted_get_by_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r:
 
 /// `sorted_rank`: the number of keys below `key`.
 pub fn sorted_rank<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<i64>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let mut node_ptr = root_ptr;
     let mut rank: i64 = 0;
     let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
@@ -493,11 +496,12 @@ pub fn sorted_rank<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: us
 /// `sorted_path_from_key`: the path to the first entry with a key at
 /// least `key`, and the number of entries before it.
 pub fn sorted_path_from_key<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<(NodePath, i64)>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let mut stack: NodePath = Vec::new();
     let mut node_ptr = root_ptr;
     let mut before: i64 = 0;
@@ -710,8 +714,9 @@ fn counts_vec(a: &[i64; BTREE_SLOT_COUNT], n: usize) -> (r: Vec<i64>)
 /// `sorted_put`: inserts `key` (or finds it) under the node at
 /// `node_ptr`, copying committed nodes. The caller writes the value of the
 /// returned entry.
-pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize, fuel: u64) -> (r: Result<SortedInsertResult>)
+pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, copy_at: i64, hash_size: usize, fuel: u64) -> (r: Result<SortedInsertResult>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         hash_size <= 0xffff,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
@@ -759,7 +764,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
                 let mut leaf = node;
                 let mut kv_slot = node.entries[idx];
                 let reusable = match limit {
-                    Some(l) => kv_slot.value >= l,
+                    Some(_) => kv_slot.value >= copy_at,
                     None => false,
                 };
                 let ghost f1 = s.file();
@@ -777,7 +782,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
                     }
                 }
                 let ghost f2 = s.file();
-                let ptr = sorted_write_node(s, &leaf, node_ptr, limit)?;
+                let ptr = sorted_write_node(s, &leaf, node_ptr, limit, copy_at)?;
                 proof {
                     lemma_tx_trans(f1, f2, s.file(), limit);
                 }
@@ -796,7 +801,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
             let total = entries.len();
 
             if total <= BTREE_SLOT_COUNT {
-                let ptr = sorted_write_node(s, &crate::sorted::leaf(entries.as_slice()), node_ptr, limit)?;
+                let ptr = sorted_write_node(s, &crate::sorted::leaf(entries.as_slice()), node_ptr, limit, copy_at)?;
                 proof {
                     lemma_tx_trans(f1, f2, s.file(), limit);
                 }
@@ -807,7 +812,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
             // the key of its first entry
             let left_n = BTREE_SPLIT_COUNT;
             let separator = read_kv_pair(s, entries[left_n], hash_size)?.key_slot;
-            let left_ptr = sorted_write_node(s, &crate::sorted::leaf(slice_subrange(entries.as_slice(), 0, left_n)), node_ptr, limit)?;
+            let left_ptr = sorted_write_node(s, &crate::sorted::leaf(slice_subrange(entries.as_slice(), 0, left_n)), node_ptr, limit, copy_at)?;
             let ghost f3 = s.file();
             let right_ptr = write_sorted_node(s, &crate::sorted::leaf(slice_subrange(entries.as_slice(), left_n, total)))?;
             proof {
@@ -828,7 +833,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
             if node.num == 0 {
                 return Err(Error::InvalidBTreeNode);
             }
-            let child = sorted_put(s, node.children[i].value, key, limit, hash_size, fuel - 1)?;
+            let child = sorted_put(s, node.children[i].value, key, limit, copy_at, hash_size, fuel - 1)?;
             let ghost f1 = s.file();
 
             let mut children = entries_vec(&node.children, node.num);
@@ -845,7 +850,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
 
             if total <= BTREE_SLOT_COUNT {
                 let node2 = crate::sorted::branch(children.as_slice(), separators.as_slice(), counts.as_slice());
-                let ptr = sorted_write_node(s, &node2, node_ptr, limit)?;
+                let ptr = sorted_write_node(s, &node2, node_ptr, limit, copy_at)?;
                 proof {
                     lemma_tx_trans(f0, f1, s.file(), limit);
                 }
@@ -872,7 +877,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
                 slice_subrange(counts.as_slice(), left_n, total),
             );
             let separator = separators[left_n];
-            let left_ptr = sorted_write_node(s, &left, node_ptr, limit)?;
+            let left_ptr = sorted_write_node(s, &left, node_ptr, limit, copy_at)?;
             let ghost f2 = s.file();
             let right_ptr = write_sorted_node(s, &right)?;
             proof {
@@ -893,8 +898,9 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
 
 /// `sorted_remove`: removes `key` under the node at `node_ptr`, copying
 /// committed nodes; an emptied leaf is left in place.
-pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize, fuel: u64) -> (r: Result<(i64, bool)>)
+pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, copy_at: i64, hash_size: usize, fuel: u64) -> (r: Result<(i64, bool)>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         hash_size <= 0xffff,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
@@ -941,7 +947,7 @@ pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Opti
             };
             let mut entries = entries_vec(&node.entries, node.num);
             entries.remove(idx);
-            let ptr = sorted_write_node(s, &crate::sorted::leaf(entries.as_slice()), node_ptr, limit)?;
+            let ptr = sorted_write_node(s, &crate::sorted::leaf(entries.as_slice()), node_ptr, limit, copy_at)?;
             Ok((ptr, true))
         },
         BTreeNodeKind::Branch => {
@@ -949,7 +955,7 @@ pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Opti
             if node.num == 0 {
                 return Err(Error::InvalidBTreeNode);
             }
-            let (child_ptr, found) = sorted_remove(s, node.children[i].value, key, limit, hash_size, fuel - 1)?;
+            let (child_ptr, found) = sorted_remove(s, node.children[i].value, key, limit, copy_at, hash_size, fuel - 1)?;
             if !found {
                 return Ok((node_ptr, false));
             }
@@ -960,7 +966,7 @@ pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Opti
                 Some(c) => c,
                 None => return Err(Error::InvalidBTreeNode),
             };
-            let ptr = sorted_write_node(s, &branch, node_ptr, limit)?;
+            let ptr = sorted_write_node(s, &branch, node_ptr, limit, copy_at)?;
             proof {
                 lemma_tx_trans(f0, f1, s.file(), limit);
             }
@@ -996,19 +1002,20 @@ pub fn sorted_grow_root<S: Store>(s: &mut S, result: &SortedInsertResult) -> (r:
 /// `sorted_target_slot`: the slot the target asks for. Only the value is
 /// writeable, at its position in the entry.
 pub fn sorted_target_slot<S: Store>(s: &mut S, kv_slot: Slot, target: SortedTarget, hash_size: usize) -> (r: Result<SlotPointer>)
-    requires
-        hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
         (r is Ok && target == SortedTarget::Value) ==> r.unwrap().position is Some && r.unwrap().position.unwrap() >= kv_slot.value,
         (r is Ok && target != SortedTarget::Value) ==> r.unwrap().position is None,
 {
+    if hash_size > 0xffff {
+        return Err(Error::InvalidHashSize);
+    }
     let kv = read_kv_pair(s, kv_slot, hash_size)?;
     Ok(match target {
         SortedTarget::KvPair => SlotPointer::new(None, kv_slot),
         SortedTarget::Key => SlotPointer::new(None, kv.key_slot),
         SortedTarget::Value => {
-            let off = kv_key_offset(kv_slot.tag, hash_size);
+            let off = kv_key_offset(kv_slot.tag, hash_size as u16);
             let pos = match kv_slot.value.checked_add(off) {
                 Some(p) => p,
                 None => return Err(Error::InvalidOffset),

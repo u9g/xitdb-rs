@@ -146,7 +146,7 @@ impl<C: Core> Database<C> {
 
     // where the key slot is in a KvPair or SortedKvPair entry. the value slot follows it.
     pub(crate) fn kv_key_offset(&self, tag: Tag) -> i64 {
-        sorted_store::kv_key_offset(tag, self.hash_size())
+        sorted_store::kv_key_offset(tag, self.header().hash_size)
     }
 
     // descend by key to the matching leaf entry, or None

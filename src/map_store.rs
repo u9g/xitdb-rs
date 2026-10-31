@@ -3,7 +3,7 @@
 //!
 //! In read mode the walk returns exactly what the file's bytes lead to
 //! ([`map_read`]). In write mode, and in removal, nothing before `limit`
-//! (the crate's `max(tx_start, frozen_at)`) changes, and the slot the walk
+//! (where the transaction started) changes, and the slot the walk
 //! returns for writing is at or after `limit`, so committed data stays as
 //! it was.
 
@@ -256,9 +256,11 @@ pub fn read_map_slot<S: Store>(
     write: bool,
     target: MapTarget,
     limit: Option<i64>,
+    copy_at: i64,
     hash_size: usize,
 ) -> (r: Result<MapSlot>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         hash_size <= 0xffff,
         key_hash@.len() == hash_size,
         key_offset <= hash_size * 2 + 1,
@@ -311,7 +313,7 @@ pub fn read_map_slot<S: Store>(
         Tag::Index => {
             let mut next_ptr = ptr;
             if write {
-                next_ptr = copy_index_block_if_old(s, ptr, limit)?;
+                next_ptr = copy_index_block_if_old(s, ptr, limit, copy_at)?;
                 if next_ptr != ptr {
                     // make slot point to the copied block
                     let ghost f1 = s.file();
@@ -326,7 +328,7 @@ pub fn read_map_slot<S: Store>(
                 return Err(Error::KeyOffsetExceeded);
             }
             let ghost f2 = s.file();
-            let r = read_map_slot(s, next_ptr, key_hash, key_offset + 1, write, target, limit, hash_size);
+            let r = read_map_slot(s, next_ptr, key_hash, key_offset + 1, write, target, limit, copy_at, hash_size);
             proof {
                 if write && r is Ok {
                     lemma_kept_trans(f0, f2, s.file(), l);
@@ -341,11 +343,10 @@ pub fn read_map_slot<S: Store>(
             }
             if bytes_eq(kv.hash.as_slice(), key_hash) {
                 if write {
-                    let lim = match limit {
-                        Some(l) => l,
-                        None => return Err(Error::ExpectedTxStart),
-                    };
-                    if ptr < lim {
+                    if limit.is_none() {
+                        return Err(Error::ExpectedTxStart);
+                    }
+                    if ptr < copy_at {
                         let hash_pos = append(s, &kv.to_bytes())?;
                         let ghost f1 = s.file();
                         let next_slot = Slot::new(hash_pos, Tag::KvPair);
@@ -384,7 +385,7 @@ pub fn read_map_slot<S: Store>(
                     lemma_overwrite_keeps(f1, moved_pos as int, slot_encode_spec(slot), l);
                     lemma_kept_trans(f0, f1, f2, l);
                 }
-                let res = read_map_slot(s, next_index_pos, key_hash, key_offset + 1, write, target, limit, hash_size)?;
+                let res = read_map_slot(s, next_index_pos, key_hash, key_offset + 1, write, target, limit, copy_at, hash_size)?;
                 let ghost f3 = s.file();
                 write_slot_at(s, slot_pos, Slot::new(next_index_pos, Tag::Index))?;
                 proof {
@@ -399,6 +400,42 @@ pub fn read_map_slot<S: Store>(
     }
 }
 
+/// [`read_map_slot`] for unverified callers: its preconditions, checked at run time.
+pub fn read_map_slot_checked<S: Store>(
+    s: &mut S,
+    index_pos: i64,
+    key_hash: &[u8],
+    key_offset: usize,
+    write: bool,
+    target: MapTarget,
+    limit: Option<i64>,
+    copy_at: i64,
+    hash_size: usize,
+) -> (r: Result<MapSlot>)
+    ensures
+        !write ==> final(s).file() == old(s).file(),
+        (!write && r is Ok) ==> (r.unwrap().slot_ptr.position is Some && map_read(old(s).file(), index_pos as int, key_hash@,
+            key_offset as int, hash_size as int, target) == Some((r.unwrap().slot_ptr.position.unwrap() as int, r.unwrap().slot_ptr.slot))),
+        (write && r is Ok) ==> kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
+        (write && r is Ok) ==> (r.unwrap().slot_ptr.position is Some && r.unwrap().slot_ptr.position.unwrap() >= limit.unwrap()),
+{
+    if let Some(l) = limit {
+        if copy_at < l {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if hash_size > 0xffff || key_hash.len() != hash_size || key_offset > hash_size * 2 + 1 {
+        return Err(Error::InvalidHashSize);
+    }
+    if write {
+        match limit {
+            Some(l) => check_limit(s, l, index_pos)?,
+            None => return Err(Error::InvalidOffset),
+        }
+    }
+    read_map_slot(s, index_pos, key_hash, key_offset, write, target, limit, copy_at, hash_size)
+}
+
 /// `remove_map_slot`: returns the slot that replaces the block at
 /// `index_pos`. Blocks are only written if they belong to the current
 /// transaction (the root, which the caller copied) or were just copied.
@@ -408,9 +445,11 @@ pub fn remove_map_slot<S: Store>(
     key_hash: &[u8],
     key_offset: usize,
     limit: Option<i64>,
+    copy_at: i64,
     hash_size: usize,
 ) -> (r: Result<Slot>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         hash_size <= 0xffff,
         key_hash@.len() == hash_size,
         key_offset <= hash_size * 2 + 1,
@@ -443,7 +482,7 @@ pub fn remove_map_slot<S: Store>(
             if key_offset + 1 > hash_size * 2 + 1 {
                 return Err(Error::KeyOffsetExceeded);
             }
-            remove_map_slot(s, slot.value, key_hash, key_offset + 1, limit, hash_size)?
+            remove_map_slot(s, slot.value, key_hash, key_offset + 1, limit, copy_at, hash_size)?
         },
         Tag::KvPair => {
             let kv = read_kv_at(s, slot.value, hash_size)?;
@@ -497,7 +536,7 @@ pub fn remove_map_slot<S: Store>(
     // there was more than one used slot, or a single INDEX slot,
     // so we must keep this index block. update the slot in it,
     // copying the block first unless it belongs to this transaction.
-    let next_index_pos = copy_index_block_if_old(s, index_pos, limit)?;
+    let next_index_pos = copy_index_block_if_old(s, index_pos, limit, copy_at)?;
     let ghost f2 = s.file();
     let pos = match next_index_pos.checked_add((SLOT_LENGTH * i) as i64) {
         Some(p) => p,
@@ -510,6 +549,34 @@ pub fn remove_map_slot<S: Store>(
         lemma_kept_trans(f0, f2, s.file(), l);
     }
     Ok(Slot::new(next_index_pos, Tag::Index))
+}
+
+/// [`remove_map_slot`] for unverified callers: its preconditions, checked at run time.
+pub fn remove_map_slot_checked<S: Store>(
+    s: &mut S,
+    index_pos: i64,
+    key_hash: &[u8],
+    key_offset: usize,
+    limit: Option<i64>,
+    copy_at: i64,
+    hash_size: usize,
+) -> (r: Result<Slot>)
+    ensures
+        r is Ok ==> kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
+{
+    if let Some(l) = limit {
+        if copy_at < l {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if hash_size > 0xffff || key_hash.len() != hash_size || key_offset > hash_size * 2 + 1 {
+        return Err(Error::InvalidHashSize);
+    }
+    match limit {
+        Some(l) => check_limit(s, l, if key_offset == 0 { index_pos } else { l })?,
+        None => return Err(Error::InvalidOffset),
+    }
+    remove_map_slot(s, index_pos, key_hash, key_offset, limit, copy_at, hash_size)
 }
 
 } // verus!

@@ -119,6 +119,22 @@ pub fn walk_bound<S: Store>(s: &mut S, block: u64) -> (r: Result<u64>)
     Ok(len as u64 / block + 1)
 }
 
+/// Checks at run time that `limit` lies within the file and at or below
+/// `start`. The verified functions that the unverified orchestration calls
+/// check their preconditions like this, so their guarantees hold whatever
+/// it passes them.
+pub fn check_limit<S: Store>(s: &mut S, limit: i64, start: i64) -> (r: Result<()>)
+    ensures
+        final(s).file() == old(s).file(),
+        r is Ok ==> 0 <= limit <= old(s).file().len() && limit <= start,
+{
+    let len = s.len()?;
+    if limit < 0 || limit > len || limit > start {
+        return Err(crate::Error::InvalidOffset);
+    }
+    Ok(())
+}
+
 #[verifier::external_trait_specification]
 #[allow(dead_code)]
 pub trait ExCore {

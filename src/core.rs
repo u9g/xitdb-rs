@@ -162,8 +162,6 @@ impl CoreMemory {
 
     /// `Core::read`: fills `out` from the position, or fails.
     pub fn read_impl(&mut self, out: &mut [u8]) -> (r: io::Result<()>)
-        requires
-            old(self).ok(),
         ensures
             final(self).ok(),
             final(self).bytes() == old(self).bytes(),
@@ -172,6 +170,12 @@ impl CoreMemory {
                 && final(out)@ == old(self).bytes().subrange(old(self).position_spec(), old(self).position_spec() + old(out)@.len())
                 && final(self).position_spec() == old(self).position_spec() + old(out)@.len(),
     {
+        // the position never passes the end, but restore that if it did
+        if self.pos > self.buf.len() {
+            let e = eof_error(self.pos, out.len(), self.buf.len());
+            self.pos = self.buf.len();
+            return Err(e);
+        }
         let end = match self.pos.checked_add(out.len()) {
             Some(e) => e,
             None => return Err(eof_error(self.pos, out.len(), self.buf.len())),
@@ -204,13 +208,17 @@ impl CoreMemory {
     /// `Core::write`: writes `data` at the position, extending the bytes if
     /// it runs past the end.
     pub fn write_impl(&mut self, data: &[u8]) -> (r: io::Result<()>)
-        requires
-            old(self).ok(),
         ensures
             r is Ok ==> final(self).ok(),
             r is Ok ==> final(self).bytes() == crate::store::overwrite(old(self).bytes(), old(self).position_spec(), data@),
             r is Ok ==> final(self).position_spec() == old(self).position_spec() + data@.len(),
     {
+        // the position never passes the end, but restore that if it did
+        if self.pos > self.buf.len() {
+            let e = too_large_error();
+            self.pos = self.buf.len();
+            return Err(e);
+        }
         let pos = self.pos;
         let new_pos = match pos.checked_add(data.len()) {
             Some(p) => p,
@@ -247,8 +255,6 @@ impl CoreMemory {
 
     /// `Core::seek_to`: the position, clamped to the end.
     pub fn seek_impl(&mut self, pos: u64)
-        requires
-            old(self).ok(),
         ensures
             final(self).ok(),
             final(self).bytes() == old(self).bytes(),
@@ -260,13 +266,17 @@ impl CoreMemory {
 
     /// `Core::set_length`: truncates the bytes (it can't extend them).
     pub fn set_length_impl(&mut self, len: u64) -> (r: io::Result<()>)
-        requires
-            old(self).ok(),
         ensures
             final(self).ok(),
             r is Ok ==> len <= old(self).bytes().len() && final(self).bytes() == old(self).bytes().subrange(0, len as int),
             r is Err ==> final(self).bytes() == old(self).bytes(),
     {
+        // the position never passes the end, but restore that if it did
+        if self.pos > self.buf.len() {
+            let e = invalid_length_error();
+            self.pos = self.buf.len();
+            return Err(e);
+        }
         if len > self.buf.len() as u64 {
             return Err(invalid_length_error());
         }

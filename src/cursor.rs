@@ -845,7 +845,7 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             return Err(Error::CursorNotWriteable);
         }
         let db = self.read.db;
-        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.frozen_at);
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
         // verified in cursor_store.rs
         let (ptr_pos, start_position) = crate::cursor_store::writer_begin(&mut DbStore::new(db), limit)?;
         Ok(CursorWriter {
@@ -919,7 +919,7 @@ impl<C: Core> CursorWriter<'_, '_, C> {
     fn write_bytes(&mut self, buf: &[u8]) -> Result<()> {
         self.check_writable()?;
         let db = self.parent.read.db;
-        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.parent.frozen_at);
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
         // verified in cursor_store.rs
         let (relative_position, size) = crate::cursor_store::writer_write(
             &mut DbStore::new(db),
@@ -950,7 +950,7 @@ impl<C: Core> CursorWriter<'_, '_, C> {
         self.check_writable()?;
         let db = self.parent.read.db;
         let position = self.parent.read.slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.parent.frozen_at);
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
         // verified in cursor_store.rs
         self.slot = crate::cursor_store::writer_finish(
             &mut DbStore::new(db),

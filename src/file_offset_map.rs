@@ -25,7 +25,7 @@ impl<'a, C: Core> FileOffsetMap<'a, C> {
         Ok(FileOffsetMap { map: WriteHashMap::new(cursor)? })
     }
 
-    fn key(&self, offset: i64) -> Vec<u8> {
+    fn key(&self, offset: i64) -> Result<Vec<u8>> {
         // encode the offset directly rather than hashing it, preserving exact
         // keys. verified below
         offset_key(self.map.cursor().db.hash_size(), offset)
@@ -40,12 +40,14 @@ pub open spec fn offset_key_spec(hash_size: int, offset: i64) -> Seq<u8> {
 }
 
 /// `FileOffsetMap::key`.
-fn offset_key(hash_size: usize, offset: i64) -> (r: Vec<u8>)
-    requires
-        hash_size >= 8,
+fn offset_key(hash_size: usize, offset: i64) -> (r: Result<Vec<u8>>)
     ensures
-        r@ == offset_key_spec(hash_size as int, offset),
+        r is Ok <==> hash_size >= 8,
+        r is Ok ==> r.unwrap()@ == offset_key_spec(hash_size as int, offset),
 {
+    if hash_size < 8 {
+        return Err(Error::InvalidHashSize);
+    }
     let mut key = Vec::new();
     let mut i: usize = 0;
     while i < hash_size - 8
@@ -71,7 +73,7 @@ fn offset_key(hash_size: usize, offset: i64) -> (r: Vec<u8>)
         assert(key@ =~= Seq::new((hash_size - 8) as nat, |k: int| 0u8) + b@.subrange(0, j as int));
     }
     assert(b@.subrange(0, 8) =~= b@);
-    key
+    Ok(key)
 }
 
 /// Different offsets get different keys, so the map never confuses them.
@@ -103,14 +105,14 @@ impl<C: Core> OffsetMap for FileOffsetMap<'_, C> {
     }
 
     fn get(&mut self, source_offset: i64) -> Result<Option<i64>> {
-        match self.map.get_cursor_by_hash(&self.key(source_offset))? {
+        match self.map.get_cursor_by_hash(&self.key(source_offset)?)? {
             Some(cursor) => Ok(Some(cursor.read_uint()? as i64)),
             None => Ok(None),
         }
     }
 
     fn put(&mut self, source_offset: i64, target_offset: i64) -> Result<()> {
-        let key = self.key(source_offset);
+        let key = self.key(source_offset)?;
         self.map.put_by_hash(&key, target_offset as u64)
     }
 }

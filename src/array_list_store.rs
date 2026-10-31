@@ -4,7 +4,7 @@
 //! In read mode it returns exactly the slot the bytes of the file lead to
 //! ([`al_read`]). In write mode it creates missing index blocks and copies
 //! committed ones, and it never changes a committed byte: everything
-//! before `limit` (the crate's `max(tx_start, frozen_at)`) is left as it
+//! before `limit` (where the transaction started) is left as it
 //! was, and the slot it returns is at or after `limit`, so writing it can't
 //! change committed data either.
 
@@ -121,8 +121,9 @@ pub fn write_slot_at<S: Store>(s: &mut S, pos: i64, slot: Slot) -> (r: Result<()
 /// `copy_index_block_if_old`: an index block from before `limit` is copied
 /// to the end. `limit` is `None` outside a transaction, where nothing can
 /// be written (`Error::ExpectedTxStart`).
-pub fn copy_index_block_if_old<S: Store>(s: &mut S, ptr: i64, limit: Option<i64>) -> (r: Result<i64>)
+pub fn copy_index_block_if_old<S: Store>(s: &mut S, ptr: i64, limit: Option<i64>, copy_at: i64) -> (r: Result<i64>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> limit is Some,
@@ -130,11 +131,10 @@ pub fn copy_index_block_if_old<S: Store>(s: &mut S, ptr: i64, limit: Option<i64>
         r is Ok ==> (r.unwrap() == ptr && final(s).file() == old(s).file()) || (r.unwrap() == old(s).file().len()
             && final(s).file() == old(s).file() + old(s).file().subrange(ptr as int, ptr + INDEX_BLOCK_SIZE)),
 {
-    let limit = match limit {
-        Some(l) => l,
-        None => return Err(Error::ExpectedTxStart),
-    };
-    if ptr >= limit {
+    if limit.is_none() {
+        return Err(Error::ExpectedTxStart);
+    }
+    if ptr >= copy_at {
         return Ok(ptr);
     }
     let mut block = [0u8; INDEX_BLOCK_SIZE];
@@ -143,7 +143,8 @@ pub fn copy_index_block_if_old<S: Store>(s: &mut S, ptr: i64, limit: Option<i64>
     let p = append(s, &block)?;
     proof {
         let g = s.file();
-        assert(g.subrange(0, limit as int) =~= f.subrange(0, limit as int));
+        let l = limit.unwrap() as int;
+        assert(g.subrange(0, l) =~= f.subrange(0, l));
     }
     Ok(p)
 }
@@ -156,8 +157,10 @@ pub fn read_array_list_slot<S: Store>(
     shift: u8,
     write: bool,
     limit: Option<i64>,
+    copy_at: i64,
 ) -> (r: Result<SlotPointer>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         key >= 0,
         write ==> (limit is Some && 0 <= limit.unwrap() <= old(s).file().len() && index_pos >= limit.unwrap()),
     ensures
@@ -204,7 +207,7 @@ pub fn read_array_list_slot<S: Store>(
                 lemma_kept_trans(f0, f1, s.file(), l);
             }
             let ghost f2 = s.file();
-            let r = read_array_list_slot(s, next_index_pos, key, shift - 1, write, limit);
+            let r = read_array_list_slot(s, next_index_pos, key, shift - 1, write, limit, copy_at);
             proof {
                 if r is Ok {
                     lemma_kept_trans(f0, f2, s.file(), limit.unwrap() as int);
@@ -217,7 +220,7 @@ pub fn read_array_list_slot<S: Store>(
             let mut next_ptr = ptr;
             let ghost f0 = s.file();
             if write {
-                next_ptr = copy_index_block_if_old(s, ptr, limit)?;
+                next_ptr = copy_index_block_if_old(s, ptr, limit, copy_at)?;
                 if next_ptr != ptr {
                     let ghost f1 = s.file();
                     write_slot_at(s, slot_pos, Slot::new(next_ptr, Tag::Index))?;
@@ -229,7 +232,7 @@ pub fn read_array_list_slot<S: Store>(
                 }
             }
             let ghost f2 = s.file();
-            let r = read_array_list_slot(s, next_ptr, key, shift - 1, write, limit);
+            let r = read_array_list_slot(s, next_ptr, key, shift - 1, write, limit, copy_at);
             proof {
                 if write && r is Ok {
                     lemma_kept_trans(f0, f2, s.file(), limit.unwrap() as int);
@@ -241,6 +244,41 @@ pub fn read_array_list_slot<S: Store>(
     }
 }
 
+/// [`read_array_list_slot`] for unverified callers: its preconditions, checked at run time.
+pub fn read_array_list_slot_checked<S: Store>(
+    s: &mut S,
+    index_pos: i64,
+    key: i64,
+    shift: u8,
+    write: bool,
+    limit: Option<i64>,
+    copy_at: i64,
+) -> (r: Result<SlotPointer>)
+    ensures
+        !write ==> final(s).file() == old(s).file(),
+        (!write && r is Ok) ==> (r.unwrap().position is Some && al_read(old(s).file(), index_pos as int, key as int, shift as nat)
+            == Some((r.unwrap().position.unwrap() as int, r.unwrap().slot))),
+        (write && r is Ok) ==> kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
+        (write && r is Ok) ==> (r.unwrap().position is Some && r.unwrap().position.unwrap() >= limit.unwrap()
+            && slot_at(final(s).file(), r.unwrap().position.unwrap() as int, r.unwrap().slot)),
+{
+    if let Some(l) = limit {
+        if copy_at < l {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if key < 0 {
+        return Err(Error::InvalidOffset);
+    }
+    if write {
+        match limit {
+            Some(l) => check_limit(s, l, index_pos)?,
+            None => return Err(Error::InvalidOffset),
+        }
+    }
+    read_array_list_slot(s, index_pos, key, shift, write, limit, copy_at)
+}
+
 /// `read_array_list_slot_append`: the slot for key `header.size`, moving a
 /// full root under a new one and clearing the slot (values left by a
 /// rollback or slice).
@@ -248,10 +286,8 @@ pub fn read_array_list_slot_append<S: Store>(
     s: &mut S,
     header: ArrayListHeader,
     limit: Option<i64>,
+    copy_at: i64,
 ) -> (r: Result<(ArrayListHeader, SlotPointer)>)
-    requires
-        header.size >= 0,
-        limit is Some && 0 <= limit.unwrap() <= old(s).file().len() && header.ptr >= limit.unwrap(),
     ensures
         r is Ok ==> kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
         r is Ok ==> {
@@ -263,6 +299,18 @@ pub fn read_array_list_slot_append<S: Store>(
             &&& slot_at(final(s).file(), sp.position.unwrap() as int, sp.slot)
         },
 {
+    if let Some(l) = limit {
+        if copy_at < l {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if header.size < 0 {
+        return Err(Error::InvalidDatabase);
+    }
+    match limit {
+        Some(l) => check_limit(s, l, header.ptr)?,
+        None => return Err(Error::InvalidOffset),
+    }
     let mut index_pos = header.ptr;
     let key = header.size;
     let size = match header.size.checked_add(1) {
@@ -289,7 +337,7 @@ pub fn read_array_list_slot_append<S: Store>(
     }
 
     let ghost f2 = s.file();
-    let slot_ptr = read_array_list_slot(s, index_pos, key, next_shift, true, limit)?;
+    let slot_ptr = read_array_list_slot(s, index_pos, key, next_shift, true, limit, copy_at)?;
     let ghost f3 = s.file();
     // clear values left by a rollback or slice
     let slot_ptr = slot_ptr.with_slot(Slot::new(0, Tag::None));
@@ -316,15 +364,24 @@ pub fn read_array_list_slice<S: Store>(
     header: ArrayListHeader,
     size: i64,
     limit: Option<i64>,
+    copy_at: i64,
 ) -> (r: Result<ArrayListHeader>)
-    requires
-        header.size >= 0,
-        limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> r.unwrap().size == size && 0 <= size <= header.size,
         r is Ok ==> r.unwrap().ptr == header.ptr && final(s).file() == old(s).file() || (limit is Some && r.unwrap().ptr
             >= limit.unwrap() && kept_below(old(s).file(), final(s).file(), limit.unwrap() as int)),
 {
+    if let Some(l) = limit {
+        if copy_at < l {
+            return Err(Error::InvalidOffset);
+        }
+    }
+    if header.size < 0 {
+        return Err(Error::InvalidDatabase);
+    }
+    if let Some(l) = limit {
+        check_limit(s, l, l)?;
+    }
     if size > header.size || size < 0 {
         return Err(Error::KeyNotFound);
     }
@@ -348,7 +405,7 @@ pub fn read_array_list_slice<S: Store>(
     }
     // the new root may still belong to a past moment. unlike child
     // nodes, root nodes are written directly, so copy it now.
-    let index_pos = copy_index_block_if_old(s, index_pos, limit)?;
+    let index_pos = copy_index_block_if_old(s, index_pos, limit, copy_at)?;
     Ok(ArrayListHeader { ptr: index_pos, size })
 }
 

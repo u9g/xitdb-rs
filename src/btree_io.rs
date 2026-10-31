@@ -2,9 +2,9 @@
 //! (`read_btree_node`), the copy-on-write node write (`btree_write_node`),
 //! and the read-mode descent (`read_btree_slot`).
 //!
-//! A node is written in place only at or after `limit` (the crate's
-//! `max(tx_start, frozen_at)`), and appended otherwise, so committed nodes
-//! never change.
+//! A node is written in place only at or after `copy_at`, which is at least
+//! `limit` (where the transaction started), and appended otherwise, so
+//! committed nodes never change.
 
 #[allow(unused_imports)]
 use crate::array_list_store::*;
@@ -88,15 +88,16 @@ pub fn read_btree_node<S: Store>(s: &mut S, ptr: i64) -> (r: Result<BTreeNode>)
 
 /// `btree_write_node`: the node is written in place at `old_ptr` if that
 /// is at or after `limit`, and appended otherwise. Returns where it went.
-pub fn btree_write_node<S: Store>(s: &mut S, node: &BTreeNode, old_ptr: i64, limit: Option<i64>) -> (r: Result<i64>)
+pub fn btree_write_node<S: Store>(s: &mut S, node: &BTreeNode, old_ptr: i64, limit: Option<i64>, copy_at: i64) -> (r: Result<i64>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         (r is Ok && limit is Some) ==> r.unwrap() >= limit.unwrap() && kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
         (r is Ok && limit is None) ==> r.unwrap() == old(s).file().len() && final(s).file().subrange(0, old(s).file().len() as int) == old(s).file(),
 {
     let reusable = match limit {
-        Some(l) => old_ptr >= l,
+        Some(_) => old_ptr >= copy_at,
         None => false,
     };
     let ghost f = s.file();
@@ -358,8 +359,9 @@ fn counts_to_vec(a: &[i64; BTREE_SLOT_COUNT], to: usize) -> (r: Vec<i64>)
 
 /// `btree_insert`: a placeholder slot inserted at `rank` under the node at
 /// `node_ptr`, descending at most `fuel` levels.
-pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<InsertResult>)
+pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, copy_at: i64, fuel: u64) -> (r: Result<InsertResult>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
@@ -393,14 +395,14 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             let total = vals.len();
 
             if total <= BTREE_SLOT_COUNT {
-                let ptr = btree_write_node(s, &crate::btree::leaf(vals.as_slice()), node_ptr, limit)?;
+                let ptr = btree_write_node(s, &crate::btree::leaf(vals.as_slice()), node_ptr, limit, copy_at)?;
                 let vp = value_position(ptr, r)?;
                 return Ok(InsertResult { join: JoinResult { node_ptr: ptr, count: total as i64, split: None }, value_position: vp });
             }
 
             // overflow: split into two leaves (reuse this node for the left half)
             let left_n = BTREE_SPLIT_COUNT;
-            let left_ptr = btree_write_node(s, &crate::btree::leaf(slice_subrange(vals.as_slice(), 0, left_n)), node_ptr, limit)?;
+            let left_ptr = btree_write_node(s, &crate::btree::leaf(slice_subrange(vals.as_slice(), 0, left_n)), node_ptr, limit, copy_at)?;
             let ghost f1 = s.file();
             let right_ptr = write_btree_node(s, &crate::btree::leaf(slice_subrange(vals.as_slice(), left_n, total)))?;
             proof {
@@ -425,7 +427,7 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             }
             // pick the child that contains `rank`
             let (i, rem) = crate::btree::child_for_rank_pub(&node, rank, true);
-            let child = btree_insert(s, node.children[i].value, rem, limit, fuel - 1)?;
+            let child = btree_insert(s, node.children[i].value, rem, limit, copy_at, fuel - 1)?;
             let ghost f1 = s.file();
 
             // rebuild this branch with the (possibly split) child
@@ -441,7 +443,7 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
 
             if total <= BTREE_SLOT_COUNT {
                 let node2 = crate::btree::branch(children.as_slice(), counts.as_slice());
-                let ptr = btree_write_node(s, &node2, node_ptr, limit)?;
+                let ptr = btree_write_node(s, &node2, node_ptr, limit, copy_at)?;
                 proof {
                     if limit is Some {
                         lemma_kept_trans(f0, f1, s.file(), limit.unwrap() as int);
@@ -457,7 +459,7 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             let left_n = BTREE_SPLIT_COUNT;
             let left = crate::btree::branch(slice_subrange(children.as_slice(), 0, left_n), slice_subrange(counts.as_slice(), 0, left_n));
             let right = crate::btree::branch(slice_subrange(children.as_slice(), left_n, total), slice_subrange(counts.as_slice(), left_n, total));
-            let left_ptr = btree_write_node(s, &left, node_ptr, limit)?;
+            let left_ptr = btree_write_node(s, &left, node_ptr, limit, copy_at)?;
             let ghost f2 = s.file();
             let right_ptr = write_btree_node(s, &right)?;
             proof {
@@ -482,8 +484,9 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
 
 /// `btree_get_for_write`: the slot at `rank`, copying committed nodes on
 /// the way so the returned position is writable.
-pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<WriteSlot>)
+pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, copy_at: i64, fuel: u64) -> (r: Result<WriteSlot>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
@@ -499,7 +502,7 @@ pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit:
     if matches!(node.kind, BTreeNodeKind::Leaf) {
         let rank = check_rank(rank, node.num, false)?;
         let reusable = match limit {
-            Some(l) => node_ptr >= l,
+            Some(_) => node_ptr >= copy_at,
             None => false,
         };
         let mut new_ptr = node_ptr;
@@ -519,14 +522,14 @@ pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit:
     }
     let (i, rem) = crate::btree::child_for_rank_pub(&node, rank, false);
     let child_ptr = node.children[i].value;
-    let child = btree_get_for_write(s, child_ptr, rem, limit, fuel - 1)?;
+    let child = btree_get_for_write(s, child_ptr, rem, limit, copy_at, fuel - 1)?;
     // if the child stayed put, this branch is unchanged too
     if child.node_ptr == child_ptr {
         return Ok(WriteSlot { node_ptr, ..child });
     }
     let ghost f1 = s.file();
     node.children[i] = crate::btree::index_slot(child.node_ptr);
-    let new_ptr = btree_write_node(s, &node, node_ptr, limit)?;
+    let new_ptr = btree_write_node(s, &node, node_ptr, limit, copy_at)?;
     proof {
         if limit is Some {
             lemma_kept_trans(f0, f1, s.file(), limit.unwrap() as int);
@@ -549,8 +552,9 @@ fn same_kind(a: BTreeNodeKind, b: BTreeNodeKind) -> (r: bool)
 /// `btree_remove`: the node left after removing the value at `rank`, for
 /// the caller to write. Emptied children are dropped and underfull ones
 /// merged with a neighbor.
-pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<BTreeNode>)
+pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, copy_at: i64, fuel: u64) -> (r: Result<BTreeNode>)
     requires
+        limit is Some ==> limit.unwrap() <= copy_at,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
@@ -584,7 +588,7 @@ pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             let (i0, rem) = crate::btree::child_for_rank_pub(&node, rank, false);
             let mut i = i0;
             let child_ptr = node.children[i].value;
-            let mut child = btree_remove(s, child_ptr, rem, limit, fuel - 1)?;
+            let mut child = btree_remove(s, child_ptr, rem, limit, copy_at, fuel - 1)?;
             let ghost f1 = s.file();
             if child.num == 0 {
                 crate::btree::drop_child(&mut node, i);
@@ -604,7 +608,7 @@ pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
                     i = first;
                 }
             }
-            let ptr = btree_write_node(s, &child, child_ptr, limit)?;
+            let ptr = btree_write_node(s, &child, child_ptr, limit, copy_at)?;
             proof {
                 if limit is Some {
                     lemma_kept_trans(f0, f1, s.file(), limit.unwrap() as int);

@@ -73,9 +73,12 @@ impl<'a> Data<'a> {
             Data::Int(value) => Slot::new(*value, Tag::Int),
             Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
             // verified in cursor_store.rs, which proves that reading it back
-            // gives the same bytes and format tag
-            Data::Bytes(bytes) if bytes.is_short() => crate::cursor_store::short_bytes_slot(&bytes.value, bytes.format_tag),
-            Data::Bytes(bytes) => return Encoded::Long(bytes),
+            // gives the same bytes and format tag, and that it only packs
+            // bytes that fit
+            Data::Bytes(bytes) => match crate::cursor_store::short_bytes_slot(&bytes.value, bytes.format_tag) {
+                Some(slot) => slot,
+                None => return Encoded::Long(bytes),
+            },
         };
         Encoded::Inline(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
     }

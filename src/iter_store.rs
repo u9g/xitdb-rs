@@ -83,6 +83,34 @@ pub fn level<S: Store>(s: &mut S, position: i64) -> (r: Result<IterLevel>)
     Ok(IterLevel { position, block: decode_slots(&buf)?, index: 0 })
 }
 
+/// `stack_ok`, checked at run time.
+pub fn check_stack(stack: &Vec<IterLevel>) -> (r: bool)
+    ensures
+        r == stack_ok(stack@),
+{
+    let mut i: usize = 0;
+    while i < stack.len()
+        invariant
+            i <= stack@.len(),
+            forall|k: int| 0 <= k < i ==> #[trigger] stack@[k].index <= SLOT_COUNT,
+        decreases stack.len() - i,
+    {
+        if stack[i].index > SLOT_COUNT {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `state_ok`, checked at run time.
+pub fn check_state(st: &IterState) -> (r: bool)
+    ensures
+        r == state_ok(*st),
+{
+    check_stack(&st.stack) && 0 <= st.node_offset && st.node_offset <= BTREE_NODE_HEADER_SIZE as i64
+}
+
 pub fn empty_state() -> (r: IterState)
     ensures
         state_ok(r),
@@ -156,13 +184,13 @@ pub fn new_state<S: Store>(s: &mut S, slot: Slot) -> (r: Result<IterState>)
 
 /// A counted iterator started at `index`, with a stack from a seek.
 pub fn seeked_state<S: Store>(s: &mut S, size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> (r: Result<IterState>)
-    requires
-        stack_ok(stack@),
-        0 <= node_offset <= BTREE_NODE_HEADER_SIZE,
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> state_ok(r.unwrap()),
 {
+    if !check_stack(&stack) || node_offset < 0 || node_offset > BTREE_NODE_HEADER_SIZE as i64 {
+        return Err(Error::InvalidDatabase);
+    }
     let steps = step_bound(s)?;
     Ok(IterState { kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false, steps })
 }
@@ -170,11 +198,12 @@ pub fn seeked_state<S: Store>(s: &mut S, size: i64, index: i64, node_offset: i64
 /// `resolve_start_index`: a possibly-negative start index as a rank, or
 /// `None` if it is out of range.
 pub fn resolve_start_index(index: i64, size: i64) -> (r: Option<i64>)
-    requires
-        size >= 0,
     ensures
         r is Some ==> 0 <= r.unwrap() < size,
 {
+    if size < 0 {
+        return None;
+    }
     let resolved = if index < 0 {
         match index.checked_add(size) {
             Some(r) => r,
@@ -192,13 +221,13 @@ pub fn resolve_start_index(index: i64, size: i64) -> (r: Option<i64>)
 
 /// `array_list_from`: the stack of an array list iterator seeked to `idx`.
 pub fn array_list_seek<S: Store>(s: &mut S, header: ArrayListHeader, idx: i64) -> (r: Result<Vec<IterLevel>>)
-    requires
-        idx >= 0,
-        header.size >= 0,
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> stack_ok(r.unwrap()@),
 {
+    if idx < 0 || header.size < 0 {
+        return Err(Error::InvalidDatabase);
+    }
     let mut shift = array_list_shift(header.size - 1);
     // descend the radix trie, pushing one level per tier with its index set
     // to that tier's child slot
@@ -278,12 +307,13 @@ pub fn linked_array_list_seek<S: Store>(s: &mut S, header: BTreeHeader, idx: i64
 /// `next_internal`: the next slot, or `None` once the stack is exhausted.
 /// Empty slots are skipped, except in array list leaf blocks.
 pub fn next_internal<S: Store>(s: &mut S, st: &mut IterState) -> (r: Result<Option<SlotPointer>>)
-    requires
-        state_ok(*old(st)),
     ensures
         final(s).file() == old(s).file(),
-        state_ok(*final(st)),
+        state_ok(*old(st)) ==> state_ok(*final(st)),
 {
+    if !check_state(st) {
+        return Err(Error::InvalidDatabase);
+    }
     let mut steps = st.steps;
     while st.stack.len() > 0
         invariant
