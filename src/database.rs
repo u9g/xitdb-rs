@@ -940,7 +940,7 @@ impl<C: Core> Database<C> {
                 }
 
                 // path-copy down to the value slot so the write is persistent
-                let write_slot = self.btree_get_for_write(header.root_ptr, rank, frozen_at)?;
+                let write_slot = self.btree_get_for_write(header.root_ptr, rank, frozen_at, self.max_tree_depth()?)?;
                 // update the header before callbacks can freeze it
                 if write_slot.node_ptr != header.root_ptr {
                     let new_header = BTreeHeader { root_ptr: write_slot.node_ptr, size: header.size };
@@ -952,7 +952,7 @@ impl<C: Core> Database<C> {
             PathPart::LinkedArrayListAppend => {
                 let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let _ = slot_ptr;
-                let result = self.btree_insert(header.root_ptr, header.size, frozen_at)?;
+                let result = self.btree_insert(header.root_ptr, header.size, frozen_at, self.max_tree_depth()?)?;
                 let new_root_ptr = self.btree_make_root(result.join)?;
                 // update the header before filling in the value, so that a
                 // failure in the rest of the path leaves the tree and header
@@ -970,8 +970,8 @@ impl<C: Core> Database<C> {
                     return Err(Error::KeyNotFound);
                 }
                 // slice = drop [0, offset) then keep [0, size) of what's left
-                let after_offset = self.btree_split(header.root_ptr, offset)?;
-                let sliced = self.btree_split(after_offset.1, size)?;
+                let after_offset = self.btree_split(header.root_ptr, offset, self.max_tree_depth()?)?;
+                let sliced = self.btree_split(after_offset.1, size, self.max_tree_depth()?)?;
                 // update the header before recursing into the rest of the
                 // path, so that a failure there leaves the tree and header
                 // consistent
@@ -1006,7 +1006,7 @@ impl<C: Core> Database<C> {
             PathPart::LinkedArrayListInsert(index) => {
                 let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
-                let result = self.btree_insert(header.root_ptr, rank, frozen_at)?;
+                let result = self.btree_insert(header.root_ptr, rank, frozen_at, self.max_tree_depth()?)?;
                 let new_root_ptr = self.btree_make_root(result.join)?;
                 // update the header before filling in the value, so that a
                 // failure in the rest of the path leaves the tree and header
@@ -1022,7 +1022,7 @@ impl<C: Core> Database<C> {
                 let new_root_ptr = if header.size == 1 {
                     self.btree_new_root()?
                 } else {
-                    let mut root = self.btree_remove(header.root_ptr, rank, frozen_at)?;
+                    let mut root = self.btree_remove(header.root_ptr, rank, frozen_at, self.max_tree_depth()?)?;
                     let mut new_root_ptr = self.btree_write_node(&root, header.root_ptr, frozen_at)?;
                     // a root left with one child is replaced by it
                     while root.kind == BTreeNodeKind::Branch && root.num == 1 {
@@ -1176,7 +1176,7 @@ impl<C: Core> Database<C> {
                     return next(target_slot, ctx);
                 }
 
-                let result = self.sorted_put(header.root_ptr, key, frozen_at)?;
+                let result = self.sorted_put(header.root_ptr, key, frozen_at, self.max_tree_depth()?)?;
                 let new_root_ptr = self.sorted_grow_root(&result)?;
                 // update the header before filling in the value, so that a
                 // failure in the rest of the path leaves the tree and header
@@ -1217,7 +1217,7 @@ impl<C: Core> Database<C> {
                 let slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::SortedMapInit { set }, frozen_at)?;
                 let header_ptr = slot_ptr.slot.value;
                 let header = self.read_btree_header(header_ptr)?;
-                let (node_ptr, found) = self.sorted_remove(header.root_ptr, key, frozen_at)?;
+                let (node_ptr, found) = self.sorted_remove(header.root_ptr, key, frozen_at, self.max_tree_depth()?)?;
                 if !found {
                     return Err(Error::KeyNotFound);
                 }

@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::core::Core;
+use crate::btree::descend;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::format::*;
@@ -176,6 +177,7 @@ impl<C: Core> Database<C> {
     // descend by key to the matching leaf entry, or None
     pub(crate) fn sorted_get(&self, root_ptr: i64, key: &[u8]) -> Result<Option<SortedSlot>> {
         let mut node_ptr = root_ptr;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_sorted_node(node_ptr)?;
             if node.kind == BTreeNodeKind::Leaf {
@@ -191,6 +193,7 @@ impl<C: Core> Database<C> {
                 return Ok(None);
             }
             let (i, _) = self.child_for_key(&node, key)?;
+            depth = descend(depth)?;
             node_ptr = node.children[i].value;
         }
     }
@@ -199,6 +202,7 @@ impl<C: Core> Database<C> {
     pub(crate) fn sorted_get_by_index(&self, root_ptr: i64, rank: i64) -> Result<SortedSlot> {
         let mut node_ptr = root_ptr;
         let mut rem = rank;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_sorted_node(node_ptr)?;
             if node.kind == BTreeNodeKind::Leaf {
@@ -207,6 +211,7 @@ impl<C: Core> Database<C> {
             }
             let (i, next_rem) = Self::child_for_rank(&node, rem);
             rem = next_rem;
+            depth = descend(depth)?;
             node_ptr = node.children[i].value;
         }
     }
@@ -215,6 +220,7 @@ impl<C: Core> Database<C> {
     pub(crate) fn sorted_rank(&self, root_ptr: i64, key: &[u8]) -> Result<i64> {
         let mut node_ptr = root_ptr;
         let mut rank = 0;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_sorted_node(node_ptr)?;
             if node.kind == BTreeNodeKind::Leaf {
@@ -228,6 +234,7 @@ impl<C: Core> Database<C> {
             }
             let (i, before) = self.child_for_key(&node, key)?;
             rank += before;
+            depth = descend(depth)?;
             node_ptr = node.children[i].value;
         }
     }
@@ -243,6 +250,7 @@ impl<C: Core> Database<C> {
         let mut stack = Vec::new();
         let mut node_ptr = root_ptr;
         let mut before = 0;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_sorted_node(node_ptr)?;
             let position = node_ptr + BTREE_NODE_HEADER_SIZE as i64;
@@ -261,6 +269,7 @@ impl<C: Core> Database<C> {
             let (i, child_before) = self.child_for_key(&node, key)?;
             before += child_before;
             stack.push((position, node.children, i));
+            depth = descend(depth)?;
             node_ptr = node.children[i].value;
         }
     }
@@ -275,6 +284,7 @@ impl<C: Core> Database<C> {
         let mut stack = Vec::new();
         let mut node_ptr = root_ptr;
         let mut rem = rank;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_sorted_node(node_ptr)?;
             let position = node_ptr + BTREE_NODE_HEADER_SIZE as i64;
@@ -285,6 +295,7 @@ impl<C: Core> Database<C> {
             let (i, next_rem) = Self::child_for_rank(&node, rem);
             rem = next_rem;
             stack.push((position, node.children, i));
+            depth = descend(depth)?;
             node_ptr = node.children[i].value;
         }
     }
@@ -316,7 +327,13 @@ impl<C: Core> Database<C> {
     // insert key (or locate it for replacement) within the subtree at
     // node_ptr, path-copying nodes and maintaining separators + counts. the
     // caller writes the value of the returned entry.
-    pub(crate) fn sorted_put(&self, node_ptr: i64, key: &[u8], frozen_at: i64) -> Result<SortedInsertResult> {
+    pub(crate) fn sorted_put(
+        &self,
+        node_ptr: i64,
+        key: &[u8],
+        frozen_at: i64,
+        depth: usize,
+    ) -> Result<SortedInsertResult> {
         let node = self.read_sorted_node(node_ptr)?;
         match node.kind {
             BTreeNodeKind::Leaf => {
@@ -390,7 +407,7 @@ impl<C: Core> Database<C> {
             }
             BTreeNodeKind::Branch => {
                 let (i, _) = self.child_for_key(&node, key)?;
-                let child = self.sorted_put(node.children[i].value, key, frozen_at)?;
+                let child = self.sorted_put(node.children[i].value, key, frozen_at, descend(depth)?)?;
 
                 let mut children = node.children[..node.num].to_vec();
                 let mut separators = node.separators[..node.num].to_vec();
@@ -439,7 +456,13 @@ impl<C: Core> Database<C> {
     // remove key from the subtree at node_ptr, path-copying nodes and
     // decrementing counts. an emptied leaf is left in place. returns the new
     // node pointer and whether the key was found.
-    pub(crate) fn sorted_remove(&self, node_ptr: i64, key: &[u8], frozen_at: i64) -> Result<(i64, bool)> {
+    pub(crate) fn sorted_remove(
+        &self,
+        node_ptr: i64,
+        key: &[u8],
+        frozen_at: i64,
+        depth: usize,
+    ) -> Result<(i64, bool)> {
         let node = self.read_sorted_node(node_ptr)?;
         match node.kind {
             BTreeNodeKind::Leaf => {
@@ -464,7 +487,7 @@ impl<C: Core> Database<C> {
             }
             BTreeNodeKind::Branch => {
                 let (i, _) = self.child_for_key(&node, key)?;
-                let (child_ptr, found) = self.sorted_remove(node.children[i].value, key, frozen_at)?;
+                let (child_ptr, found) = self.sorted_remove(node.children[i].value, key, frozen_at, descend(depth)?)?;
                 if !found {
                     return Ok((node_ptr, false));
                 }

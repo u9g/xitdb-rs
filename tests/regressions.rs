@@ -108,3 +108,97 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// Points the first child slot of the index block or b-tree node body at
+/// `block` back at `target`, so following it loops.
+fn corrupt_child(db: &Database<CoreMemory>, block: i64, target: i64) -> Result<()> {
+    let mut core = db.core();
+    let mut tag = [0u8];
+    core.seek_to(block as u64)?;
+    core.read(&mut tag)?;
+    assert_eq!(tag[0] & 0x7f, Tag::Index as u8);
+    core.write(&target.to_be_bytes())?;
+    Ok(())
+}
+
+/// The position of a b-tree's root node, from the header its slot points at.
+fn btree_root(db: &Database<CoreMemory>, slot: Slot) -> Result<i64> {
+    let mut buf = [0u8; 8];
+    let mut core = db.core();
+    core.seek_to(slot.value as u64 + 8)?;
+    core.read(&mut buf)?;
+    Ok(i64::from_be_bytes(buf))
+}
+
+/// A hash map index slot that points back at its own block is an error
+/// when iterating, not an endless descent. Found by Kani.
+#[test]
+fn cyclic_hash_map_iteration_is_an_error() -> Result<()> {
+    // a 1-byte hash, so 0x01 and 0x11 share the first level's nibble
+    let hasher = Hasher::new(|data: &[u8]| vec![data.first().copied().unwrap_or(0)]);
+    let db = Database::new(CoreMemory::new(), hasher)?;
+    let mut map = WriteHashMap::new(&mut db.root_cursor())?;
+    map.put([0x01], 1u64)?;
+    map.put([0x11], 2u64)?;
+    let root = map.slot()?.value;
+    corrupt_child(&db, root + SLOT_LENGTH as i64, root)?;
+
+    let map = ReadHashMap::new(db.root_cursor())?;
+    let results: Vec<_> = map.iter()?.collect();
+    assert!(matches!(results.last(), Some(Err(Error::InvalidDatabase))));
+    Ok(())
+}
+
+/// A sorted map branch whose child points back at it is an error, not an
+/// endless descent. Found by Kani.
+#[test]
+fn cyclic_sorted_map_is_an_error() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    db.run_context(|cursor| {
+        let mut map = WriteSortedMap::new(cursor)?;
+        // one more than a leaf holds, so the root is a branch
+        for key in 1..=17u8 {
+            map.put([key], key as u64)?;
+        }
+        Ok(())
+    })?;
+    let root = btree_root(&db, db.root_cursor().slot()?)?;
+    corrupt_child(&db, root + 2, root)?;
+
+    let map = ReadSortedMap::new(db.root_cursor())?;
+    assert!(matches!(map.get_cursor([1]), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(map.rank([1]), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(map.iter_from([1]), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(map.iter_from_index(0), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(map.iter()?.last(), Some(Err(Error::InvalidDatabase))));
+    let mut map = WriteSortedMap::new(&mut db.root_cursor())?;
+    assert!(matches!(map.put([1], 0u64), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(map.remove([1]), Err(Error::InvalidBTreeNode)));
+    Ok(())
+}
+
+/// The same for a linked array list.
+#[test]
+fn cyclic_linked_array_list_is_an_error() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    db.run_context(|cursor| {
+        let mut list = WriteLinkedArrayList::new(cursor)?;
+        for i in 0..17u64 {
+            list.append(i)?;
+        }
+        Ok(())
+    })?;
+    let root = btree_root(&db, db.root_cursor().slot()?)?;
+    corrupt_child(&db, root + 2, root)?;
+
+    let list = ReadLinkedArrayList::new(db.root_cursor())?;
+    assert!(matches!(list.get_cursor(0), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(list.iter_from(0), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(list.iter()?.last(), Some(Err(Error::InvalidDatabase))));
+    let mut list = WriteLinkedArrayList::new(&mut db.root_cursor())?;
+    assert!(matches!(list.insert(0, 0u64), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(list.remove(0), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(list.put(0, 0u64), Err(Error::InvalidBTreeNode)));
+    assert!(matches!(list.slice(1, 1), Err(Error::InvalidBTreeNode)));
+    Ok(())
+}

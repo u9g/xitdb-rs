@@ -6,6 +6,12 @@ use crate::error::{Error, Result};
 use crate::format::*;
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 
+/// One branch level further down a tree, or an error once a descent has
+/// used up its levels (see [`Database::max_tree_depth`]).
+pub(crate) fn descend(depth: usize) -> Result<usize> {
+    depth.checked_sub(1).ok_or(Error::InvalidBTreeNode)
+}
+
 /// A node pointer plus the element count of its subtree (the right sibling
 /// of a split).
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +149,16 @@ impl<C: Core> Database<C> {
         self.write_btree_node(node)
     }
 
+    /// The most branch levels a descent may pass through. The nodes on a
+    /// path from a root are distinct blocks of at least
+    /// `BTREE_LEAF_BLOCK_SIZE` bytes, so no path through a valid tree is
+    /// longer than the number of them that fit in the database. A corrupt
+    /// tree whose pointers form a cycle runs out of levels instead of being
+    /// followed forever.
+    pub(crate) fn max_tree_depth(&self) -> Result<usize> {
+        Ok(usize::try_from(self.len()?).unwrap_or(usize::MAX) / BTREE_LEAF_BLOCK_SIZE)
+    }
+
     pub(crate) fn btree_new_root(&self) -> Result<i64> {
         self.write_btree_node(&BTreeNode::empty(BTreeNodeKind::Leaf, 0))
     }
@@ -152,12 +168,14 @@ impl<C: Core> Database<C> {
     pub(crate) fn read_btree_slot(&self, root_ptr: i64, rank: i64) -> Result<SlotPointer> {
         let mut node_ptr = root_ptr;
         let mut rem = rank;
+        let mut depth = self.max_tree_depth()?;
         loop {
             let node = self.read_btree_node(node_ptr)?;
             if node.kind == BTreeNodeKind::Leaf {
                 let rank = check_rank(rem, node.num, false)?;
                 return Ok(SlotPointer::new(Some(value_position(node_ptr, rank)), node.values[rank]));
             }
+            depth = descend(depth)?;
             let (i, next_rem) = child_for_rank(&node, rem, false);
             rem = next_rem;
             node_ptr = node.children[i].value;
@@ -167,7 +185,7 @@ impl<C: Core> Database<C> {
     // insert a placeholder slot at `rank` within the subtree at node_ptr,
     // writing new nodes along the path. the caller fills in the value at the
     // returned value_position.
-    pub(crate) fn btree_insert(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<InsertResult> {
+    pub(crate) fn btree_insert(&self, node_ptr: i64, rank: i64, frozen_at: i64, depth: usize) -> Result<InsertResult> {
         let node = self.read_btree_node(node_ptr)?;
         match node.kind {
             BTreeNodeKind::Leaf => {
@@ -211,7 +229,7 @@ impl<C: Core> Database<C> {
             BTreeNodeKind::Branch => {
                 // pick the child that contains `rank`
                 let (i, rem) = child_for_rank(&node, rank, true);
-                let child = self.btree_insert(node.children[i].value, rem, frozen_at)?;
+                let child = self.btree_insert(node.children[i].value, rem, frozen_at, descend(depth)?)?;
 
                 // rebuild this branch with the (possibly split) child
                 let mut children = node.children[..node.num].to_vec();
@@ -255,7 +273,13 @@ impl<C: Core> Database<C> {
     // the nodes that belong to a past transaction. the element count is
     // unchanged, so when the whole path is already this-transaction nothing
     // is rewritten and the caller writes straight into the existing leaf.
-    pub(crate) fn btree_get_for_write(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<WriteSlot> {
+    pub(crate) fn btree_get_for_write(
+        &self,
+        node_ptr: i64,
+        rank: i64,
+        frozen_at: i64,
+        depth: usize,
+    ) -> Result<WriteSlot> {
         let mut node = self.read_btree_node(node_ptr)?;
         if node.kind == BTreeNodeKind::Leaf {
             let rank = check_rank(rank, node.num, false)?;
@@ -271,7 +295,7 @@ impl<C: Core> Database<C> {
         }
         let (i, rem) = child_for_rank(&node, rank, false);
         let child_ptr = node.children[i].value;
-        let child = self.btree_get_for_write(child_ptr, rem, frozen_at)?;
+        let child = self.btree_get_for_write(child_ptr, rem, frozen_at, descend(depth)?)?;
         // if the child stayed put, this branch is unchanged too
         if child.node_ptr == child_ptr {
             return Ok(WriteSlot { node_ptr, ..child });
@@ -285,7 +309,7 @@ impl<C: Core> Database<C> {
     // the node left behind for the caller to write. an emptied child is
     // dropped and a child left under half full is merged with a neighbor it
     // fits with, so every leaf stays at the same depth.
-    pub(crate) fn btree_remove(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<BTreeNode> {
+    pub(crate) fn btree_remove(&self, node_ptr: i64, rank: i64, frozen_at: i64, depth: usize) -> Result<BTreeNode> {
         let mut node = self.read_btree_node(node_ptr)?;
         match node.kind {
             BTreeNodeKind::Leaf => {
@@ -297,7 +321,7 @@ impl<C: Core> Database<C> {
             BTreeNodeKind::Branch => {
                 let (mut i, rem) = child_for_rank(&node, rank, false);
                 let child_ptr = node.children[i].value;
-                let mut child = self.btree_remove(child_ptr, rem, frozen_at)?;
+                let mut child = self.btree_remove(child_ptr, rem, frozen_at, descend(depth)?)?;
                 if child.num == 0 {
                     drop_child(&mut node, i);
                     return Ok(node);
@@ -328,10 +352,14 @@ impl<C: Core> Database<C> {
     fn btree_height(&self, root_ptr: i64) -> Result<usize> {
         let mut ptr = root_ptr;
         let mut height = 0;
+        let max_depth = self.max_tree_depth()?;
         loop {
             let node = self.read_btree_node(ptr)?;
             if node.kind == BTreeNodeKind::Leaf {
                 return Ok(height);
+            }
+            if height == max_depth {
+                return Err(Error::InvalidBTreeNode);
             }
             height += 1;
             ptr = node.children[0].value;
@@ -475,7 +503,7 @@ impl<C: Core> Database<C> {
 
     /// Splits the tree at `rank`, returning the roots of the left and
     /// right parts.
-    pub(crate) fn btree_split(&self, root_ptr: i64, rank: i64) -> Result<(i64, i64)> {
+    pub(crate) fn btree_split(&self, root_ptr: i64, rank: i64, depth: usize) -> Result<(i64, i64)> {
         let node = self.read_btree_node(root_ptr)?;
         if node.kind == BTreeNodeKind::Leaf {
             let r = check_rank(rank, node.num, true)?;
@@ -484,7 +512,7 @@ impl<C: Core> Database<C> {
             return Ok((left_ptr, right_ptr));
         }
         let (i, rem) = child_for_rank(&node, rank, true);
-        let (child_left, child_right) = self.btree_split(node.children[i].value, rem)?;
+        let (child_left, child_right) = self.btree_split(node.children[i].value, rem, descend(depth)?)?;
         let left_sub = self.btree_subtree(&node.children[..i], &node.counts[..i])?;
         let right_sub = self.btree_subtree(&node.children[i + 1..node.num], &node.counts[i + 1..node.num])?;
         let joined_left = self.btree_join(left_sub, child_left)?;

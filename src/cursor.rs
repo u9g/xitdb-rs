@@ -1,6 +1,7 @@
 use std::io;
 use std::ops::Deref;
 
+use crate::btree::descend;
 use crate::core::Core;
 use crate::data::{Bytes, Data};
 use crate::database::{ContextFn, Database, is_root};
@@ -350,6 +351,11 @@ pub struct CursorIterator<'a, C: Core> {
     // otherwise, empty slots past the end of a list that was sliced and then
     // appended to without being written would be followed by stale items.
     leaf_depth: Option<usize>,
+    // the most levels the stack can have, found when it first grows. each
+    // level is a distinct block of at least INDEX_BLOCK_SIZE bytes, so a
+    // corrupt database whose pointers form a cycle runs out of levels
+    // instead of being followed forever.
+    max_depth: Option<usize>,
     done: bool,
 }
 
@@ -371,6 +377,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             stack: Vec::new(),
             node_offset: 0,
             leaf_depth: None,
+            max_depth: None,
             done: true,
         }
     }
@@ -418,7 +425,17 @@ impl<'a, C: Core> CursorIterator<'a, C> {
 
     // starts a counted iterator at `index` with a stack from a seek
     fn seeked(db: &'a Database<C>, size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> Self {
-        CursorIterator { db, kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false }
+        CursorIterator {
+            db,
+            kind: IterKind::Counted,
+            size,
+            index,
+            stack,
+            node_offset,
+            leaf_depth: None,
+            max_depth: None,
+            done: false,
+        }
     }
 
     /// An array list iterator that starts at `start_index`, descending the
@@ -477,6 +494,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
         let mut stack = Vec::new();
         let mut node_ptr = header.root_ptr;
         let mut rem = idx;
+        let mut depth = db.max_tree_depth()?;
         loop {
             let node = db.read_btree_node(node_ptr)?;
             let position = node_ptr + BTREE_NODE_HEADER_SIZE as i64;
@@ -489,6 +507,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
                 rem -= node.counts[i];
                 i += 1;
             }
+            depth = descend(depth)?;
             stack.push(IterLevel { position, block: node.children, index: i });
             node_ptr = node.children[i].value;
         }
@@ -553,6 +572,16 @@ impl<'a, C: Core> CursorIterator<'a, C> {
 
             let next_slot = level.block[level.index];
             if next_slot.tag == Tag::Index {
+                let max_depth = match self.max_depth {
+                    Some(max_depth) => max_depth,
+                    None => {
+                        let len = usize::try_from(self.db.len()?).unwrap_or(usize::MAX);
+                        *self.max_depth.insert(len / INDEX_BLOCK_SIZE)
+                    }
+                };
+                if self.stack.len() >= max_depth {
+                    return Err(Error::InvalidDatabase);
+                }
                 // node_offset skips a b-tree node's kind+num header
                 let next_pos = next_slot.value + self.node_offset;
                 let level = self.level(next_pos)?;
