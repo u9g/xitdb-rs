@@ -244,7 +244,7 @@ fn numbers_at_the_edges_round_trip() {
 
     // 128-bit integers that don't fit are an error
     let err = history.transact(|moment| put_structured(moment, "x", &u128::MAX)).unwrap_err();
-    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert!(matches!(err, Error::Serialize(_)), "{err:?}");
 }
 
 #[test]
@@ -282,7 +282,9 @@ fn stored_shape_is_plain() {
     let stored = moment.get_map("pr").unwrap().unwrap();
     assert_eq!(stored.get_uint("number").unwrap(), Some(7));
     assert_eq!(stored.get_string("title", None).unwrap().as_deref(), Some("Add structured values"));
-    assert_eq!(stored.get_uint("draft").unwrap(), Some(1));
+    // a bool is the text "true" or "false", tagged "bl"
+    let draft = stored.get_cursor("draft").unwrap().unwrap().read_bytes_object(None).unwrap();
+    assert_eq!((&*draft.value, draft.format_tag), (&b"true"[..], Some(BOOL_FORMAT_TAG)));
     // None is a missing key
     assert!(stored.get_cursor("merged_at").unwrap().is_none());
     assert_eq!(stored.get_list("comments").unwrap().unwrap().count().unwrap(), 0);
@@ -356,10 +358,15 @@ fn an_identical_value_writes_nothing_at_any_depth() {
     history.transact(|moment| VIEWS.put(moment, "main", &view)).unwrap();
     assert_eq!(VIEWS.get(&history.latest().unwrap(), "main").unwrap().as_ref(), Some(&view));
     let before = db.committed_size().unwrap();
-    history.transact(|moment| VIEWS.put(moment, "main", &view)).unwrap();
-    // Map::put opens the collection and the key, so it copies the path, but
-    // nothing of the value
+    let (_, committed) = history.transact_with_status(|moment| VIEWS.put(moment, "main", &view)).unwrap();
+    assert!(!committed);
+    assert_eq!(db.committed_size().unwrap(), before);
+    let mut changed = view.clone();
+    changed.clusters[4].pull_requests[3].checks[4].state = State::Passed;
+    let (_, committed) = history.transact_with_status(|moment| VIEWS.put(moment, "main", &changed)).unwrap();
+    assert!(committed);
     assert!(db.committed_size().unwrap() - before < 2048);
+    assert_eq!(VIEWS.get(&history.latest().unwrap(), "main").unwrap(), Some(changed));
 }
 
 #[test]
@@ -442,10 +449,12 @@ fn removed_keys_are_removed() {
     assert_eq!(state.iter().unwrap().count(), 1);
     assert_eq!(get_structured(&history.latest().unwrap(), "check").unwrap(), Some(check.clone()));
 
-    // a value that's None removes its key
+    // a value that's None is an empty value, which keeps its key
     let (wrote, _) = history.transact_with_status(|moment| put_structured(moment, "check", &None::<Check>)).unwrap();
     assert!(wrote);
-    assert!(history.latest().unwrap().get_cursor("check").unwrap().is_none());
+    let moment = history.latest().unwrap();
+    assert_eq!(moment.get_slot("check").unwrap().unwrap().tag, Tag::None);
+    assert_eq!(get_structured::<_, Option<Check>>(&moment, "check").unwrap(), Some(None));
     let (wrote, committed) =
         history.transact_with_status(|moment| put_structured(moment, "check", &None::<Check>)).unwrap();
     assert!(!wrote && !committed);
@@ -571,10 +580,30 @@ fn errors() {
     let Error::Decode(decode) = &err else { panic!("{err:?}") };
     assert_eq!(decode.collection.as_deref(), Some("views"));
 
-    // keys that aren't text are an error
-    let err = history.transact(|moment| put_structured(moment, "x", &HashMap::from([((1, 2), 3)]))).unwrap_err();
-    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    // keys that aren't text are an error that names where they are
+    #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Pair(u32, u32),
+    }
+    #[derive(Serialize)]
+    struct Outer {
+        inner: Vec<BTreeMap<Key, u32>>,
+    }
+    let value = Outer { inner: vec![BTreeMap::new(), BTreeMap::from([(Key::Pair(1, 2), 3)])] };
+    let err = history.transact(|moment| put_structured(moment, "x", &value)).unwrap_err();
+    let Error::Serialize(serialize) = &err else { panic!("{err:?}") };
+    assert_eq!(serialize.field.as_deref(), Some("inner.1"));
     assert!(err.to_string().contains("map key"), "{err}");
+    // and a variant's contents are named by the variant
+    #[derive(Serialize)]
+    enum Wrapper {
+        Many { values: Vec<u128> },
+    }
+    let err = history.transact(|moment| put_structured(moment, "x", &Wrapper::Many { values: vec![1, u128::MAX] }));
+    let err = err.unwrap_err();
+    let Error::Serialize(serialize) = &err else { panic!("{err:?}") };
+    assert_eq!(serialize.field.as_deref(), Some("Many.values.1"));
+    assert!(history.latest().unwrap().get_cursor("x").unwrap().is_none());
 }
 
 #[test]
@@ -602,4 +631,204 @@ fn a_change_writes_what_writing_its_path_by_hand_does() {
     let before = db.committed_size().unwrap();
     history.transact(|moment| put_structured(moment, "view", &view)).unwrap();
     assert_eq!(db.committed_size().unwrap() - before, by_hand);
+}
+
+#[test]
+fn map_put_of_an_unchanged_value_writes_nothing() {
+    const NAMES: Map<str, String> = Map::new("names");
+    const COUNTS: Map<str, u64> = Map::new("counts");
+    const DELTAS: Map<str, i64> = Map::new("deltas");
+    const RATIOS: Map<str, f64> = Map::new("ratios");
+    const FLAGS: Map<str, bool> = Map::new("flags");
+    const BLOBS: Map<str, Vec<u8>> = Map::new("blobs");
+    const MAYBE: Map<str, Option<u64>> = Map::new("maybe");
+    const JSON: Map<str, Json<Vec<u32>>> = Map::new("json");
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    let put_all = |moment: &mut WriteHashMap<'_, CoreMemory>, n: u64| {
+        NAMES.put(moment, "a", &format!("name {n}"))?;
+        COUNTS.put(moment, "a", &n)?;
+        DELTAS.put(moment, "a", &-(n as i64))?;
+        RATIOS.put(moment, "a", &(n as f64 / 3.0))?;
+        FLAGS.put(moment, "a", &(n % 2 == 0))?;
+        BLOBS.put(moment, "a", &[0, n as u8])?;
+        MAYBE.put(moment, "a", &(n > 1).then_some(n))?;
+        JSON.put(moment, "a", &vec![n as u32])
+    };
+    history.transact(|moment| put_all(moment, 1)).unwrap();
+    let before = len(&db);
+    let (_, committed) = history.transact_with_status(|moment| put_all(moment, 1)).unwrap();
+    assert!(!committed);
+    assert_eq!(len(&db), before);
+    let (_, committed) = history.transact_with_status(|moment| put_all(moment, 2)).unwrap();
+    assert!(committed);
+    let moment = history.latest().unwrap();
+    assert_eq!(NAMES.get(&moment, "a").unwrap().as_deref(), Some("name 2"));
+    assert_eq!(MAYBE.get(&moment, "a").unwrap(), Some(Some(2)));
+    assert_eq!(JSON.get(&moment, "a").unwrap(), Some(vec![2]));
+    assert_eq!(FLAGS.get(&moment, "a").unwrap(), Some(true));
+}
+
+#[test]
+fn bools_read_back_as_bools_everywhere() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[serde(untagged)]
+    enum Untagged {
+        Number(u64),
+        Bool(bool),
+        Text(String),
+    }
+    assert_round_trip(Untagged::Bool(true));
+    assert_round_trip(Untagged::Bool(false));
+    assert_round_trip(Untagged::Number(1));
+    assert_round_trip(Untagged::Text("true".into()));
+    assert_round_trip(vec![Untagged::Number(0), Untagged::Bool(false), Untagged::Text("x".into())]);
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Inner {
+        enabled: bool,
+        count: u32,
+    }
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Flattened {
+        name: String,
+        #[serde(flatten)]
+        inner: Inner,
+    }
+    assert_round_trip(Flattened { name: "x".into(), inner: Inner { enabled: true, count: 1 } });
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[serde(tag = "type")]
+    enum Internal {
+        Toggle { on: bool },
+        Count { n: u64 },
+    }
+    assert_round_trip(Internal::Toggle { on: true });
+    assert_round_trip(vec![Internal::Toggle { on: false }, Internal::Count { n: 1 }]);
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[serde(tag = "t", content = "c")]
+    enum Adjacent {
+        Flag(bool),
+    }
+    assert_round_trip(Adjacent::Flag(false));
+
+    let value = serde_json::json!({
+        "bool": true,
+        "false": false,
+        "null": null,
+        "int": -3,
+        "uint": 7,
+        "float": 1.5,
+        "text": "true",
+        "list": [true, null, 1, "a", {"nested": false}],
+        "empty": {},
+    });
+    assert_round_trip(value);
+
+    // a bool stored as the Uint 0 or 1, as the bool codec and records store
+    // them, reads as a bool where the type is known
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history
+        .transact(|moment| {
+            let mut inner = moment.put_map("inner")?;
+            inner.put("enabled", 1u64)?;
+            inner.put("count", 4u64)
+        })
+        .unwrap();
+    let inner: Inner = get_structured(&history.latest().unwrap(), "inner").unwrap().unwrap();
+    assert_eq!(inner, Inner { enabled: true, count: 4 });
+
+    // and the bool codec reads the tagged bools that Structured writes
+    const FLAGS: Map<str, bool> = Map::new("flags");
+    history.transact(|moment| put_structured(&mut moment.put_map("flags")?, "on", &true)).unwrap();
+    assert_eq!(FLAGS.get(&history.latest().unwrap(), "on").unwrap(), Some(true));
+}
+
+#[test]
+fn units_and_nones_keep_their_keys() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Marker;
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Wrapped(Option<u32>);
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Units {
+        unit: (),
+        marker: Marker,
+        phantom: std::marker::PhantomData<String>,
+        wrapped: Wrapped,
+        nested: Option<Option<u32>>,
+        missing: Option<u32>,
+    }
+    let units = Units {
+        unit: (),
+        marker: Marker,
+        phantom: std::marker::PhantomData,
+        wrapped: Wrapped(None),
+        nested: Some(None),
+        missing: None,
+    };
+    let read = round_trip(&units);
+    // Some(None) reads back as None, as in JSON
+    assert_eq!(read, Units { nested: None, ..units });
+
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| put_structured(moment, "units", &read)).unwrap();
+    let stored = history.latest().unwrap().get_map("units").unwrap().unwrap();
+    for key in ["unit", "marker", "phantom", "wrapped"] {
+        assert_eq!(stored.get_slot(key).unwrap().map(|slot| slot.tag), Some(Tag::None), "{key}");
+    }
+    // only a struct field's own None is left out
+    assert!(stored.get_slot("nested").unwrap().is_none());
+    assert!(stored.get_slot("missing").unwrap().is_none());
+
+    assert_round_trip(Wrapped(None));
+    assert_round_trip(Wrapped(Some(3)));
+    assert_round_trip(Marker);
+    assert_round_trip(());
+    assert_round_trip(vec![(), ()]);
+
+    let map = BTreeMap::from([("a".to_string(), None), ("b".to_string(), Some(2u32))]);
+    assert_round_trip(map.clone());
+    history.transact(|moment| put_structured(moment, "map", &map)).unwrap();
+    let stored = history.latest().unwrap().get_map("map").unwrap().unwrap();
+    assert_eq!(stored.get_slot("a").unwrap().map(|slot| slot.tag), Some(Tag::None));
+    assert_round_trip(BTreeMap::from([("unit".to_string(), ())]));
+    assert_round_trip(serde_json::json!({"a": null, "b": [null]}));
+
+    // a struct field that becomes None is removed, and one that comes back
+    // is added again
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+    struct Field {
+        value: Option<u32>,
+    }
+    history.transact(|moment| put_structured(moment, "field", &Field { value: Some(1) })).unwrap();
+    history.transact(|moment| put_structured(moment, "field", &Field { value: None })).unwrap();
+    let stored = history.latest().unwrap().get_map("field").unwrap().unwrap();
+    assert!(stored.get_slot("value").unwrap().is_none());
+    history.transact(|moment| put_structured(moment, "field", &Field { value: Some(2) })).unwrap();
+    assert_eq!(get_structured(&history.latest().unwrap(), "field").unwrap(), Some(Field { value: Some(2) }));
+}
+
+#[test]
+fn write_at_a_moment_cursor_keeps_the_cursor_current() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| put_structured(moment, "a", &vec![1u64])).unwrap();
+    history
+        .transact(|moment| {
+            let mut cursor = moment.put_cursor("a")?;
+            assert!(write_structured(&mut cursor, &BTreeMap::from([("x", true)]))?);
+            // the caller's cursor sees the new map, without a fix-up
+            let map = ReadHashMap::new(&cursor)?;
+            assert!(map.get_cursor("x")?.is_some());
+            assert!(write_structured(&mut cursor, &5u64)?);
+            assert_eq!(cursor.read_uint()?, 5);
+            assert!(!write_structured(&mut cursor, &5u64)?);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    assert_eq!(get_structured(&history.latest().unwrap(), "a").unwrap(), Some(5u64));
 }

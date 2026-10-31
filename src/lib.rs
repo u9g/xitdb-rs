@@ -90,7 +90,7 @@ pub use crate::cursor::{
 };
 pub use crate::data::{Bytes, Data};
 pub use crate::database::Database;
-pub use crate::error::{DecodeError, Error, Result};
+pub use crate::error::{DecodeError, Error, Result, SerializeError};
 pub use crate::file_offset_map::FileOffsetMap;
 pub use crate::format::{Header, ReplicaState, root_trailer_checksum};
 pub use crate::hasher::{Hasher, bytes_to_id, id_to_bytes};
@@ -100,7 +100,7 @@ pub use crate::migrate::{LAYOUT_VERSION_KEY, Migrated, Migration, Migrations};
 pub use crate::path::{HashMapGetTarget, PathPart, SortedMapGetTarget, WriteMode};
 pub use crate::record::{LazyMap, Record};
 pub use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
-pub use crate::typed::{KeyCodec, Map, MapIter, Set, SetIter, ValueCodec};
+pub use crate::typed::{BOOL_FORMAT_TAG, KeyCodec, Map, MapIter, Set, SetIter, ValueCodec};
 #[cfg(feature = "serde")]
 pub use crate::typed::{JSON_FORMAT_TAG, Json};
 #[cfg(feature = "serde")]

@@ -9,19 +9,23 @@
 //!   key) to its value. A map key that's a string or bytes is stored as
 //!   those bytes; an integer, a bool, a char or a unit variant is stored as
 //!   its text (`"42"`, `"true"`), as JSON does. Any other key type is an
-//!   error.
+//!   [`Error::Serialize`].
 //! * A sequence, a tuple, or a tuple struct is an array list.
 //! * A string, a char, or bytes (with `serialize_bytes`, as `serde_bytes`
 //!   does; a plain `Vec<u8>` is a sequence) is a byte array.
 //! * A signed integer is a [`Data::Int`], an unsigned one a [`Data::Uint`],
-//!   a float a [`Data::Float`], and a bool the `Uint` `0` or `1`, as the
-//!   [`ValueCodec`]s of `i64`, `u64`, `f64` and `bool` store them. An
-//!   `i128` or `u128` is stored the same way if it fits in 64 bits, and is
-//!   an error otherwise.
-//! * `None`, `()` and a unit struct are left out of a map: a field that's
-//!   `None` is a missing key. Where a slot has to exist, as an item of a
-//!   list or the value of a variant, they're an empty value
-//!   ([`Data::None`]).
+//!   and a float a [`Data::Float`], as the [`ValueCodec`]s of `i64`, `u64`
+//!   and `f64` store them. An `i128` or `u128` is stored the same way if it
+//!   fits in 64 bits, and is an error otherwise.
+//! * A bool is the text `true` or `false`, tagged [`BOOL_FORMAT_TAG`], so
+//!   that it reads back as a bool, not a number, even where serde doesn't
+//!   say which type it expects (`#[serde(untagged)]`, `#[serde(flatten)]`,
+//!   internally tagged enums, `serde_json::Value`). Reading a bool also
+//!   accepts the `Uint` `0` or `1` that the `bool` codec writes.
+//! * A struct field that's `None` is left out of its map. Every other
+//!   `None`, and `()`, a unit struct, and a newtype of either, is an empty
+//!   value ([`Data::None`]), so a map entry whose value is `None` keeps its
+//!   key.
 //! * A newtype struct is its contents.
 //! * An enum is externally tagged, like serde_json's default: a unit
 //!   variant is its name, as a byte array, and any other variant is a hash
@@ -31,32 +35,30 @@
 //! Writing compares with what's stored as it goes, and only writes what
 //! differs; see [`write_structured`].
 
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
-use std::io;
 use std::marker::PhantomData;
 
 use serde::de::{self, DeserializeOwned, DeserializeSeed, IntoDeserializer, Visitor};
 use serde::ser::{self, Serialize};
 
-use crate::collections::{KvPairIterator, ReadArrayList, ReadHashMap, WriteArrayList, WriteHashMap, has_value};
+use crate::collections::{KvPairIterator, ReadArrayList, ReadHashMap, WriteArrayList, WriteHashMap};
 use crate::core::Core;
 use crate::cursor::{CursorIterator, ReadCursor, WriteCursor};
 use crate::data::Data;
-use crate::database::is_root;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, SerializeError};
 use crate::slot::Tag;
-use crate::typed::ValueCodec;
+use crate::typed::{BOOL_FORMAT_TAG, ValueCodec, tagged_bool};
 
 /// A [`ValueCodec`] that stores a serde type as nested hash maps, array
 /// lists and scalars (see [`write_structured`] for the shape), so that
 /// writing a new value over a stored one writes only what changed.
 ///
-/// [`ValueCodec::write`] is [`write_structured`]: it writes the parts of
-/// the value that differ from what's at the cursor, and nothing else. A
-/// [`Map`](crate::Map) opens its collection and the key before calling it,
-/// so [`Map::put`](crate::Map::put) of an unchanged value still copies the
-/// path to it; use [`put_structured`] for a value that's often unchanged.
+/// [`Map::put`](crate::Map::put) compares as it writes, and only opens the
+/// collection and the key once something differs, so putting an unchanged
+/// value writes nothing at all. [`ValueCodec::write`], given a cursor, is
+/// [`write_structured`].
 ///
 /// A value that doesn't deserialize as `T` is an [`Error::Decode`] whose
 /// [`DecodeError::field`](crate::DecodeError::field) is the path to the
@@ -96,11 +98,18 @@ impl<T: Serialize + DeserializeOwned> ValueCodec for Structured<T> {
     fn write<C: Core>(value: &T, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         write_structured(cursor, value).map(drop)
     }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &T,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_lazily(value, existing.cloned(), open)
+    }
 }
 
 /// Reads a value that [`write_structured`] wrote, or any data of the same
-/// shape. Keys of a hash map whose values are empty ([`Data::None`]) are
-/// skipped, like missing ones.
+/// shape.
 pub fn read_structured<C: Core, T: DeserializeOwned>(cursor: &ReadCursor<'_, C>) -> Result<T> {
     T::deserialize(ValueDe { cursor: cursor.resolved_cursor()? }).map_err(|err| err.0)
 }
@@ -114,8 +123,9 @@ pub fn read_structured<C: Core, T: DeserializeOwned>(cursor: &ReadCursor<'_, C>)
 /// * A scalar is only written if it differs, as [`ReadCursor::equals`]
 ///   compares (so floats compare by their bits).
 /// * A struct or map over a stored hash map changes it in place: each
-///   field is compared the same way, recursively, fields that are `None`
-///   or no longer there are removed, and new ones are added.
+///   value is compared the same way, recursively, keys that are no longer
+///   there (or struct fields that are now `None`) are removed, and new
+///   ones are added.
 /// * A sequence over a stored array list is compared item by item, by
 ///   index. Items past the stored length are appended, and if the new
 ///   sequence is shorter, the list is sliced to its length.
@@ -132,34 +142,25 @@ pub fn read_structured<C: Core, T: DeserializeOwned>(cursor: &ReadCursor<'_, C>)
 /// keyed by ID, along with a list of the IDs if the order matters.
 ///
 /// It must run inside a transaction, such as [`History::transact`]. A
-/// value that can't be serialized (a map key of an unsupported type, or a
-/// 128-bit integer that doesn't fit in 64 bits) is an [`Error::Io`], as
-/// for [`Json`](crate::Json); what was written before it stays written,
-/// and is discarded with the transaction if the error is returned from it.
+/// value that can't be stored (a map key of an unsupported type, or a
+/// 128-bit integer that doesn't fit in 64 bits) is an
+/// [`Error::Serialize`] with the path to it; what was written before it
+/// stays written, and is discarded with the transaction if the error is
+/// returned from it.
 ///
 /// [`History::transact`]: crate::History::transact
 pub fn write_structured<C: Core, T: Serialize + ?Sized>(cursor: &mut WriteCursor<'_, C>, value: &T) -> Result<bool> {
     let existing = Some(cursor.read.resolved_cursor()?);
-    let mut root = CursorRoot { cursor, opened: false };
-    let place = Place { target: Target::Child(&mut root, Key::Root), existing, opened: None };
+    let touched = Cell::new(false);
+    let place = Place { target: Target::Cursor(cursor, &touched), existing, opened: None };
     value.serialize(ValueSer { place, optional: false }).map_err(|err| err.0)?;
-    let opened = root.opened;
-    // the writes went through a copy of the cursor, so catch it up
-    if opened
-        && let Some(position) = cursor.read.slot_ptr.position
-        && !is_root(&cursor.read.slot_ptr)
-    {
-        let slot = cursor.read.db.read_slot_at(position)?;
-        cursor.read.slot_ptr = cursor.read.slot_ptr.with_slot(slot);
-    }
-    Ok(opened)
+    Ok(touched.get())
 }
 
 /// Writes `value` under `key` in `map`, as [`write_structured`] does, and
 /// returns whether it wrote anything. The key is only opened if something
 /// changed, so if nothing did, nothing at all is written, and
-/// [`History::transact`] doesn't commit a new moment. A value that
-/// serializes as `None` removes `key`.
+/// [`History::transact`] doesn't commit a new moment.
 ///
 /// [`History::transact`]: crate::History::transact
 pub fn put_structured<C: Core, T: Serialize + ?Sized>(
@@ -169,24 +170,30 @@ pub fn put_structured<C: Core, T: Serialize + ?Sized>(
 ) -> Result<bool> {
     let key = key.as_ref();
     let existing = map.get_cursor(key)?;
-    let had_key = existing.is_some();
-    let mut root = MapRoot { map, opened: false };
-    let place = Place { target: Target::Child(&mut root, Key::Map(key.to_vec())), existing, opened: None };
-    let present = value.serialize(ValueSer { place, optional: true }).map_err(|err| err.0)?;
-    let mut wrote = root.opened;
-    if !present && had_key {
-        wrote |= map.remove(key)?;
-    }
-    Ok(wrote)
+    write_lazily(value, existing, || map.put_cursor(key))
 }
 
 /// Reads the value under `key` in `map`, as [`read_structured`] does, or
-/// `None` if `key` is missing or its value is empty.
+/// `None` if `key` is missing. An empty value ([`Data::None`]) is read as
+/// `T`, so it's `None` for an `Option`, and an error for a struct.
 pub fn get_structured<C: Core, T: DeserializeOwned>(
     map: &ReadHashMap<'_, C>,
     key: impl AsRef<[u8]>,
 ) -> Result<Option<T>> {
-    map.get_value_cursor(key)?.map(|cursor| read_structured(&cursor)).transpose()
+    map.get_cursor(key)?.map(|cursor| read_structured(&cursor)).transpose()
+}
+
+/// Writes `value` over `existing`, at the place that `open` opens, only
+/// opening it if something differs.
+fn write_lazily<'a, C: Core, T: Serialize + ?Sized>(
+    value: &T,
+    existing: Option<ReadCursor<'a, C>>,
+    open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+) -> Result<bool> {
+    let mut root = LazyRoot { open: Some(open), opened: false };
+    let place = Place { target: Target::Child(&mut root, Key::Root), existing, opened: None };
+    value.serialize(ValueSer { place, optional: false }).map_err(|err| err.0)?;
+    Ok(root.opened)
 }
 
 // Errors
@@ -217,7 +224,7 @@ impl std::error::Error for Wrapped {}
 
 impl ser::Error for Wrapped {
     fn custom<M: fmt::Display>(msg: M) -> Self {
-        Wrapped(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, msg.to_string())))
+        Wrapped(Error::Serialize(Box::new(SerializeError { field: None, message: msg.to_string() })))
     }
 }
 
@@ -228,17 +235,18 @@ impl de::Error for Wrapped {
 }
 
 impl Wrapped {
-    /// Adds `name` to the front of the path of a decode error.
-    fn in_field(self, name: impl fmt::Display) -> Wrapped {
-        let mut decode = match self.0 {
-            Error::Decode(decode) => decode,
-            other => return Wrapped(other),
+    /// Adds `name` to the front of the path of a decode or serialize error.
+    fn in_field(mut self, name: impl fmt::Display) -> Wrapped {
+        let field = match &mut self.0 {
+            Error::Decode(decode) => &mut decode.field,
+            Error::Serialize(serialize) => &mut serialize.field,
+            _ => return self,
         };
-        decode.field = Some(match decode.field.take() {
+        *field = Some(match field.take() {
             Some(inner) => format!("{name}.{inner}"),
             None => name.to_string(),
         });
-        Wrapped(Error::Decode(decode))
+        self
     }
 }
 
@@ -250,7 +258,8 @@ type SerResult<T> = std::result::Result<T, Wrapped>;
 enum Key {
     /// The value that a root writes.
     Root,
-    Map(Vec<u8>),
+    /// A key of a map, with its hash if it's already known.
+    Map { key: Vec<u8>, hash: Option<Vec<u8>> },
     Index(i64),
     Append,
 }
@@ -262,30 +271,18 @@ trait Parent<'a, C: Core> {
     fn child(&mut self, key: &Key) -> Result<WriteCursor<'a, C>>;
 }
 
-/// The cursor given to [`write_structured`].
-struct CursorRoot<'r, 'a, C: Core> {
-    cursor: &'r mut WriteCursor<'a, C>,
+/// The place that [`put_structured`] and [`Map::put`](crate::Map::put)
+/// write to, which `open` opens.
+struct LazyRoot<F> {
+    open: Option<F>,
     opened: bool,
 }
 
-impl<'a, C: Core> Parent<'a, C> for CursorRoot<'_, 'a, C> {
+impl<'a, C: Core + 'a, F: FnOnce() -> Result<WriteCursor<'a, C>>> Parent<'a, C> for LazyRoot<F> {
     fn child(&mut self, _: &Key) -> Result<WriteCursor<'a, C>> {
+        let open = self.open.take().ok_or(Error::CursorNotWriteable)?;
         self.opened = true;
-        Ok(self.cursor.clone())
-    }
-}
-
-/// The map given to [`put_structured`].
-struct MapRoot<'r, 'a, C: Core> {
-    map: &'r mut WriteHashMap<'a, C>,
-    opened: bool,
-}
-
-impl<'a, C: Core> Parent<'a, C> for MapRoot<'_, 'a, C> {
-    fn child(&mut self, key: &Key) -> Result<WriteCursor<'a, C>> {
-        let Key::Map(key) = key else { unreachable!("a map root only has map keys") };
-        self.opened = true;
-        self.map.put_cursor(key)
+        open()
     }
 }
 
@@ -298,6 +295,8 @@ struct Place<'p, 'a, C: Core> {
 }
 
 enum Target<'p, 'a, C: Core> {
+    /// The cursor given to [`write_structured`], and whether it was used.
+    Cursor(&'p mut WriteCursor<'a, C>, &'p Cell<bool>),
     Child(&'p mut dyn Parent<'a, C>, Key),
     /// The contents of a tuple or struct variant, in the map that holds its
     /// name, which is finished along with them.
@@ -307,19 +306,25 @@ enum Target<'p, 'a, C: Core> {
 impl<'a, C: Core> Place<'_, 'a, C> {
     /// A cursor to the place, opening it (and its parents) if it isn't yet.
     fn cursor(&mut self) -> Result<&mut WriteCursor<'a, C>> {
-        if self.opened.is_none() {
-            let cursor = match &mut self.target {
-                Target::Child(parent, key) => parent.child(key)?,
-                Target::Variant { outer, key, .. } => outer.child(&Key::Map(key.clone()))?,
-            };
-            self.opened = Some(cursor);
+        let Place { target, opened, .. } = self;
+        match target {
+            Target::Cursor(cursor, touched) => {
+                touched.set(true);
+                Ok(&mut **cursor)
+            }
+            Target::Child(parent, key) => {
+                if opened.is_none() {
+                    *opened = Some(parent.child(key)?);
+                }
+                Ok(opened.as_mut().expect("the place was just opened"))
+            }
+            Target::Variant { outer, key, hash } => {
+                if opened.is_none() {
+                    *opened = Some(outer.child(&Key::Map { key: key.clone(), hash: hash.clone() })?);
+                }
+                Ok(opened.as_mut().expect("the place was just opened"))
+            }
         }
-        Ok(self.opened.as_mut().expect("the place was just opened"))
-    }
-
-    /// The tag of what's stored, or `None` if nothing is.
-    fn existing_tag(&self) -> Result<Option<Tag>> {
-        self.existing.as_ref().map(|cursor| Ok(cursor.slot()?.tag)).transpose()
     }
 
     /// Writes `data` unless it's already there.
@@ -335,7 +340,8 @@ impl<'a, C: Core> Place<'_, 'a, C> {
     /// For a container: opens the place, replacing what's stored if it
     /// isn't `tag` or empty.
     fn open_container(&mut self, tag: Tag) -> Result<&mut WriteCursor<'a, C>> {
-        let replace = !matches!(self.existing_tag()?, None | Some(Tag::None)) && self.existing_tag()? != Some(tag);
+        let existing = self.existing.as_ref().map(|cursor| cursor.slot()).transpose()?;
+        let replace = existing.is_some_and(|slot| slot.tag != Tag::None && slot.tag != tag);
         let cursor = self.cursor()?;
         if replace {
             cursor.write(Data::None)?;
@@ -343,10 +349,21 @@ impl<'a, C: Core> Place<'_, 'a, C> {
         Ok(cursor)
     }
 
+    /// Adds the variant's name to an error from its contents, if this place
+    /// holds a variant's contents.
+    fn in_variant(&self, err: Wrapped) -> Wrapped {
+        match &self.target {
+            Target::Variant { key, .. } => err.in_field(String::from_utf8_lossy(key)),
+            _ => err,
+        }
+    }
+
     /// Finishes the variant whose contents this place holds, if it does.
     fn finish(self) -> SerResult<()> {
         if let Target::Variant { mut outer, hash, .. } = self.target {
-            outer.seen.extend(hash);
+            if let Some(hash) = hash {
+                outer.stored.remove(&hash);
+            }
             outer.finish()?;
         }
         Ok(())
@@ -354,8 +371,8 @@ impl<'a, C: Core> Place<'_, 'a, C> {
 }
 
 /// Serializes a value into a [`Place`]. `Ok` is whether the value is
-/// present: `None` and `()` aren't, where they're `optional`, so the parent
-/// map leaves their key out.
+/// present: a struct field (`optional`) that's `None` isn't, so its map
+/// leaves it out.
 struct ValueSer<'p, 'a, C: Core> {
     place: Place<'p, 'a, C>,
     optional: bool,
@@ -367,11 +384,9 @@ impl<'a, C: Core> ValueSer<'_, 'a, C> {
         Ok(true)
     }
 
-    fn none(self) -> SerResult<bool> {
-        if self.optional {
-            return Ok(false);
-        }
-        self.scalar(Data::None)
+    /// The same place, for a value that isn't directly a field's `None`.
+    fn inner(self) -> Self {
+        ValueSer { place: self.place, optional: false }
     }
 }
 
@@ -391,7 +406,8 @@ impl<'p, 'a, C: Core> ser::Serializer for ValueSer<'p, 'a, C> {
     type SerializeStructVariant = MapSer<'p, 'a, C>;
 
     fn serialize_bool(self, v: bool) -> SerResult<bool> {
-        self.scalar(Data::Uint(u64::from(v)))
+        let text: &[u8] = if v { b"true" } else { b"false" };
+        self.scalar(Data::tagged_bytes(text, BOOL_FORMAT_TAG))
     }
 
     fn serialize_i8(self, v: i8) -> SerResult<bool> {
@@ -455,19 +471,22 @@ impl<'p, 'a, C: Core> ser::Serializer for ValueSer<'p, 'a, C> {
     }
 
     fn serialize_none(self) -> SerResult<bool> {
-        self.none()
+        if self.optional {
+            return Ok(false);
+        }
+        self.scalar(Data::None)
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> SerResult<bool> {
-        value.serialize(self)
+        value.serialize(self.inner())
     }
 
     fn serialize_unit(self) -> SerResult<bool> {
-        self.none()
+        self.scalar(Data::None)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> SerResult<bool> {
-        self.none()
+        self.scalar(Data::None)
     }
 
     fn serialize_unit_variant(self, _name: &'static str, _index: u32, variant: &'static str) -> SerResult<bool> {
@@ -475,7 +494,7 @@ impl<'p, 'a, C: Core> ser::Serializer for ValueSer<'p, 'a, C> {
     }
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(self, _name: &'static str, value: &T) -> SerResult<bool> {
-        value.serialize(self)
+        value.serialize(self.inner())
     }
 
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
@@ -536,22 +555,20 @@ impl<'p, 'a, C: Core> ser::Serializer for ValueSer<'p, 'a, C> {
 fn variant_place<'p, 'a, C: Core>(place: Place<'p, 'a, C>, variant: &str) -> SerResult<Place<'p, 'a, C>> {
     let outer = MapSer::new(place)?;
     let key = variant.as_bytes().to_vec();
-    let (hash, existing) = outer.lookup(&key)?;
+    let (hash, existing) = outer.lookup(&key);
     Ok(Place { target: Target::Variant { outer: Box::new(outer), key, hash }, existing, opened: None })
 }
-
-/// The hash of a key in a stored map, if there is one, and what's stored
-/// at it, if anything.
-type Lookup<'a, C> = (Option<Vec<u8>>, Option<ReadCursor<'a, C>>);
 
 /// Serializes a struct, a map, or the map around a variant, into a hash map.
 struct MapSer<'p, 'a, C: Core> {
     place: Place<'p, 'a, C>,
     /// The stored map, if there is one.
     existing: Option<ReadHashMap<'a, C>>,
+    /// The stored map's entries, by the hashes of their keys, that haven't
+    /// been written again yet. The stored map is read once, here, rather
+    /// than looking up each key and then finding the ones that are gone.
+    stored: HashMap<Vec<u8>, ReadCursor<'a, C>>,
     map: Option<WriteHashMap<'a, C>>,
-    /// The hashes of the stored map's keys that are still present.
-    seen: HashSet<Vec<u8>>,
     /// The key of a map entry whose value is next.
     key: Option<Vec<u8>>,
 }
@@ -562,7 +579,14 @@ impl<'p, 'a, C: Core> MapSer<'p, 'a, C> {
             Some(cursor) if cursor.slot()?.tag == Tag::HashMap => Some(ReadHashMap::new(cursor.clone())?),
             _ => None,
         };
-        let mut ser = MapSer { place, existing, map: None, seen: HashSet::new(), key: None };
+        let mut stored = HashMap::new();
+        if let Some(existing) = &existing {
+            for kv in existing.entries()? {
+                let kv = kv?;
+                stored.insert(kv.hash, kv.value_cursor);
+            }
+        }
+        let mut ser = MapSer { place, existing, stored, map: None, key: None };
         // a new map is written even if it stays empty
         if ser.existing.is_none() {
             ser.open()?;
@@ -578,36 +602,32 @@ impl<'p, 'a, C: Core> MapSer<'p, 'a, C> {
         Ok(self.map.as_mut().expect("the map was just opened"))
     }
 
-    /// The hash of `key`, and what's stored at it, in the stored map.
-    fn lookup(&self, key: &[u8]) -> Result<Lookup<'a, C>> {
-        let Some(existing) = &self.existing else { return Ok((None, None)) };
+    /// The hash of `key`, if there's a stored map, and what's stored at it.
+    fn lookup(&self, key: &[u8]) -> (Option<Vec<u8>>, Option<ReadCursor<'a, C>>) {
+        let Some(existing) = &self.existing else { return (None, None) };
         let hash = existing.hash(key);
-        let cursor = existing.get_cursor_by_hash(&hash)?;
-        Ok((Some(hash), cursor))
+        let cursor = self.stored.get(&hash).cloned();
+        (Some(hash), cursor)
     }
 
     fn field<T: Serialize + ?Sized>(&mut self, key: &[u8], value: &T, optional: bool) -> SerResult<()> {
-        let (hash, existing) = self.lookup(key)?;
-        let place = Place { target: Target::Child(self, Key::Map(key.to_vec())), existing, opened: None };
-        if value.serialize(ValueSer { place, optional })? {
-            self.seen.extend(hash);
+        let (hash, existing) = self.lookup(key);
+        let child = Key::Map { key: key.to_vec(), hash: hash.clone() };
+        let place = Place { target: Target::Child(self, child), existing, opened: None };
+        let present = value
+            .serialize(ValueSer { place, optional })
+            .map_err(|err| self.place.in_variant(err.in_field(String::from_utf8_lossy(key))))?;
+        if present && let Some(hash) = hash {
+            self.stored.remove(&hash);
         }
         Ok(())
     }
 
     /// Removes the stored keys that weren't written again.
     fn finish(mut self) -> SerResult<bool> {
-        if let Some(existing) = &self.existing {
-            let mut stale = Vec::new();
-            for kv in existing.entries()? {
-                let kv = kv?;
-                if !self.seen.contains(&kv.hash) {
-                    stale.push(kv.hash);
-                }
-            }
-            for hash in stale {
-                self.open()?.remove_by_hash(&hash)?;
-            }
+        let stale: Vec<Vec<u8>> = self.stored.drain().map(|(hash, _)| hash).collect();
+        for hash in stale {
+            self.open()?.remove_by_hash(&hash)?;
         }
         self.place.finish()?;
         Ok(true)
@@ -616,36 +636,39 @@ impl<'p, 'a, C: Core> MapSer<'p, 'a, C> {
 
 impl<'a, C: Core> Parent<'a, C> for MapSer<'_, 'a, C> {
     fn child(&mut self, key: &Key) -> Result<WriteCursor<'a, C>> {
-        let Key::Map(key) = key else { unreachable!("a map only has map keys") };
-        self.open()?.put_cursor(key)
+        let Key::Map { key, hash } = key else { unreachable!("a map only has map keys") };
+        let map = self.open()?;
+        match hash {
+            Some(hash) => {
+                map.put_key_by_hash(hash, Data::bytes(&key[..]))?;
+                map.put_cursor_by_hash(hash)
+            }
+            None => map.put_cursor(key),
+        }
     }
 }
 
-impl<C: Core> ser::SerializeStruct for MapSer<'_, '_, C> {
-    type Ok = bool;
-    type Error = Wrapped;
+macro_rules! struct_impls {
+    ($($trait:ident),*) => {
+        $(
+            impl<C: Core> ser::$trait for MapSer<'_, '_, C> {
+                type Ok = bool;
+                type Error = Wrapped;
 
-    fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> SerResult<()> {
-        self.field(key.as_bytes(), value, true)
-    }
+                fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> SerResult<()> {
+                    // only a struct field's None is left out
+                    self.field(key.as_bytes(), value, true)
+                }
 
-    fn end(self) -> SerResult<bool> {
-        self.finish()
-    }
+                fn end(self) -> SerResult<bool> {
+                    self.finish()
+                }
+            }
+        )*
+    };
 }
 
-impl<C: Core> ser::SerializeStructVariant for MapSer<'_, '_, C> {
-    type Ok = bool;
-    type Error = Wrapped;
-
-    fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> SerResult<()> {
-        self.field(key.as_bytes(), value, true)
-    }
-
-    fn end(self) -> SerResult<bool> {
-        self.finish()
-    }
-}
+struct_impls!(SerializeStruct, SerializeStructVariant);
 
 impl<C: Core> ser::SerializeMap for MapSer<'_, '_, C> {
     type Ok = bool;
@@ -658,7 +681,7 @@ impl<C: Core> ser::SerializeMap for MapSer<'_, '_, C> {
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> SerResult<()> {
         let key = self.key.take().ok_or_else(|| <Wrapped as ser::Error>::custom("a map value came before its key"))?;
-        self.field(&key, value, true)
+        self.field(&key, value, false)
     }
 
     fn end(self) -> SerResult<bool> {
@@ -702,12 +725,15 @@ impl<'p, 'a, C: Core> SeqSer<'p, 'a, C> {
     }
 
     fn item<T: Serialize + ?Sized>(&mut self, value: &T) -> SerResult<()> {
+        let index = self.index;
         let (key, existing) = match &self.existing {
-            Some(list) if self.index < self.existing_len => (Key::Index(self.index), list.get_cursor(self.index)?),
+            Some(list) if index < self.existing_len => (Key::Index(index), list.get_cursor(index)?),
             _ => (Key::Append, None),
         };
         let place = Place { target: Target::Child(self, key), existing, opened: None };
-        value.serialize(ValueSer { place, optional: false })?;
+        value
+            .serialize(ValueSer { place, optional: false })
+            .map_err(|err| self.place.in_variant(err.in_field(index)))?;
         self.index += 1;
         Ok(())
     }
@@ -887,13 +913,16 @@ struct ValueDe<'a, C: Core> {
     cursor: ReadCursor<'a, C>,
 }
 
-impl<'a, C: Core> ValueDe<'a, C> {
+impl<C: Core> ValueDe<'_, C> {
     fn tag(&self) -> Result<Tag> {
         Ok(self.cursor.slot()?.tag)
     }
 
-    fn unexpected(&self, expected: &str) -> SerResult<Wrapped> {
-        Ok(de::Error::custom(format_args!("expected {expected}, found {:?}", self.tag()?)))
+    fn unexpected(&self, expected: &str) -> Wrapped {
+        match self.tag() {
+            Ok(tag) => de::Error::custom(format_args!("expected {expected}, found {tag:?}")),
+            Err(err) => Wrapped(err),
+        }
     }
 }
 
@@ -907,22 +936,33 @@ impl<'de, C: Core> de::Deserializer<'de> for ValueDe<'_, C> {
             Tag::Uint => visitor.visit_u64(slot.value as u64),
             Tag::Int => visitor.visit_i64(slot.value),
             Tag::Float => visitor.visit_f64(f64::from_bits(slot.value as u64)),
-            Tag::Bytes | Tag::ShortBytes => match String::from_utf8(self.cursor.read_bytes(None)?) {
-                Ok(string) => visitor.visit_string(string),
-                Err(err) => visitor.visit_byte_buf(err.into_bytes()),
-            },
+            Tag::Bytes | Tag::ShortBytes => {
+                let bytes = self.cursor.read_bytes_object(None)?;
+                if let Some(value) = tagged_bool(&bytes) {
+                    return visitor.visit_bool(value);
+                }
+                match String::from_utf8(bytes.value.into_owned()) {
+                    Ok(string) => visitor.visit_string(string),
+                    Err(err) => visitor.visit_byte_buf(err.into_bytes()),
+                }
+            }
             Tag::HashMap => visitor.visit_map(MapDe::new(&self.cursor)?),
             Tag::ArrayList => visitor.visit_seq(SeqDe::new(&self.cursor)?),
-            _ => Err(self.unexpected("a hash map, an array list or a scalar")?),
+            _ => Err(self.unexpected("a hash map, an array list or a scalar")),
         }
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> SerResult<V::Value> {
         let slot = self.cursor.slot()?;
-        match (slot.tag, slot.value) {
-            (Tag::Uint, 0) => visitor.visit_bool(false),
-            (Tag::Uint, 1) => visitor.visit_bool(true),
-            _ => Err(self.unexpected("a bool (the Uint 0 or 1)")?),
+        let value = match (slot.tag, slot.value) {
+            (Tag::Uint, 0) => Some(false),
+            (Tag::Uint, 1) => Some(true),
+            (Tag::ShortBytes, _) => tagged_bool(&self.cursor.read_bytes_object(Some(8))?),
+            _ => None,
+        };
+        match value {
+            Some(value) => visitor.visit_bool(value),
+            None => Err(self.unexpected("a bool (true or false tagged \"bl\", or the Uint 0 or 1)")),
         }
     }
 
@@ -969,7 +1009,7 @@ impl<'de, C: Core> de::Deserializer<'de> for ValueDe<'_, C> {
                     .map_err(|_| <Wrapped as de::Error>::custom("a variant's name isn't valid utf-8"))?;
                 visitor.visit_enum(EnumDe { variant, content: kv.value_cursor })
             }
-            _ => Err(self.unexpected("a variant's name, or a map with one key")?),
+            _ => Err(self.unexpected("a variant's name, or a map with one key")),
         }
     }
 
@@ -991,10 +1031,11 @@ fn read_key<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<Vec<u8>> {
     }
 }
 
-/// The entries of a hash map, skipping empty values.
+/// The entries of a hash map.
 struct MapDe<'a, C: Core> {
     entries: KvPairIterator<'a, C>,
     value: Option<ReadCursor<'a, C>>,
+    /// The key of the entry whose value is next.
     key: Vec<u8>,
 }
 
@@ -1008,16 +1049,11 @@ impl<'de, C: Core> de::MapAccess<'de> for MapDe<'_, C> {
     type Error = Wrapped;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> SerResult<Option<K::Value>> {
-        for kv in self.entries.by_ref() {
-            let kv = kv?;
-            if !has_value(&kv.value_cursor) {
-                continue;
-            }
-            self.key = read_key(&kv.key_cursor)?;
-            self.value = Some(kv.value_cursor);
-            return seed.deserialize(KeyDe { key: self.key.clone() }).map(Some);
-        }
-        Ok(None)
+        let Some(kv) = self.entries.next() else { return Ok(None) };
+        let kv = kv?;
+        self.key = read_key(&kv.key_cursor)?;
+        self.value = Some(kv.value_cursor);
+        seed.deserialize(KeyDe { key: &self.key }).map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> SerResult<V::Value> {
@@ -1102,13 +1138,13 @@ impl<'de, C: Core> de::VariantAccess<'de> for VariantDe<'_, C> {
 
 /// Deserializes a map key from its bytes: a string, bytes, or a number, a
 /// bool or a char from its text.
-struct KeyDe {
-    key: Vec<u8>,
+struct KeyDe<'k> {
+    key: &'k [u8],
 }
 
-impl KeyDe {
+impl KeyDe<'_> {
     fn text(&self) -> SerResult<&str> {
-        std::str::from_utf8(&self.key).map_err(|_| de::Error::custom("a map key isn't valid utf-8"))
+        std::str::from_utf8(self.key).map_err(|_| de::Error::custom("a map key isn't valid utf-8"))
     }
 
     fn parse<T: std::str::FromStr>(&self, kind: &str) -> SerResult<T> {
@@ -1127,13 +1163,13 @@ macro_rules! key_from_text {
     };
 }
 
-impl<'de> de::Deserializer<'de> for KeyDe {
+impl<'de> de::Deserializer<'de> for KeyDe<'_> {
     type Error = Wrapped;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> SerResult<V::Value> {
-        match String::from_utf8(self.key) {
-            Ok(string) => visitor.visit_string(string),
-            Err(err) => visitor.visit_byte_buf(err.into_bytes()),
+        match std::str::from_utf8(self.key) {
+            Ok(text) => visitor.visit_str(text),
+            Err(_) => visitor.visit_bytes(self.key),
         }
     }
 
@@ -1145,11 +1181,11 @@ impl<'de> de::Deserializer<'de> for KeyDe {
     );
 
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> SerResult<V::Value> {
-        visitor.visit_byte_buf(self.key)
+        visitor.visit_bytes(self.key)
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> SerResult<V::Value> {
-        visitor.visit_byte_buf(self.key)
+        visitor.visit_bytes(self.key)
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> SerResult<V::Value> {
@@ -1166,7 +1202,8 @@ impl<'de> de::Deserializer<'de> for KeyDe {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> SerResult<V::Value> {
-        visitor.visit_enum(self.text()?.into_deserializer())
+        let name: de::value::StrDeserializer<'_, Wrapped> = self.text()?.into_deserializer();
+        visitor.visit_enum(name)
     }
 
     serde::forward_to_deserialize_any! {

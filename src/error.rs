@@ -85,7 +85,34 @@ pub enum Error {
     /// of the [`DecodeError`], so it has no
     /// [`source`](std::error::Error::source).
     Decode(Box<DecodeError>),
+    /// A value couldn't be stored by a codec, such as a
+    /// [`Structured`](crate::Structured) value with a map key that isn't
+    /// text. Boxed, like [`Error::Decode`].
+    Serialize(Box<SerializeError>),
 }
+
+/// The details of an [`Error::Serialize`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SerializeError {
+    /// The path to the part of the value that couldn't be stored, like
+    /// `"clusters.3.labels"`, if it's known.
+    pub field: Option<String>,
+    /// What was wrong.
+    pub message: String,
+}
+
+impl fmt::Display for SerializeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("couldn't serialize")?;
+        if let Some(field) = &self.field {
+            write!(f, " field {field:?}")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for SerializeError {}
 
 /// The details of an [`Error::Decode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +182,7 @@ impl fmt::Display for Error {
                 return write!(f, "migration version {version} must be greater than {previous}");
             }
             Error::Decode(err) => return write!(f, "{err}"),
+            Error::Serialize(err) => return write!(f, "{err}"),
             Error::NestedTopLevelWrite => "nested top-level writes are not allowed",
             Error::FrozenSlot => {
                 "writer points into frozen data; reacquire it from the transaction root"

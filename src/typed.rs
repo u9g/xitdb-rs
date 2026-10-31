@@ -36,7 +36,7 @@ use std::marker::PhantomData;
 use crate::collections::{KvPairIterator, ReadHashMap, ReadHashSet, WriteHashMap, WriteHashSet, has_value};
 use crate::core::Core;
 use crate::cursor::{CursorIterator, ReadCursor, ReadKvPairCursor, WriteCursor};
-use crate::data::Data;
+use crate::data::{Bytes, Data};
 use crate::error::{DecodeError, Error, Result};
 use crate::slot::Tag;
 
@@ -94,7 +94,9 @@ pub trait KeyCodec: fmt::Debug {
 ///   the Go and Java implementations can't read a `Uint` above `i64::MAX`
 ///   (their `readUint` rejects it), so stay below that to share data.
 /// * `f64` is [`Data::Float`].
-/// * `bool` is [`Data::Uint`] `0` or `1`; any other value is an error.
+/// * `bool` is [`Data::Uint`] `0` or `1`. It also reads the text `true` or
+///   `false` tagged [`BOOL_FORMAT_TAG`], as `Structured` stores bools; any
+///   other value is an error.
 /// * `Option<T>` writes `None` as an empty value ([`Data::None`]), and reads
 ///   an empty value as `None`. In a [`Map`], that reads as a missing key,
 ///   so use [`Map::remove`] there; `Option` is for nested structures,
@@ -142,6 +144,58 @@ pub trait ValueCodec {
     ) -> Result<()> {
         let _ = old;
         Self::write(new, cursor)
+    }
+
+    /// For [`Map::put`]: writes `value` over `existing`, what's stored now
+    /// (or `None` if nothing is), only if it would store something
+    /// different, and returns whether it wrote. The place is only opened,
+    /// with `open`, once it's known to differ, so an unchanged value writes
+    /// nothing at all, not even the path to it. (This is unrelated to
+    /// [`ValueCodec::write_changed`], which is called once a value is known
+    /// to have changed.)
+    ///
+    /// By default, this always opens the place and calls
+    /// [`ValueCodec::write`]. The built-in codecs compare first, as
+    /// [`ReadCursor::equals`] does, and `Structured` compares as it writes,
+    /// part by part.
+    fn write_if_changed<'a, C: Core>(
+        value: &Self::Borrowed,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        let _ = existing;
+        Self::write(value, &mut open()?)?;
+        Ok(true)
+    }
+}
+
+/// [`ValueCodec::write_if_changed`] for a value that's written as `data`.
+pub(crate) fn write_data_if_changed<'a, C: Core>(
+    data: Data<'_>,
+    existing: Option<&ReadCursor<'a, C>>,
+    open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+) -> Result<bool> {
+    if let Some(existing) = existing
+        && existing.equals_data(&data)?
+    {
+        return Ok(false);
+    }
+    open()?.write(data)?;
+    Ok(true)
+}
+
+/// The format tag of a bool stored as the text `true` or `false`, as
+/// [`Structured`](crate::Structured) stores bools, so that readers can tell
+/// them from numbers. The `bool` codec writes the `Uint` `0` or `1`, and
+/// reads both.
+pub const BOOL_FORMAT_TAG: [u8; 2] = *b"bl";
+
+/// The bool that bytes tagged [`BOOL_FORMAT_TAG`] hold, if they do.
+pub(crate) fn tagged_bool(bytes: &Bytes<'_>) -> Option<bool> {
+    match (bytes.format_tag, &*bytes.value) {
+        (Some(BOOL_FORMAT_TAG), b"true") => Some(true),
+        (Some(BOOL_FORMAT_TAG), b"false") => Some(false),
+        _ => None,
     }
 }
 
@@ -273,6 +327,14 @@ impl ValueCodec for String {
     fn write<C: Core>(value: &str, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(value)
     }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &str,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::string(value), existing, open)
+    }
 }
 
 impl ValueCodec for Vec<u8> {
@@ -285,6 +347,14 @@ impl ValueCodec for Vec<u8> {
 
     fn write<C: Core>(value: &[u8], cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(value)
+    }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &[u8],
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::bytes(value), existing, open)
     }
 }
 
@@ -304,6 +374,14 @@ impl ValueCodec for i64 {
     fn write<C: Core>(value: &i64, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(*value)
     }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &i64,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::Int(*value), existing, open)
+    }
 }
 
 impl ValueCodec for u64 {
@@ -322,6 +400,14 @@ impl ValueCodec for u64 {
     fn write<C: Core>(value: &u64, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(*value)
     }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &u64,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::Uint(*value), existing, open)
+    }
 }
 
 impl ValueCodec for f64 {
@@ -339,6 +425,14 @@ impl ValueCodec for f64 {
         cursor.write(*value)
     }
 
+    fn write_if_changed<'a, C: Core>(
+        value: &f64,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::Float(*value), existing, open)
+    }
+
     fn changed(old: &f64, new: &f64) -> Option<bool> {
         Some(old.to_bits() != new.to_bits())
     }
@@ -349,6 +443,11 @@ impl ValueCodec for bool {
     type Borrowed = bool;
 
     fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<bool> {
+        let tag = value_tag(cursor)?;
+        if matches!(tag, Tag::Bytes | Tag::ShortBytes) {
+            let bytes = cursor.read_bytes_object(Some(8))?;
+            return tagged_bool(&bytes).ok_or_else(|| unexpected("a bool (0 or 1)", tag));
+        }
         match read_integer(cursor, "a bool (0 or 1)")? {
             Integer::Uint(0) => Ok(false),
             Integer::Uint(1) => Ok(true),
@@ -359,6 +458,14 @@ impl ValueCodec for bool {
 
     fn write<C: Core>(value: &bool, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(u64::from(*value))
+    }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &bool,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        write_data_if_changed(Data::Uint(u64::from(*value)), existing, open)
     }
 }
 
@@ -380,6 +487,17 @@ where
         match value {
             Some(value) => T::write(value.borrow(), cursor),
             None => cursor.write(Data::None),
+        }
+    }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &Option<T::Owned>,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        match value {
+            Some(value) => T::write_if_changed(value.borrow(), existing, open),
+            None => write_data_if_changed(Data::None, existing, open),
         }
     }
 
@@ -467,6 +585,15 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> ValueCodec for Json<T> {
     fn write<C: Core>(value: &T, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         let json = serde_json::to_vec(value).map_err(std::io::Error::from)?;
         cursor.write(Data::tagged_bytes(json, JSON_FORMAT_TAG))
+    }
+
+    fn write_if_changed<'a, C: Core>(
+        value: &T,
+        existing: Option<&ReadCursor<'a, C>>,
+        open: impl FnOnce() -> Result<WriteCursor<'a, C>>,
+    ) -> Result<bool> {
+        let json = serde_json::to_vec(value).map_err(std::io::Error::from)?;
+        write_data_if_changed(Data::tagged_bytes(json, JSON_FORMAT_TAG), existing, open)
     }
 }
 
@@ -651,9 +778,22 @@ impl<K: KeyCodec + ?Sized, V: ValueCodec> Map<K, V> {
     }
 
     /// Sets `key` to `value`, creating the collection if it's missing.
+    ///
+    /// The codec's [`ValueCodec::write_if_changed`] compares with what's
+    /// stored first, and the collection and the key are only opened for
+    /// writing if the value differs. For the built-in codecs and
+    /// [`Structured`](crate::Structured), an unchanged value writes nothing
+    /// at all, so [`History::transact`] doesn't commit a new moment.
+    ///
+    /// [`History::transact`]: crate::History::transact
     pub fn put<C: Core>(&self, parent: &mut WriteHashMap<'_, C>, key: &K, value: &V::Borrowed) -> Result<()> {
-        let mut cursor = self.collection_mut(parent)?.put_cursor(key.encode_key())?;
-        V::write(value, &mut cursor)
+        let key = key.encode_key();
+        let existing = match self.collection(parent)? {
+            Some(map) => map.get_cursor(&key)?,
+            None => None,
+        };
+        V::write_if_changed(value, existing.as_ref(), || self.collection_mut(parent)?.put_cursor(&key))?;
+        Ok(())
     }
 
     /// Removes `key`, returning whether it had a value. If it didn't (it's
