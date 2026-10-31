@@ -28,6 +28,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Sorting and Paginating](#sorting-and-paginating)
 * [Large Byte Arrays](#large-byte-arrays)
 * [Iterators](#iterators)
+* [Accessors](#accessors)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
 * [Replication](#replication)
@@ -507,6 +508,50 @@ fn main() -> xitdb::Result<()> {
 ```
 
 `ArrayList` and `LinkedArrayList` also have an `iter_from` method, which starts the iterator from the given index. `SortedMap` and `SortedSet` have `iter_from` and `iter_from_index` to start the iterator from a key or index respectively.
+
+## Accessors
+
+The cursor methods above can do anything, but nesting and reading typed values take a few steps each. The collections have shorthands for the common cases:
+
+* `WriteHashMap::put_map`, `put_set` and `put_list` store a key and return a collection at its value. They are shorthand for `WriteHashMap::new(&mut map.put_cursor(key)?)` and so on, so an existing collection of that kind keeps its contents and any other value is an `Error::UnexpectedTag` (as with `WriteHashMap::new`, a hash map and a hash set can be opened as each other). `WriteArrayList` has the same methods taking an index, plus `append_map`, `append_set` and `append_list`.
+* `ReadHashMap::get_map`, `get_set` and `get_list` return `Result<Option<_>>`, with `None` if the key is absent. So do the typed getters `get_bytes`, `get_string`, `get_int`, `get_uint` and `get_float`, which return `Error::UnexpectedTag` if the value is a different type.
+* `ReadCursor::read_string` reads a byte array as a `String`. Invalid UTF-8 is an `Error::InvalidUtf8` rather than being replaced; use `read_bytes` for lossy decoding.
+* `entries()` on hash and sorted maps yields a `ReadKvPairCursor` (a key cursor and a value cursor) for each pair, and `keys()` on hash and sorted sets yields key cursors. `iter()` still yields the raw cursors that need `read_key_value_pair`.
+
+```rust
+use xitdb::*;
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    db.run_context(|cursor| {
+        let mut moment = WriteHashMap::new(cursor)?;
+        moment.put("started-at", 1700000000i64)?;
+        let mut merge = moment.put_map("merges")?.put_map("https://example.com/pr/1")?;
+        merge.put("status", "merged")?;
+        moment.put_set("tags")?.put("urgent")?;
+        Ok(())
+    })?;
+
+    let moment = ReadHashMap::new(db.root_cursor())?;
+    assert_eq!(moment.get_int("started-at")?, Some(1700000000));
+    assert_eq!(moment.get_int("finished-at")?, None);
+
+    if let Some(merges) = moment.get_map("merges")? {
+        for kv in merges.entries()? {
+            let kv = kv?;
+            let url = kv.key_cursor.read_string(Some(1024))?;
+            let status = ReadHashMap::new(kv.value_cursor)?.get_string("status", Some(1024))?;
+            assert_eq!((url.as_str(), status.as_deref()), ("https://example.com/pr/1", Some("merged")));
+        }
+    }
+
+    let tags = moment.get_set("tags")?.unwrap();
+    for key in tags.keys()? {
+        assert_eq!(key?.read_string(Some(1024))?, "urgent");
+    }
+    Ok(())
+}
+```
 
 ## Hashing
 

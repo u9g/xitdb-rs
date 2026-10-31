@@ -53,6 +53,35 @@ fn removed(result: Result<WriteCursor<'_, impl Core>>) -> Result<bool> {
     }
 }
 
+/// Iterates over the key-value pairs of a map, yielding cursors to each
+/// pair's key and value. Made by [`ReadHashMap::entries`] and
+/// [`ReadSortedMap::entries`].
+pub struct KvPairIterator<'a, C: Core> {
+    iter: CursorIterator<'a, C>,
+}
+
+impl<'a, C: Core> Iterator for KvPairIterator<'a, C> {
+    type Item = Result<ReadKvPairCursor<'a, C>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|cursor| cursor?.read_key_value_pair())
+    }
+}
+
+/// Iterates over the keys of a set, yielding cursors to them. Made by
+/// [`ReadHashSet::keys`] and [`ReadSortedSet::keys`].
+pub struct KeyIterator<'a, C: Core> {
+    iter: CursorIterator<'a, C>,
+}
+
+impl<'a, C: Core> Iterator for KeyIterator<'a, C> {
+    type Item = Result<ReadCursor<'a, C>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|cursor| Ok(cursor?.read_key_value_pair()?.key_cursor))
+    }
+}
+
 impl<'a, C: Core> From<WriteCursor<'a, C>> for ReadCursor<'a, C> {
     fn from(cursor: WriteCursor<'a, C>) -> Self {
         cursor.read
@@ -162,6 +191,42 @@ impl<'a, C: Core> WriteArrayList<'a, C> {
 
     pub fn append_cursor(&mut self) -> Result<WriteCursor<'a, C>> {
         self.cursor.write_path(&[PathPart::ArrayListAppend])
+    }
+
+    /// Initializes a hash map at `index`, unless there already is one, and
+    /// returns it. Shorthand for
+    /// `WriteHashMap::new(&mut list.put_cursor(index)?)`, so it has the
+    /// same semantics: an existing map keeps its contents (as does a set,
+    /// which becomes a map), and any other existing value is an
+    /// [`Error::UnexpectedTag`].
+    pub fn put_map(&mut self, index: i64) -> Result<WriteHashMap<'a, C>> {
+        WriteHashMap::new(&mut self.put_cursor(index)?)
+    }
+
+    /// Like [`WriteArrayList::put_map`], for a hash set.
+    pub fn put_set(&mut self, index: i64) -> Result<WriteHashSet<'a, C>> {
+        WriteHashSet::new(&mut self.put_cursor(index)?)
+    }
+
+    /// Like [`WriteArrayList::put_map`], for an array list.
+    pub fn put_list(&mut self, index: i64) -> Result<WriteArrayList<'a, C>> {
+        WriteArrayList::new(&mut self.put_cursor(index)?)
+    }
+
+    /// Appends a new, empty hash map and returns it. Shorthand for
+    /// `WriteHashMap::new(&mut list.append_cursor()?)`.
+    pub fn append_map(&mut self) -> Result<WriteHashMap<'a, C>> {
+        WriteHashMap::new(&mut self.append_cursor()?)
+    }
+
+    /// Appends a new, empty hash set and returns it.
+    pub fn append_set(&mut self) -> Result<WriteHashSet<'a, C>> {
+        WriteHashSet::new(&mut self.append_cursor()?)
+    }
+
+    /// Appends a new, empty array list and returns it.
+    pub fn append_list(&mut self) -> Result<WriteArrayList<'a, C>> {
+        WriteArrayList::new(&mut self.append_cursor()?)
     }
 
     /// Appends `data`, then runs `f` with a cursor to the new item, in one
@@ -335,8 +400,58 @@ impl<'a, C: Core> ReadHashMap<'a, C> {
         self.cursor.iter()
     }
 
+    /// Like [`ReadHashMap::iter`], but yields the key and value cursors of
+    /// each pair, as [`ReadCursor::read_key_value_pair`] returns them.
+    pub fn entries(&self) -> Result<KvPairIterator<'a, C>> {
+        Ok(KvPairIterator { iter: self.cursor.iter()? })
+    }
+
     fn hash(&self, key: impl AsRef<[u8]>) -> Vec<u8> {
         self.cursor.db.digest(key.as_ref())
+    }
+
+    /// The hash map at `key`, or `None` if it isn't in the map. A value
+    /// that isn't a map (or set) is an [`Error::UnexpectedTag`].
+    pub fn get_map(&self, key: impl AsRef<[u8]>) -> Result<Option<ReadHashMap<'a, C>>> {
+        self.get_cursor(key)?.map(ReadHashMap::new).transpose()
+    }
+
+    /// Like [`ReadHashMap::get_map`], for a hash set.
+    pub fn get_set(&self, key: impl AsRef<[u8]>) -> Result<Option<ReadHashSet<'a, C>>> {
+        self.get_cursor(key)?.map(ReadHashSet::new).transpose()
+    }
+
+    /// Like [`ReadHashMap::get_map`], for an array list.
+    pub fn get_list(&self, key: impl AsRef<[u8]>) -> Result<Option<ReadArrayList<'a, C>>> {
+        self.get_cursor(key)?.map(ReadArrayList::new).transpose()
+    }
+
+    /// The byte array at `key`, or `None` if it isn't in the map. See
+    /// [`ReadCursor::read_bytes`] for `max_size`.
+    pub fn get_bytes(&self, key: impl AsRef<[u8]>, max_size: Option<u64>) -> Result<Option<Vec<u8>>> {
+        self.get_cursor(key)?.map(|cursor| cursor.read_bytes(max_size)).transpose()
+    }
+
+    /// The string at `key`, or `None` if it isn't in the map. Invalid UTF-8
+    /// is an [`Error::InvalidUtf8`] (see [`ReadCursor::read_string`]).
+    pub fn get_string(&self, key: impl AsRef<[u8]>, max_size: Option<u64>) -> Result<Option<String>> {
+        self.get_cursor(key)?.map(|cursor| cursor.read_string(max_size)).transpose()
+    }
+
+    /// The signed integer at `key`, or `None` if it isn't in the map. Any
+    /// other type of value is an [`Error::UnexpectedTag`].
+    pub fn get_int(&self, key: impl AsRef<[u8]>) -> Result<Option<i64>> {
+        self.get_cursor(key)?.map(|cursor| cursor.read_int()).transpose()
+    }
+
+    /// Like [`ReadHashMap::get_int`], for an unsigned integer.
+    pub fn get_uint(&self, key: impl AsRef<[u8]>) -> Result<Option<u64>> {
+        self.get_cursor(key)?.map(|cursor| cursor.read_uint()).transpose()
+    }
+
+    /// Like [`ReadHashMap::get_int`], for a float.
+    pub fn get_float(&self, key: impl AsRef<[u8]>) -> Result<Option<f64>> {
+        self.get_cursor(key)?.map(|cursor| cursor.read_float()).transpose()
     }
 
     /// The value of `key`, or `None` if it isn't in the map.
@@ -420,6 +535,30 @@ impl<'a, C: Core> WriteHashMap<'a, C> {
         let hash = self.hash(key);
         self.put_key_by_hash(&hash, Data::bytes(key))?;
         self.put_cursor_by_hash(&hash)
+    }
+
+    /// Stores `key` and initializes a hash map as its value, unless there
+    /// already is one, and returns it. Shorthand for
+    /// `WriteHashMap::new(&mut map.put_cursor(key)?)`, so it has the same
+    /// semantics: an existing map keeps its contents (as does a set, which
+    /// becomes a map), and any other existing value is an
+    /// [`Error::UnexpectedTag`].
+    ///
+    /// Like [`WriteHashMap::put_cursor`], it's meant for use inside a
+    /// transaction: on a top-level map the key is stored in a transaction
+    /// of its own, so this returns [`Error::ExpiredTransaction`].
+    pub fn put_map(&mut self, key: impl AsRef<[u8]>) -> Result<WriteHashMap<'a, C>> {
+        WriteHashMap::new(&mut self.put_cursor(key)?)
+    }
+
+    /// Like [`WriteHashMap::put_map`], for a hash set.
+    pub fn put_set(&mut self, key: impl AsRef<[u8]>) -> Result<WriteHashSet<'a, C>> {
+        WriteHashSet::new(&mut self.put_cursor(key)?)
+    }
+
+    /// Like [`WriteHashMap::put_map`], for an array list.
+    pub fn put_list(&mut self, key: impl AsRef<[u8]>) -> Result<WriteArrayList<'a, C>> {
+        WriteArrayList::new(&mut self.put_cursor(key)?)
     }
 
     /// Sets the stored key of `key` to `data`, if it isn't set yet.
@@ -577,6 +716,12 @@ impl<'a, C: Core> ReadHashSet<'a, C> {
     /// empty.
     pub fn iter(&self) -> Result<CursorIterator<'a, C>> {
         self.cursor.iter()
+    }
+
+    /// Like [`ReadHashSet::iter`], but yields cursors to the keys
+    /// themselves.
+    pub fn keys(&self) -> Result<KeyIterator<'a, C>> {
+        Ok(KeyIterator { iter: self.cursor.iter()? })
     }
 
     /// The stored key, or `None` if it isn't in the set.
@@ -775,6 +920,12 @@ impl<'a, C: Core> ReadSortedMap<'a, C> {
         self.cursor.iter()
     }
 
+    /// Like [`ReadSortedMap::iter`], but yields the key and value cursors
+    /// of each pair, as [`ReadCursor::read_key_value_pair`] returns them.
+    pub fn entries(&self) -> Result<KvPairIterator<'a, C>> {
+        Ok(KvPairIterator { iter: self.cursor.iter()? })
+    }
+
     /// Iterates in key order, starting at the first entry with a key >=
     /// `start_key`.
     pub fn iter_from(&self, start_key: impl AsRef<[u8]>) -> Result<CursorIterator<'a, C>> {
@@ -888,6 +1039,12 @@ impl<'a, C: Core> ReadSortedSet<'a, C> {
     /// values are always empty.
     pub fn iter(&self) -> Result<CursorIterator<'a, C>> {
         self.cursor.iter()
+    }
+
+    /// Like [`ReadSortedSet::iter`], but yields cursors to the keys
+    /// themselves, in order.
+    pub fn keys(&self) -> Result<KeyIterator<'a, C>> {
+        Ok(KeyIterator { iter: self.cursor.iter()? })
     }
 
     pub fn iter_from(&self, start_key: impl AsRef<[u8]>) -> Result<CursorIterator<'a, C>> {

@@ -44,6 +44,8 @@ pub enum Error {
         /// Why reopening the original failed.
         reopen_error: Box<Error>,
     },
+    /// A byte array read as a string isn't valid UTF-8.
+    InvalidUtf8(std::str::Utf8Error),
 }
 
 impl fmt::Display for Error {
@@ -57,6 +59,7 @@ impl fmt::Display for Error {
                     temp_path.display()
                 );
             }
+            Error::InvalidUtf8(err) => return write!(f, "invalid utf-8: {err}"),
             Error::NestedTopLevelWrite => "nested top-level writes are not allowed",
             Error::FrozenSlot => {
                 "writer points into frozen data; reacquire it from the transaction root"
@@ -93,6 +96,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(err) => Some(err),
             Error::CompactFileReopenFailed { rename_error, .. } => Some(rename_error),
+            Error::InvalidUtf8(err) => Some(err),
             _ => None,
         }
     }
