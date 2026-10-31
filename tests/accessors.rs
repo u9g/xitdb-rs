@@ -7,7 +7,7 @@ use xitdb::*;
 const MAX_READ: Option<u64> = Some(1024);
 
 fn memory_db() -> Database<CoreMemory> {
-    Database::new(CoreMemory::new(), Hasher::sha1()).unwrap()
+    Database::in_memory().unwrap()
 }
 
 fn assert_unexpected_tag<T>(result: Result<T>) {

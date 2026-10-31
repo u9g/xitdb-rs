@@ -522,7 +522,7 @@ The cursor methods above can do anything, but nesting and reading typed values t
 use xitdb::*;
 
 fn main() -> xitdb::Result<()> {
-    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let db = Database::in_memory()?;
     db.run_context(|cursor| {
         let mut moment = WriteHashMap::new(cursor)?;
         moment.put("started-at", 1700000000i64)?;
