@@ -1,0 +1,8 @@
+{
+  "name": "xitdb-telephone-hop",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "xitdb": "0.26.0"
+  }
+}
