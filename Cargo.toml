@@ -10,11 +10,15 @@ repository = "https://github.com/u9g/xitdb-rs"
 keywords = ["database", "immutable", "embedded", "persistent", "hamt"]
 categories = ["database-implementations", "data-structures"]
 
+[workspace]
+members = ["derive"]
+
 [dependencies]
 getrandom = "0.3"
 sha1 = { version = "0.10", optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+xitdb-derive = { version = "0.1.0", path = "derive", optional = true }
 
 [features]
 default = ["sha1"]
@@ -22,6 +26,8 @@ default = ["sha1"]
 sha1 = ["dep:sha1"]
 # adds the Json codec for typed collections
 serde = ["dep:serde", "dep:serde_json"]
+# adds #[derive(Record)], to store a struct as a nested hash map of its fields
+derive = ["dep:xitdb-derive"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

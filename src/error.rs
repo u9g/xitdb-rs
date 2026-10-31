@@ -96,6 +96,10 @@ pub struct DecodeError {
     /// The key, formatted with `Debug`, if it's known. A key that couldn't
     /// be decoded is shown as a lossy UTF-8 string.
     pub key: Option<String>,
+    /// The field of a [`Record`](crate::Record) that couldn't be decoded,
+    /// by the name it's stored under. For a field of a nested record, it's
+    /// a path, like `"merge.title"`.
+    pub field: Option<String>,
     /// What the codec found wrong.
     pub message: String,
 }
@@ -109,6 +113,9 @@ impl fmt::Display for DecodeError {
         if let Some(key) = &self.key {
             write!(f, " at key {key}")?;
         }
+        if let Some(field) = &self.field {
+            write!(f, " field {field:?}")?;
+        }
         write!(f, ": {}", self.message)
     }
 }
@@ -119,7 +126,7 @@ impl Error {
     /// An [`Error::Decode`] with just a message, as a codec returns it. The
     /// typed collection that called the codec adds its name and the key.
     pub fn decode(message: impl Into<String>) -> Error {
-        Error::Decode(Box::new(DecodeError { collection: None, key: None, message: message.into() }))
+        Error::Decode(Box::new(DecodeError { collection: None, key: None, field: None, message: message.into() }))
     }
 }
 

@@ -98,7 +98,8 @@ pub trait KeyCodec: fmt::Debug {
 /// * `Option<T>` writes `None` as an empty value ([`Data::None`]), and reads
 ///   an empty value as `None`. In a [`Map`], that reads as a missing key,
 ///   so use [`Map::remove`] there; `Option` is for nested structures,
-///   where a missing field and an empty one should both mean `None`.
+///   where a missing field and an empty one should both mean `None`. As a
+///   field of a [`Record`](crate::Record), `None` leaves the field out.
 /// * `Json<T>`, behind the `serde` feature, is JSON in a byte array.
 pub trait ValueCodec {
     /// What reads return.
@@ -109,6 +110,36 @@ pub trait ValueCodec {
     fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<Self::Owned>;
 
     fn write<C: Core>(value: &Self::Borrowed, cursor: &mut WriteCursor<'_, C>) -> Result<()>;
+
+    /// For a field of a [`Record`](crate::Record): whether `value` is
+    /// stored by leaving the field out, rather than with
+    /// [`ValueCodec::write`]. Only `Option`'s `None` is, by default.
+    fn is_missing(value: &Self::Borrowed) -> bool {
+        let _ = value;
+        false
+    }
+
+    /// For [`Map::update`]: whether `new` would be stored differently from
+    /// `old`, or `None` to compare them with `PartialEq`, as by default.
+    /// `f64` compares their bits, so `-0.0` differs from `0.0` and a NaN is
+    /// the same as itself, like [`ReadCursor::equals`]; `Option<T>` and
+    /// records use their contents' codecs.
+    fn changed(old: &Self::Owned, new: &Self::Owned) -> Option<bool> {
+        let _ = (old, new);
+        None
+    }
+
+    /// For [`Map::update`]: writes `new` over `old`, the value at `cursor`,
+    /// once it's known to have changed. By default, this is
+    /// [`ValueCodec::write`]; a record only writes the fields that changed.
+    fn write_changed<C: Core>(
+        old: &Self::Owned,
+        new: &Self::Borrowed,
+        cursor: &mut WriteCursor<'_, C>,
+    ) -> Result<()> {
+        let _ = old;
+        Self::write(new, cursor)
+    }
 }
 
 // Keys
@@ -304,6 +335,10 @@ impl ValueCodec for f64 {
     fn write<C: Core>(value: &f64, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
         cursor.write(*value)
     }
+
+    fn changed(old: &f64, new: &f64) -> Option<bool> {
+        Some(old.to_bits() != new.to_bits())
+    }
 }
 
 impl ValueCodec for bool {
@@ -342,6 +377,29 @@ where
         match value {
             Some(value) => T::write(value.borrow(), cursor),
             None => cursor.write(Data::None),
+        }
+    }
+
+    fn is_missing(value: &Option<T::Owned>) -> bool {
+        value.is_none()
+    }
+
+    fn changed(old: &Option<T::Owned>, new: &Option<T::Owned>) -> Option<bool> {
+        match (old, new) {
+            (Some(old), Some(new)) => T::changed(old, new),
+            (None, None) => Some(false),
+            _ => Some(true),
+        }
+    }
+
+    fn write_changed<C: Core>(
+        old: &Option<T::Owned>,
+        new: &Option<T::Owned>,
+        cursor: &mut WriteCursor<'_, C>,
+    ) -> Result<()> {
+        match (old, new) {
+            (Some(old), Some(new)) => T::write_changed(old, new.borrow(), cursor),
+            _ => Self::write(new, cursor),
         }
     }
 }
@@ -419,7 +477,7 @@ pub(crate) fn with_context(err: Error, collection: &str, key: impl FnOnce() -> O
     let mut decode = match err {
         Error::Decode(decode) => decode,
         Error::Io(_) => return err,
-        other => Box::new(DecodeError { collection: None, key: None, message: other.to_string() }),
+        other => Box::new(DecodeError { collection: None, key: None, field: None, message: other.to_string() }),
     };
     decode.collection.get_or_insert_with(|| collection.to_owned());
     if decode.key.is_none() {
@@ -433,7 +491,7 @@ pub(crate) fn with_context(err: Error, collection: &str, key: impl FnOnce() -> O
 fn wrong_kind(collection: &str, expected: Tag, found: Tag) -> Error {
     let expected = if expected == Tag::HashSet { "a hash set" } else { "a hash map" };
     let message = format!("expected {expected}, found {found:?}");
-    Error::Decode(Box::new(DecodeError { collection: Some(collection.to_owned()), key: None, message }))
+    Error::Decode(Box::new(DecodeError { collection: Some(collection.to_owned()), key: None, field: None, message }))
 }
 
 /// The collection under `name` (whose hash is `hash`) in `parent`, or
