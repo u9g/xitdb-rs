@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use vstd::prelude::*;
+
 /// Determines how a [`Database`](crate::Database) does i/o.
 ///
 /// There are three implementations: [`CoreBufferedFile`] (recommended for
@@ -99,7 +101,13 @@ impl<C: Core + ?Sized> Core for Box<C> {
 
 // CoreMemory
 
+verus! {
+
 /// A database that lives entirely in memory.
+///
+/// Checked by Verus: its operations implement a file (see
+/// [`mem_read_at`] and [`mem_write_at`], which meet the specification the
+/// database's algorithms are verified against).
 #[derive(Debug, Clone, Default)]
 pub struct CoreMemory {
     buf: Vec<u8>,
@@ -107,64 +115,266 @@ pub struct CoreMemory {
 }
 
 impl CoreMemory {
-    pub fn new() -> CoreMemory {
-        CoreMemory::default()
+    /// The position never passes the end.
+    pub closed spec fn ok(&self) -> bool {
+        self.pos <= self.buf@.len()
+    }
+
+    /// The bytes it holds.
+    pub closed spec fn bytes(&self) -> Seq<u8> {
+        self.buf@
+    }
+
+    pub closed spec fn position_spec(&self) -> int {
+        self.pos as int
+    }
+
+    pub fn new() -> (r: CoreMemory)
+        ensures
+            r.ok(),
+            r.bytes().len() == 0,
+    {
+        CoreMemory { buf: Vec::new(), pos: 0 }
     }
 
     /// Wraps existing database bytes, such as ones received over a network.
-    pub fn from_bytes(buf: Vec<u8>) -> CoreMemory {
+    pub fn from_bytes(buf: Vec<u8>) -> (r: CoreMemory)
+        ensures
+            r.ok(),
+            r.bytes() == buf@,
+    {
         CoreMemory { buf, pos: 0 }
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
+    pub fn as_bytes(&self) -> (r: &[u8])
+        ensures
+            r@ == self.bytes(),
+    {
+        self.buf.as_slice()
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> (r: Vec<u8>)
+        ensures
+            r@ == self.bytes(),
+    {
         self.buf
+    }
+
+    /// `Core::read`: fills `out` from the position, or fails.
+    pub fn read_impl(&mut self, out: &mut [u8]) -> (r: io::Result<()>)
+        requires
+            old(self).ok(),
+        ensures
+            final(self).ok(),
+            final(self).bytes() == old(self).bytes(),
+            final(out)@.len() == old(out)@.len(),
+            r is Ok ==> old(self).position_spec() + old(out)@.len() <= old(self).bytes().len()
+                && final(out)@ == old(self).bytes().subrange(old(self).position_spec(), old(self).position_spec() + old(out)@.len())
+                && final(self).position_spec() == old(self).position_spec() + old(out)@.len(),
+    {
+        let end = match self.pos.checked_add(out.len()) {
+            Some(e) => e,
+            None => return Err(eof_error(self.pos, out.len(), self.buf.len())),
+        };
+        if end > self.buf.len() {
+            return Err(eof_error(self.pos, out.len(), self.buf.len()));
+        }
+        let mut i: usize = 0;
+        while i < out.len()
+            invariant
+                self.pos + out@.len() <= self.buf@.len(),
+                end == self.pos + out@.len(),
+                i <= out@.len(),
+                out@.len() == old(out)@.len(),
+                self.buf@ == old(self).buf@,
+                self.pos == old(self).pos,
+                forall|k: int| 0 <= k < i ==> #[trigger] out@[k] == self.buf@[self.pos + k],
+            decreases out.len() - i,
+        {
+            out[i] = self.buf[self.pos + i];
+            i += 1;
+        }
+        self.pos = end;
+        proof {
+            assert(out@ =~= old(self).buf@.subrange(old(self).pos as int, old(self).pos + old(out)@.len()));
+        }
+        Ok(())
+    }
+
+    /// `Core::write`: writes `data` at the position, extending the bytes if
+    /// it runs past the end.
+    pub fn write_impl(&mut self, data: &[u8]) -> (r: io::Result<()>)
+        requires
+            old(self).ok(),
+        ensures
+            r is Ok ==> final(self).ok(),
+            r is Ok ==> final(self).bytes() == crate::store::overwrite(old(self).bytes(), old(self).position_spec(), data@),
+            r is Ok ==> final(self).position_spec() == old(self).position_spec() + data@.len(),
+    {
+        let pos = self.pos;
+        let new_pos = match pos.checked_add(data.len()) {
+            Some(p) => p,
+            None => return Err(too_large_error()),
+        };
+        let ghost f = self.buf@;
+        let mut i: usize = 0;
+        while i < data.len()
+            invariant
+                pos == old(self).pos,
+                pos <= f.len(),
+                f == old(self).buf@,
+                pos + data@.len() == new_pos,
+                i <= data@.len(),
+                self.buf@.len() == if pos + i <= f.len() { f.len() as int } else { pos + i },
+                forall|k: int| 0 <= k < pos ==> #[trigger] self.buf@[k] == f[k],
+                forall|k: int| pos <= k < pos + i ==> #[trigger] self.buf@[k] == data@[k - pos],
+                forall|k: int| pos + i <= k < self.buf@.len() ==> #[trigger] self.buf@[k] == f[k],
+            decreases data.len() - i,
+        {
+            if pos + i < self.buf.len() {
+                self.buf.set(pos + i, data[i]);
+            } else {
+                self.buf.push(data[i]);
+            }
+            i += 1;
+        }
+        self.pos = new_pos;
+        proof {
+            assert(self.buf@ =~= crate::store::overwrite(f, pos as int, data@));
+        }
+        Ok(())
+    }
+
+    /// `Core::seek_to`: the position, clamped to the end.
+    pub fn seek_impl(&mut self, pos: u64)
+        requires
+            old(self).ok(),
+        ensures
+            final(self).ok(),
+            final(self).bytes() == old(self).bytes(),
+            final(self).position_spec() == if pos <= old(self).bytes().len() { pos as int } else { old(self).bytes().len() as int },
+    {
+        let len = self.buf.len();
+        self.pos = if pos <= len as u64 { pos as usize } else { len };
+    }
+
+    /// `Core::set_length`: truncates the bytes (it can't extend them).
+    pub fn set_length_impl(&mut self, len: u64) -> (r: io::Result<()>)
+        requires
+            old(self).ok(),
+        ensures
+            final(self).ok(),
+            r is Ok ==> len <= old(self).bytes().len() && final(self).bytes() == old(self).bytes().subrange(0, len as int),
+            r is Err ==> final(self).bytes() == old(self).bytes(),
+    {
+        if len > self.buf.len() as u64 {
+            return Err(invalid_length_error());
+        }
+        let len = len as usize;
+        if len == 0 || self.pos > len {
+            self.pos = len;
+        }
+        self.buf.truncate(len);
+        Ok(())
+    }
+
+    pub fn length_impl(&self) -> (r: u64)
+        ensures
+            r == self.bytes().len(),
+    {
+        self.buf.len() as u64
     }
 }
 
+#[verifier::external_body]
+fn too_large_error() -> io::Error {
+    io::Error::other("memory too large")
+}
+
+#[verifier::external_body]
+fn invalid_length_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "invalid memory length")
+}
+
+#[verifier::external_body]
+fn eof_error(pos: usize, len: usize, size: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("read beyond end of memory: pos={pos}, len={len}, size={size}"),
+    )
+}
+
+/// What `Database::read_at` does with a `CoreMemory`: seek, then read. It
+/// meets the [`Store`](crate::store::Store) specification of `read_at`.
+#[allow(dead_code)] // the proof that CoreMemory meets the Store spec
+pub fn mem_read_at(m: &mut CoreMemory, pos: i64, out: &mut [u8]) -> (r: Result<(), crate::Error>)
+    requires
+        old(m).ok(),
+    ensures
+        final(m).ok(),
+        final(m).bytes() == old(m).bytes(),
+        final(out)@.len() == old(out)@.len(),
+        r is Ok ==> 0 <= pos,
+        (r is Ok && old(out)@.len() > 0) ==> pos + old(out)@.len() <= old(m).bytes().len()
+            && final(out)@ == old(m).bytes().subrange(pos as int, pos + old(out)@.len()),
+{
+    if pos < 0 {
+        return Err(crate::Error::InvalidOffset);
+    }
+    m.seek_impl(pos as u64);
+    match m.read_impl(out) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(crate::Error::Io(e)),
+    }
+}
+
+/// What `Database::write_at` does with a `CoreMemory`: seek, then write. It
+/// meets the [`Store`](crate::store::Store) specification of `write_at`.
+#[allow(dead_code)] // the proof that CoreMemory meets the Store spec
+pub fn mem_write_at(m: &mut CoreMemory, pos: i64, data: &[u8]) -> (r: Result<(), crate::Error>)
+    requires
+        old(m).ok(),
+    ensures
+        r is Ok ==> final(m).ok(),
+        r is Ok ==> 0 <= pos && crate::store::write_result(old(m).bytes(), final(m).bytes(), pos as int, data@),
+{
+    if pos < 0 {
+        return Err(crate::Error::InvalidOffset);
+    }
+    let ghost f = m.bytes();
+    m.seek_impl(pos as u64);
+    match m.write_impl(data) {
+        Ok(()) => {
+            proof {
+                let g = m.bytes();
+                if pos > f.len() {
+                    // the write lands at the end
+                    assert(g.subrange(0, f.len() as int) =~= f);
+                }
+            }
+            Ok(())
+        },
+        Err(e) => Err(crate::Error::Io(e)),
+    }
+}
+
+} // verus!
+
 impl Core for CoreMemory {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let end = self.pos + buf.len();
-        if end > self.buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "read beyond end of memory: pos={}, len={}, size={}",
-                    self.pos,
-                    buf.len(),
-                    self.buf.len()
-                ),
-            ));
-        }
-        buf.copy_from_slice(&self.buf[self.pos..end]);
-        self.pos = end;
-        Ok(())
+        self.read_impl(buf)
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let pos = self.pos;
-        if pos < self.buf.len() {
-            let before_end = data.len().min(self.buf.len() - pos);
-            self.buf[pos..pos + before_end].copy_from_slice(&data[..before_end]);
-            self.buf.extend_from_slice(&data[before_end..]);
-        } else {
-            // pad with zeros if position is beyond current length
-            self.buf.resize(pos, 0);
-            self.buf.extend_from_slice(data);
-        }
-        self.pos = pos + data.len();
-        Ok(())
+        self.write_impl(data)
     }
 
     fn length(&mut self) -> io::Result<u64> {
-        Ok(self.buf.len() as u64)
+        Ok(self.length_impl())
     }
 
     fn seek_to(&mut self, pos: u64) -> io::Result<()> {
-        self.pos = (pos as usize).min(self.buf.len());
+        self.seek_impl(pos);
         Ok(())
     }
 
@@ -173,15 +383,7 @@ impl Core for CoreMemory {
     }
 
     fn set_length(&mut self, len: u64) -> io::Result<()> {
-        let len = len as usize;
-        if len > self.buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid memory length"));
-        }
-        if len == 0 || self.pos > len {
-            self.pos = len;
-        }
-        self.buf.truncate(len);
-        Ok(())
+        self.set_length_impl(len)
     }
 
     fn flush(&mut self) -> io::Result<()> {
