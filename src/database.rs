@@ -8,6 +8,7 @@ use crate::core::{CoreBufferedFile, CoreMemory};
 use crate::cursor::WriteCursor;
 use crate::data::{Data, Encoded};
 use crate::error::{Error, Result};
+use vstd::prelude::*;
 use crate::format::*;
 use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
@@ -80,25 +81,57 @@ pub(crate) fn is_root(slot_ptr: &SlotPointer) -> bool {
     slot_ptr.position == Some(ROOT_HEADER_START)
 }
 
+verus! {
+
 /// Resolves a possibly-negative index against `size`, or returns
 /// [`Error::KeyNotFound`] if it's out of range.
-fn resolve_index(index: i64, size: i64) -> Result<i64> {
+fn resolve_index(index: i64, size: i64) -> (r: Result<i64>)
+    requires
+        size >= 0,
+    ensures
+        r is Err <==> !(-size <= index < size),
+        r matches Ok(i) ==> 0 <= i < size && i == if index < 0 { size + index } else { index as int },
+{
     if index >= size || index < -size {
         return Err(Error::KeyNotFound);
     }
     Ok(if index < 0 { size + index } else { index })
 }
 
+/// Nibble `offset` of the big-endian hash `h`, counting from its least
+/// significant end, or 0 past the end of the hash.
+pub open spec fn nibble(h: Seq<u8>, offset: int) -> int {
+    if offset < 0 || offset / 2 >= h.len() {
+        0
+    } else {
+        let byte = h[h.len() - 1 - offset / 2];
+        if offset % 2 == 0 {
+            (byte & 0xfu8) as int
+        } else {
+            (byte >> 4u8) as int
+        }
+    }
+}
+
 /// The nibble of the big-endian hash at `offset` nibbles from its least
 /// significant end.
-fn hash_nibble(hash: &[u8], offset: u8) -> usize {
+fn hash_nibble(hash: &[u8], offset: u8) -> (r: usize)
+    ensures
+        r == nibble(hash@, offset as int),
+        r < 16,
+{
     let offset = offset as usize;
     if offset / 2 >= hash.len() {
         return 0;
     }
     let byte = hash[hash.len() - 1 - offset / 2];
+    proof {
+        assert(byte & 0xf < 16 && byte >> 4 < 16) by (bit_vector);
+    }
     (if offset % 2 == 0 { byte & 0xf } else { byte >> 4 }) as usize
 }
+
+} // verus!
 
 fn random_u64() -> Result<u64> {
     getrandom::u64().map_err(|err| Error::Io(io::Error::other(err.to_string())))
