@@ -46,6 +46,40 @@ pub enum Error {
     },
     /// A byte array read as a string isn't valid UTF-8.
     InvalidUtf8(std::str::Utf8Error),
+    /// The layout version recorded in a [`History`](crate::History) is newer
+    /// than the newest [`Migration`](crate::Migration) this code knows, so
+    /// the data was written by newer code.
+    LayoutTooNew {
+        /// The recorded version.
+        found: u64,
+        /// The newest version this code knows.
+        known: u64,
+    },
+    /// The layout version recorded in a [`History`](crate::History) is older
+    /// than the newest [`Migration`](crate::Migration), so it hasn't been
+    /// migrated yet. Only [`History::check_version`](crate::History::check_version)
+    /// returns this.
+    LayoutTooOld {
+        /// The recorded version.
+        found: u64,
+        /// The newest version this code knows.
+        expected: u64,
+    },
+    /// The layout version recorded in a [`History`](crate::History) is
+    /// between the versions of the known [`Migration`](crate::Migration)s,
+    /// so it was made by a migration this code doesn't have.
+    UnknownLayoutVersion {
+        /// The recorded version.
+        found: u64,
+    },
+    /// A [`Migration`](crate::Migration)'s version isn't greater than the one
+    /// before it (or than 0, for the first).
+    MigrationOutOfOrder {
+        /// The migration's version.
+        version: u64,
+        /// The version before it.
+        previous: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -60,6 +94,18 @@ impl fmt::Display for Error {
                 );
             }
             Error::InvalidUtf8(err) => return write!(f, "invalid utf-8: {err}"),
+            Error::LayoutTooNew { found, known } => {
+                return write!(f, "layout version {found} is newer than the newest known version {known}");
+            }
+            Error::LayoutTooOld { found, expected } => {
+                return write!(f, "layout version {found} is older than the expected version {expected}");
+            }
+            Error::UnknownLayoutVersion { found } => {
+                return write!(f, "layout version {found} isn't the version of any known migration");
+            }
+            Error::MigrationOutOfOrder { version, previous } => {
+                return write!(f, "migration version {version} must be greater than {previous}");
+            }
             Error::NestedTopLevelWrite => "nested top-level writes are not allowed",
             Error::FrozenSlot => {
                 "writer points into frozen data; reacquire it from the transaction root"
