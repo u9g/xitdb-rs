@@ -274,4 +274,172 @@ pub fn truncate_to_frozen<S: Store>(s: &mut S, frozen_at: i64, commit_id: u64, f
     Ok(())
 }
 
+// replication
+
+/// `replica_state`.
+pub fn replica_state<S: Store>(s: &mut S, file_id: u64) -> (r: Result<ReplicaState>)
+    ensures
+        final(s).file() == old(s).file(),
+{
+    let committed_size = committed_size(s, file_id)?;
+    let trailer = read_root_trailer(s, committed_size, file_id)?;
+    Ok(ReplicaState { committed_size, checksum: trailer.checksum })
+}
+
+/// `replication_start`: the replica's committed size if its trailer
+/// matches ours there, or 0 if it must be replaced.
+pub fn replication_start<S: Store>(s: &mut S, file_id: u64, state: ReplicaState) -> (r: Result<i64>)
+    ensures
+        final(s).file() == old(s).file(),
+        r is Ok ==> r.unwrap() == 0 || (r.unwrap() == state.committed_size && exists|t: RootTrailer|
+            #[trigger] trailer_ok(old(s).file(), state.committed_size as int, file_id, t) && t.checksum == state.checksum),
+{
+    let committed_size = committed_size(s, file_id)?;
+    if state.committed_size > committed_size {
+        return Ok(0);
+    }
+    match read_root_trailer(s, state.committed_size, file_id) {
+        Ok(trailer) => if trailer.checksum == state.checksum {
+            Ok(state.committed_size)
+        } else {
+            Ok(0)
+        },
+        Err(Error::InvalidDatabase) => Ok(0),
+        Err(Error::UnexpectedTag) => Ok(0),
+        Err(err) => Err(err),
+    }
+}
+
+/// `stream_bytes`: `length` bytes from `start`, written to `w`.
+pub fn stream_bytes<S: Store, W: Sink>(s: &mut S, w: &mut W, start: i64, length: i64) -> (r: Result<()>)
+    ensures
+        final(s).file() == old(s).file(),
+{
+    let cap: usize = if length <= 0 { 0 } else if length > 4096 { 4096 } else { length as usize };
+    let mut pos = start;
+    let mut remaining = length;
+    while remaining > 0
+        invariant
+            s.file() == old(s).file(),
+            remaining > 0 ==> cap > 0,
+            cap <= 4096,
+        decreases remaining,
+    {
+        let chunk: usize = if remaining < cap as i64 { remaining as usize } else { cap };
+        let mut piece = zero_bytes(chunk);
+        s.read_at(pos, piece.as_mut_slice())?;
+        w.write_all(piece.as_slice())?;
+        pos = match pos.checked_add(chunk as i64) {
+            Some(p) => p,
+            None => return Err(Error::InvalidOffset),
+        };
+        remaining = remaining - chunk as i64;
+    }
+    Ok(())
+}
+
+fn zero_bytes(n: usize) -> (r: Vec<u8>)
+    ensures
+        r@.len() == n,
+{
+    let mut r = Vec::new();
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            i <= n,
+            r@.len() == i,
+        decreases n - i,
+    {
+        r.push(0);
+        i += 1;
+    }
+    r
+}
+
+/// `read_committed`: the committed bytes from `start` to `end`. From 0,
+/// the root header is replaced by one for `end`, so the bytes are a
+/// complete database.
+pub fn read_committed<S: Store, W: Sink>(s: &mut S, w: &mut W, start: i64, end: i64, file_id: u64) -> (r: Result<()>)
+    ensures
+        final(s).file() == old(s).file(),
+{
+    let committed_size = committed_size(s, file_id)?;
+    if start < 0 || start > end || end > committed_size {
+        return Err(Error::InvalidRange);
+    }
+    if start > 0 && start < ROOT_HEADER_END {
+        return Err(Error::InvalidRange);
+    }
+    if start == 0 {
+        let trailer = read_root_trailer(s, end, file_id)?;
+        stream_bytes(s, w, 0, ROOT_HEADER_START)?;
+        let header = RootHeader { file_size: end, root: trailer.root }.to_bytes();
+        w.write_all(&header)?;
+        return stream_bytes(s, w, ROOT_HEADER_END, end - ROOT_HEADER_END);
+    }
+    stream_bytes(s, w, start, end - start)
+}
+
+/// The copying part of `apply_replicated`: `length` bytes from `r`,
+/// written from `start` on. Nothing before `start` changes.
+pub fn write_replicated<S: Store, R: Source>(s: &mut S, r: &mut R, start: i64, length: i64) -> (res: Result<()>)
+    requires
+        0 <= start <= old(s).file().len(),
+    ensures
+        res is Ok ==> kept_below(old(s).file(), final(s).file(), start as int),
+{
+    let cap: usize = if length <= 0 { 0 } else if length > 4096 { 4096 } else { length as usize };
+    let mut pos = start;
+    let mut remaining = length;
+    let ghost f0 = s.file();
+    proof {
+        assert(f0.subrange(0, start as int) =~= f0.subrange(0, start as int));
+    }
+    while remaining > 0
+        invariant
+            0 <= start <= pos,
+            start <= f0.len(),
+            f0 == old(s).file(),
+            kept_below(f0, s.file(), start as int),
+            remaining > 0 ==> cap > 0,
+            cap <= 4096,
+        decreases remaining,
+    {
+        let chunk: usize = if remaining < cap as i64 { remaining as usize } else { cap };
+        let mut buf = zero_bytes(chunk);
+        r.read_exact(buf.as_mut_slice())?;
+        let ghost f1 = s.file();
+        s.write_at(pos, buf.as_slice())?;
+        proof {
+            lemma_overwrite_keeps(f1, pos as int, buf@, start as int);
+            lemma_kept_trans(f0, f1, s.file(), start as int);
+        }
+        pos = match pos.checked_add(chunk as i64) {
+            Some(p) => p,
+            None => return Err(Error::InvalidOffset),
+        };
+        remaining = remaining - chunk as i64;
+    }
+    Ok(())
+}
+
+/// The end of an incremental `apply_replicated`: the bytes must end with
+/// a trailer, and the root header is pointed at it.
+pub fn finish_replicated<S: Store>(s: &mut S, start: i64, length: i64, file_id: u64) -> (r: Result<()>)
+    requires
+        old(s).file().len() >= ROOT_HEADER_END,
+    ensures
+        r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
+{
+    let end = match start.checked_add(length) {
+        Some(e) => e,
+        None => return Err(Error::InvalidRange),
+    };
+    let trailer = read_root_trailer(s, end, file_id)?;
+    s.sync()?;
+    write_root_header(s, trailer.root)?;
+    s.sync()?;
+    Ok(())
+}
+
 } // verus!

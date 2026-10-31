@@ -14,7 +14,7 @@ use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 use crate::map_store::MapTarget;
-use crate::store::DbStore;
+use crate::store::{DbStore, IoSink, IoSource};
 
 /// A function run inside a write, with a cursor to the slot the path led to.
 pub(crate) type ContextFn<'f, 'a, C> =
@@ -414,9 +414,8 @@ impl<C: Core> Database<C> {
 
     /// This database's [`ReplicaState`].
     pub fn replica_state(&self) -> Result<ReplicaState> {
-        let committed_size = self.committed_size()?;
-        let trailer = self.read_root_trailer(committed_size)?;
-        Ok(ReplicaState { committed_size, checksum: trailer.checksum })
+        // verified in commit_store.rs
+        crate::commit_store::replica_state(&mut DbStore::new(self), self.header.get().file_id)
     }
 
     /// Where to start sending committed bytes to a replica in `state`.
@@ -424,15 +423,8 @@ impl<C: Core> Database<C> {
     /// database, or 0 if it must be replaced, because it's a replica of
     /// another file or it has diverged from this one.
     pub fn replication_start(&self, state: ReplicaState) -> Result<i64> {
-        let committed_size = self.committed_size()?;
-        if state.committed_size > committed_size {
-            return Ok(0);
-        }
-        match self.read_root_trailer(state.committed_size) {
-            Ok(trailer) if trailer.checksum == state.checksum => Ok(state.committed_size),
-            Ok(_) | Err(Error::InvalidDatabase | Error::UnexpectedTag) => Ok(0),
-            Err(err) => Err(err),
-        }
+        // verified in commit_store.rs
+        crate::commit_store::replication_start(&mut DbStore::new(self), self.header.get().file_id, state)
     }
 
     /// Writes the committed bytes from `start` up to `end` to `w`. `start`
@@ -442,33 +434,9 @@ impl<C: Core> Database<C> {
     /// matching `end` is written, making the bytes a complete database by
     /// themselves.
     pub fn read_committed(&self, start: i64, end: i64, w: &mut impl io::Write) -> Result<()> {
-        let committed_size = self.committed_size()?;
-        if start < 0 || start > end || end > committed_size {
-            return Err(Error::InvalidRange);
-        }
-        if start > 0 && start < ROOT_HEADER_END {
-            return Err(Error::InvalidRange);
-        }
-        if start == 0 {
-            let trailer = self.read_root_trailer(end)?;
-            self.stream_bytes(w, 0, ROOT_HEADER_START)?;
-            w.write_all(&RootHeader { file_size: end, root: trailer.root }.to_bytes())?;
-            return self.stream_bytes(w, ROOT_HEADER_END, end - ROOT_HEADER_END);
-        }
-        self.stream_bytes(w, start, end - start)
-    }
-
-    // writes length bytes, starting at start, to w
-    fn stream_bytes(&self, w: &mut impl io::Write, start: i64, mut length: i64) -> Result<()> {
-        self.seek(start)?;
-        let mut buf = vec![0u8; length.clamp(0, 4096) as usize];
-        while length > 0 {
-            let chunk = length.min(buf.len() as i64) as usize;
-            self.read_bytes(&mut buf[..chunk])?;
-            w.write_all(&buf[..chunk])?;
-            length -= chunk as i64;
-        }
-        Ok(())
+        // verified in commit_store.rs
+        let mut sink = IoSink::new(w);
+        crate::commit_store::read_committed(&mut DbStore::new(self), &mut sink, start, end, self.header.get().file_id)
     }
 
     /// Writes `length` bytes from `r` at `start` and commits them. They
@@ -486,15 +454,9 @@ impl<C: Core> Database<C> {
             self.truncate()?;
         }
 
-        self.seek(start)?;
-        let mut buf = vec![0u8; length.clamp(0, 4096) as usize];
-        let mut remaining = length;
-        while remaining > 0 {
-            let chunk = remaining.min(buf.len() as i64) as usize;
-            r.read_exact(&mut buf[..chunk])?;
-            self.write_bytes(&buf[..chunk])?;
-            remaining -= chunk as i64;
-        }
+        // verified in commit_store.rs
+        let mut source = IoSource::new(r);
+        crate::commit_store::write_replicated(&mut DbStore::new(self), &mut source, start, length)?;
 
         if start == 0 {
             // the bytes are a different database, with its own header
@@ -504,10 +466,7 @@ impl<C: Core> Database<C> {
             self.committed_size()?;
         } else if length > 0 {
             // the bytes must end with a trailer. update the root header to match it.
-            let trailer = self.read_root_trailer(start + length)?;
-            self.core().sync()?;
-            self.write_root_header(trailer.root)?;
-            self.core().sync()?;
+            crate::commit_store::finish_replicated(&mut DbStore::new(self), start, length, self.header.get().file_id)?;
         }
         Ok(())
     }
@@ -615,23 +574,12 @@ impl<C: Core> Database<C> {
         Ok(self.read_root_header()?.root)
     }
 
-    // the trailer that ends at end
-    pub(crate) fn read_root_trailer(&self, end: i64) -> Result<RootTrailer> {
-        crate::commit_store::read_root_trailer(&mut DbStore::new(self), end, self.header.get().file_id)
-    }
-
     // completes a transaction by appending a trailer for root and updating
     // the root header. callers must sync afterwards to make the header
     // itself durable.
     pub(crate) fn commit_root(&self, root: Slot, commit_id: u64) -> Result<()> {
         // verified in commit_store.rs
         crate::commit_store::commit_root(&mut DbStore::new(self), root, commit_id, self.header.get().file_id)
-    }
-
-    // points the root header at root, which must be in the trailer that ends
-    // the file.
-    fn write_root_header(&self, root: Slot) -> Result<()> {
-        crate::commit_store::write_root_header(&mut DbStore::new(self), root)
     }
 
     // whether the data at ptr predates this transaction, or the writing

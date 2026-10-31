@@ -135,10 +135,75 @@ impl<'a, C: Core> Store for DbStore<'a, C> {
     }
 }
 
+/// Where replicated bytes go. Nothing is assumed about it.
+pub trait Sink {
+    fn write_all(&mut self, data: &[u8]) -> (r: Result<()>);
+}
+
+/// Where replicated bytes come from. Nothing is assumed about the bytes.
+pub trait Source {
+    fn read_exact(&mut self, buf: &mut [u8]) -> (r: Result<()>)
+        ensures
+            final(buf)@.len() == old(buf)@.len(),
+    ;
+}
+
+#[verifier::external_trait_specification]
+#[allow(dead_code)]
+pub trait ExWrite {
+    type ExternalTraitSpecificationFor: std::io::Write;
+}
+
+#[verifier::external_trait_specification]
+#[allow(dead_code)]
+pub trait ExRead {
+    type ExternalTraitSpecificationFor: std::io::Read;
+}
+
+/// An [`std::io::Write`] as a [`Sink`].
+#[verifier::external_body]
+#[verifier::reject_recursive_types(W)]
+pub struct IoSink<'a, W: std::io::Write> {
+    w: &'a mut W,
+}
+
+impl<'a, W: std::io::Write> Sink for IoSink<'a, W> {
+    #[verifier::external_body]
+    fn write_all(&mut self, data: &[u8]) -> (r: Result<()>) {
+        Ok(self.w.write_all(data)?)
+    }
+}
+
+/// An [`std::io::Read`] as a [`Source`].
+#[verifier::external_body]
+#[verifier::reject_recursive_types(R)]
+pub struct IoSource<'a, R: std::io::Read> {
+    r: &'a mut R,
+}
+
+impl<'a, R: std::io::Read> Source for IoSource<'a, R> {
+    #[verifier::external_body]
+    fn read_exact(&mut self, buf: &mut [u8]) -> (r: Result<()>) {
+        Ok(self.r.read_exact(buf)?)
+    }
+}
+
 } // verus!
 
 impl<'a, C: Core> DbStore<'a, C> {
     pub(crate) fn new(db: &'a Database<C>) -> Self {
         DbStore { db }
+    }
+}
+
+impl<'a, W: std::io::Write> IoSink<'a, W> {
+    pub(crate) fn new(w: &'a mut W) -> Self {
+        IoSink { w }
+    }
+}
+
+impl<'a, R: std::io::Read> IoSource<'a, R> {
+    pub(crate) fn new(r: &'a mut R) -> Self {
+        IoSource { r }
     }
 }
