@@ -25,6 +25,15 @@ pub open spec fn overwrite(f: Seq<u8>, pos: int, data: Seq<u8>) -> Seq<u8> {
     }
 }
 
+/// What a successful write of `data` at `pos` leaves: within the file,
+/// exactly [`overwrite`]; past its end, at least every byte that was there
+/// (a file pads with zeros up to `pos`, while [`CoreMemory`](crate::CoreMemory)
+/// writes at its end instead).
+pub open spec fn write_result(f: Seq<u8>, g: Seq<u8>, pos: int, data: Seq<u8>) -> bool {
+    &&& pos <= f.len() ==> g == overwrite(f, pos, data)
+    &&& pos > f.len() ==> g.len() >= f.len() && g.subrange(0, f.len() as int) == f
+}
+
 pub trait Store {
     /// The bytes of the file.
     spec fn file(&self) -> Seq<u8>;
@@ -34,7 +43,9 @@ pub trait Store {
         ensures
             final(self).file() == old(self).file(),
             final(buf)@.len() == old(buf)@.len(),
-            r is Ok ==> 0 <= pos && pos + old(buf)@.len() <= old(self).file().len()
+            r is Ok ==> 0 <= pos,
+            // an empty read succeeds even past the end of a CoreMemory
+            (r is Ok && old(buf)@.len() > 0) ==> pos + old(buf)@.len() <= old(self).file().len()
                 && final(buf)@ == old(self).file().subrange(pos as int, pos + old(buf)@.len()),
     ;
 
@@ -42,7 +53,7 @@ pub trait Store {
     /// state.
     fn write_at(&mut self, pos: i64, data: &[u8]) -> (r: Result<()>)
         ensures
-            r is Ok ==> 0 <= pos && final(self).file() == overwrite(old(self).file(), pos as int, data@),
+            r is Ok ==> 0 <= pos && write_result(old(self).file(), final(self).file(), pos as int, data@),
     ;
 
     /// The length of the file.

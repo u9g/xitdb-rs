@@ -47,16 +47,22 @@ pub proof fn lemma_slot_spec(f: Seq<u8>, pos: int, s: Slot)
     lemma_slot_encode_injective(s, t);
 }
 
+/// A write at or after `limit` keeps everything before it.
 pub proof fn lemma_overwrite_keeps(f: Seq<u8>, pos: int, data: Seq<u8>, limit: int)
     requires
         0 <= limit <= pos,
     ensures
-        kept_below(f, overwrite(f, pos, data), limit),
-        overwrite(f, pos, data).len() >= pos + data.len(),
+        forall|g: Seq<u8>| #[trigger] write_result(f, g, pos, data) ==> kept_below(f, g, limit) && g.len() >= f.len(),
 {
-    let g = overwrite(f, pos, data);
-    if limit <= f.len() {
-        assert(g.subrange(0, limit) =~= f.subrange(0, limit));
+    assert forall|g: Seq<u8>| #[trigger] write_result(f, g, pos, data) implies kept_below(f, g, limit) && g.len() >= f.len() by {
+        if limit <= f.len() {
+            if pos <= f.len() {
+                assert(g.subrange(0, limit) =~= f.subrange(0, limit));
+            } else {
+                assert(g.subrange(0, limit) =~= g.subrange(0, f.len() as int).subrange(0, limit));
+                assert(f.subrange(0, limit) =~= f.subrange(0, f.len() as int).subrange(0, limit));
+            }
+        }
     }
 }
 
@@ -107,7 +113,7 @@ pub fn read_slot_at<S: Store>(s: &mut S, pos: i64) -> (r: Result<Slot>)
 
 pub fn write_slot_at<S: Store>(s: &mut S, pos: i64, slot: Slot) -> (r: Result<()>)
     ensures
-        r is Ok ==> 0 <= pos && final(s).file() == overwrite(old(s).file(), pos as int, slot_encode_spec(slot)),
+        r is Ok ==> 0 <= pos && write_result(old(s).file(), final(s).file(), pos as int, slot_encode_spec(slot)),
 {
     s.write_at(pos, &slot.to_bytes())
 }
