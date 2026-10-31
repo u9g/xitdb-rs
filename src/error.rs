@@ -6,7 +6,13 @@ use std::io;
 #[non_exhaustive]
 pub enum Error {
     /// An error from the underlying [`Core`](crate::Core).
+    #[cfg(not(kani))]
     Io(io::Error),
+    // an io::Error can hold an Error, which makes the type recursive, and
+    // kani would unwind its drop glue on every drop of an Error. proofs only
+    // need the kind.
+    #[cfg(kani)]
+    Io(io::ErrorKind),
     NestedTopLevelWrite,
     FrozenSlot,
     FrozenBytes,
@@ -71,6 +77,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(not(kani))]
             Error::Io(err) => Some(err),
             _ => None,
         }
@@ -79,20 +86,21 @@ impl std::error::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
-        Error::Io(err)
+        #[cfg(not(kani))]
+        return Error::Io(err);
+        #[cfg(kani)]
+        return Error::Io(err.kind());
     }
 }
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::Io(err) => err,
             #[cfg(not(kani))]
-            other => io::Error::other(other),
-            // an io::Error that can hold an Error makes the type recursive,
-            // which kani would unwind on every drop of an Error
+            Error::Io(err) => err,
             #[cfg(kani)]
-            other => io::Error::other(other.to_string()),
+            Error::Io(kind) => kind.into(),
+            other => io::Error::other(other),
         }
     }
 }
