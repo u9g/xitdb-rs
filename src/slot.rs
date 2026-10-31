@@ -263,11 +263,17 @@ pub struct SlotPointer {
 }
 
 impl SlotPointer {
-    pub const fn new(position: Option<i64>, slot: Slot) -> SlotPointer {
+    pub const fn new(position: Option<i64>, slot: Slot) -> (r: SlotPointer)
+        ensures
+            r == (SlotPointer { position, slot }),
+    {
         SlotPointer { position, slot }
     }
 
-    pub const fn with_slot(self, slot: Slot) -> SlotPointer {
+    pub const fn with_slot(self, slot: Slot) -> (r: SlotPointer)
+        ensures
+            r == (SlotPointer { position: self.position, slot }),
+    {
         SlotPointer { position: self.position, slot }
     }
 }

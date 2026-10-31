@@ -57,6 +57,7 @@ mod collections;
 mod compact;
 mod core;
 mod arith;
+mod array_list_store;
 mod bytes;
 mod crc64;
 mod cursor;
@@ -74,6 +75,7 @@ mod record;
 #[cfg(feature = "serde")]
 mod replica_serde;
 mod slot;
+mod store;
 mod sorted;
 #[cfg(feature = "serde")]
 mod structured;

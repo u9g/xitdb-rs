@@ -13,6 +13,7 @@ use crate::format::*;
 use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::store::DbStore;
 
 /// A function run inside a write, with a cursor to the slot the path led to.
 pub(crate) type ContextFn<'f, 'a, C> =
@@ -1572,6 +1573,7 @@ impl<C: Core> Database<C> {
         Ok((ArrayListHeader { ptr: index_pos, size: header.size + 1 }, slot_ptr))
     }
 
+    // verified in array_list_store.rs
     fn read_array_list_slot(
         &self,
         index_pos: i64,
@@ -1580,41 +1582,9 @@ impl<C: Core> Database<C> {
         write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        if shift >= MAX_BRANCH_LENGTH {
-            return Err(Error::MaxShiftExceeded);
-        }
-
-        let i = (key >> (shift as u32 * BIT_COUNT)) & MASK;
-        let slot_pos = index_pos + SLOT_LENGTH as i64 * i;
-        let slot = self.read_slot_at(slot_pos)?;
-
-        if shift == 0 {
-            return Ok(SlotPointer::new(Some(slot_pos), slot));
-        }
-
-        match slot.tag {
-            Tag::None => match write_mode {
-                WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                WriteMode::ReadWrite => {
-                    let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-                    self.write_slot_at(slot_pos, Slot::new(next_index_pos, Tag::Index))?;
-                    self.read_array_list_slot(next_index_pos, key, shift - 1, write_mode, frozen_at)
-                }
-            },
-            Tag::Index => {
-                let ptr = slot.value;
-                let mut next_ptr = ptr;
-                if write_mode == WriteMode::ReadWrite {
-                    next_ptr = self.copy_index_block_if_old(ptr, frozen_at)?;
-                    if next_ptr != ptr {
-                        // make slot point to the copied block
-                        self.write_slot_at(slot_pos, Slot::new(next_ptr, Tag::Index))?;
-                    }
-                }
-                self.read_array_list_slot(next_ptr, key, shift - 1, write_mode, frozen_at)
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        let write = write_mode == WriteMode::ReadWrite;
+        crate::array_list_store::read_array_list_slot(&mut DbStore::new(self), index_pos, key, shift, write, limit)
     }
 
     fn read_array_list_slice(&self, header: ArrayListHeader, size: i64, frozen_at: i64) -> Result<ArrayListHeader> {
