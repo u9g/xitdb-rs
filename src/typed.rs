@@ -101,6 +101,9 @@ pub trait KeyCodec: fmt::Debug {
 ///   where a missing field and an empty one should both mean `None`. As a
 ///   field of a [`Record`](crate::Record), `None` leaves the field out.
 /// * `Json<T>`, behind the `serde` feature, is JSON in a byte array.
+/// * [`Structured<T>`](crate::Structured), behind the `serde` feature, is
+///   nested hash maps, array lists and scalars, written by changing only
+///   what differs.
 pub trait ValueCodec {
     /// What reads return.
     type Owned;

@@ -73,6 +73,8 @@ mod record;
 mod replica_serde;
 mod slot;
 mod sorted;
+#[cfg(feature = "serde")]
+mod structured;
 mod typed;
 
 pub use crate::collections::{KeyIterator, KvPairIterator};
@@ -101,6 +103,8 @@ pub use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 pub use crate::typed::{KeyCodec, Map, MapIter, Set, SetIter, ValueCodec};
 #[cfg(feature = "serde")]
 pub use crate::typed::{JSON_FORMAT_TAG, Json};
+#[cfg(feature = "serde")]
+pub use crate::structured::{Structured, get_structured, put_structured, read_structured, write_structured};
 #[cfg(feature = "derive")]
 pub use xitdb_derive::Record;
 
