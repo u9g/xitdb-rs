@@ -140,14 +140,6 @@ pub(crate) fn short_bytes_value(slot: Slot) -> (r: ([u8; 8], usize))
 // the database methods below forward to the verified versions in
 // sorted_store.rs
 impl<C: Core> Database<C> {
-    fn limit(&self, frozen_at: i64) -> Option<i64> {
-        self.tx_start.get().map(|tx_start| tx_start.max(frozen_at))
-    }
-
-    pub(crate) fn write_sorted_node(&self, node: &SortedNode) -> Result<i64> {
-        sorted_store::write_sorted_node(&mut DbStore::new(self), node)
-    }
-
     pub(crate) fn read_kv_pair(&self, kv_slot: Slot) -> Result<KeyValuePair> {
         sorted_store::read_kv_pair(&mut DbStore::new(self), kv_slot, self.hash_size())
     }
@@ -183,24 +175,6 @@ impl<C: Core> Database<C> {
     /// position, block, index) levels.
     pub(crate) fn sorted_path_from_index(&self, root_ptr: i64, rank: i64) -> Result<NodePath> {
         sorted_store::sorted_path_from_index(&mut DbStore::new(self), root_ptr, rank)
-    }
-
-    // insert key (or locate it for replacement) within the subtree at
-    // node_ptr, path-copying nodes and maintaining separators + counts. the
-    // caller writes the value of the returned entry.
-    pub(crate) fn sorted_put(&self, node_ptr: i64, key: &[u8], frozen_at: i64) -> Result<SortedInsertResult> {
-        sorted_store::sorted_put(&mut DbStore::new(self), node_ptr, key, self.limit(frozen_at), self.hash_size())
-    }
-
-    // remove key from the subtree at node_ptr, path-copying nodes and
-    // decrementing counts. an emptied leaf is left in place. returns the new
-    // node pointer and whether the key was found.
-    pub(crate) fn sorted_remove(&self, node_ptr: i64, key: &[u8], frozen_at: i64) -> Result<(i64, bool)> {
-        sorted_store::sorted_remove(&mut DbStore::new(self), node_ptr, key, self.limit(frozen_at), self.hash_size())
-    }
-
-    pub(crate) fn sorted_grow_root(&self, result: &SortedInsertResult) -> Result<i64> {
-        sorted_store::sorted_grow_root(&mut DbStore::new(self), result)
     }
 
     // turn a located/inserted entry into the slot for the requested target.

@@ -582,14 +582,6 @@ impl<C: Core> Database<C> {
         crate::commit_store::commit_root(&mut DbStore::new(self), root, commit_id, self.header.get().file_id)
     }
 
-    // whether the data at ptr predates this transaction, or the writing
-    // cursor's freeze point, so it must be copied before it is modified.
-    // writes only happen inside a transaction.
-    pub(crate) fn is_old(&self, ptr: i64, frozen_at: i64) -> Result<bool> {
-        let tx_start = self.tx_start.get().ok_or(Error::ExpectedTxStart)?;
-        Ok(ptr < tx_start.max(frozen_at))
-    }
-
 
     fn check_hash<'h>(&self, hash: &'h [u8]) -> Result<&'h [u8]> {
         if hash.len() != self.hash_size() {
@@ -756,39 +748,10 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let array_list_start = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let start = self.len()?;
-                        let header = ArrayListHeader {
-                            ptr: start + ARRAY_LIST_HEADER_LENGTH as i64,
-                            size: 0,
-                        };
-                        self.write_at(start, &header.to_bytes())?;
-                        self.write_bytes(&[0u8; INDEX_BLOCK_SIZE])?;
-                        start
-                    }
-                    Tag::ArrayList => {
-                        let mut start = slot_ptr.slot.value;
-                        // copy it to the end unless it was made in this transaction
-                        if self.is_old(start, frozen_at)? {
-                            let header = self.read_array_list_header(start)?;
-                            let mut block = [0u8; INDEX_BLOCK_SIZE];
-                            self.read_at(header.ptr, &mut block)?;
-                            let new_start = self.len()?;
-                            let header = ArrayListHeader {
-                                ptr: new_start + ARRAY_LIST_HEADER_LENGTH as i64,
-                                size: header.size,
-                            };
-                            self.write_at(new_start, &header.to_bytes())?;
-                            self.write_bytes(&block)?;
-                            start = new_start;
-                        }
-                        start
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(array_list_start, Tag::ArrayList));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -855,23 +818,10 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let header_ptr = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        // create an empty tree: a single empty leaf plus a header
-                        let root_ptr = self.write_btree_node(&BTreeNode::empty(BTreeNodeKind::Leaf, 0))?;
-                        self.append(&BTreeHeader { root_ptr, size: 0 }.to_bytes())?
-                    }
-                    Tag::LinkedArrayList => {
-                        // copy the header into this transaction unless it was made
-                        // in it, so past moments still pointing at the old header
-                        // are unaffected. b-tree nodes are copied on write, so
-                        // only the header needs copying.
-                        self.copy_header_if_old(slot_ptr.slot.value, frozen_at)?
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(header_ptr, Tag::LinkedArrayList));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::linked_array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -894,43 +844,31 @@ impl<C: Core> Database<C> {
                     return next(final_slot_ptr, ctx);
                 }
 
-                // path-copy down to the value slot so the write is persistent
-                let write_slot = self.btree_get_for_write(header.root_ptr, rank, frozen_at)?;
-                // update the header before callbacks can freeze it
-                if write_slot.node_ptr != header.root_ptr {
-                    let new_header = BTreeHeader { root_ptr: write_slot.node_ptr, size: header.size };
-                    self.write_at(header_ptr, &new_header.to_bytes())?;
-                }
-                next(SlotPointer::new(Some(write_slot.value_position), write_slot.slot), ctx)
+// path-copy down to the value slot so the write is persistent,
+                // updating the header before callbacks can freeze it.
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let slot_ptr =
+                    crate::path_store::linked_get_for_write(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListAppend => {
-                let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
-                let _ = slot_ptr;
-                let result = self.btree_insert(header.root_ptr, header.size, frozen_at)?;
-                let new_root_ptr = self.btree_make_root(result.join)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size + 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
-                // fill in the value via the rest of the path
-                next(SlotPointer::new(Some(result.value_position), Slot::default()), ctx)
+                let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
+                // the header is updated before the value is filled in via the
+                // rest of the path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let slot_ptr =
+                    crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, header.size, limit)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListSlice { offset, size } => {
                 let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
-                // bounds-checked without overflow (offset + size could wrap)
-                if offset < 0 || size < 0 || offset > header.size || size > header.size - offset {
-                    return Err(Error::KeyNotFound);
-                }
-                // slice = drop [0, offset) then keep [0, size) of what's left
-                let after_offset = self.btree_split(header.root_ptr, offset)?;
-                let sliced = self.btree_split(after_offset.1, size)?;
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: sliced.0, size }.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::linked_slice(&mut DbStore::new(self), header_ptr, header, offset, size, limit)?;
                 next(slot_ptr, ctx)
             }
 
@@ -949,48 +887,29 @@ impl<C: Core> Database<C> {
                 // instead of overwriting a node that is still referenced
                 // elsewhere.
                 self.tx_start.set(Some(self.len()?));
-                let new_root_ptr = self.btree_join(header_a.root_ptr, header_b.root_ptr)?;
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header_a.size + header_b.size };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::linked_concat(&mut DbStore::new(self), header_ptr, header_a, header_b, limit)?;
                 next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListInsert(index) => {
                 let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
-                let result = self.btree_insert(header.root_ptr, rank, frozen_at)?;
-                let new_root_ptr = self.btree_make_root(result.join)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size + 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
-                next(SlotPointer::new(Some(result.value_position), Slot::default()), ctx)
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let slot_ptr = crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListRemove(index) => {
                 let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
-                let new_root_ptr = if header.size == 1 {
-                    self.btree_new_root()?
-                } else {
-                    let mut root = self.btree_remove(header.root_ptr, rank, frozen_at)?;
-                    let mut new_root_ptr = self.btree_write_node(&root, header.root_ptr, frozen_at)?;
-                    // a root left with one child is replaced by it
-                    while root.kind == BTreeNodeKind::Branch && root.num == 1 {
-                        new_root_ptr = root.children[0].value;
-                        root = self.read_btree_node(new_root_ptr)?;
-                    }
-                    new_root_ptr
-                };
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size - 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::linked_remove(&mut DbStore::new(self), header_ptr, header, rank, limit)?;
                 next(slot_ptr, ctx)
             }
 
@@ -1000,35 +919,10 @@ impl<C: Core> Database<C> {
                 }
                 let tag = hash_map_tag(counted, set);
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let map_start = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let map_start = self.len()?;
-                        self.seek(map_start)?;
-                        if counted {
-                            self.write_bytes(&0i64.to_be_bytes())?;
-                        }
-                        self.write_bytes(&[0u8; INDEX_BLOCK_SIZE])?;
-                        map_start
-                    }
-                    Tag::HashMap | Tag::HashSet | Tag::CountedHashMap | Tag::CountedHashSet => {
-                        let is_counted = matches!(slot_ptr.slot.tag, Tag::CountedHashMap | Tag::CountedHashSet);
-                        if counted != is_counted {
-                            return Err(Error::UnexpectedTag);
-                        }
-                        let mut map_start = slot_ptr.slot.value;
-                        // copy it to the end unless it was made in this transaction
-                        if self.is_old(map_start, frozen_at)? {
-                            let len = INDEX_BLOCK_SIZE + if counted { 8 } else { 0 };
-                            let mut buf = vec![0u8; len];
-                            self.read_at(map_start, &mut buf)?;
-                            map_start = self.append(&buf)?;
-                        }
-                        map_start
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(map_start, tag));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::hash_map_init(&mut DbStore::new(self), position, slot_ptr.slot, counted, tag, limit)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -1045,12 +939,13 @@ impl<C: Core> Database<C> {
                 if write_mode == ReadWrite {
                     slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::HashMapInit { counted, set }, frozen_at)?;
                 }
-                let index_pos = slot_ptr.slot.value + if counted { 8 } else { 0 };
+                let index_pos = crate::path_store::map_index_pos(slot_ptr.slot.value, counted)?;
                 let hash = self.check_hash(target.hash())?;
                 let res = self.read_map_slot(index_pos, hash, 0, write_mode, target, frozen_at)?;
                 if write_mode == ReadWrite && counted && res.is_empty {
-                    let count = self.read_i64_at(slot_ptr.slot.value)?;
-                    self.write_i64_at(slot_ptr.slot.value, count.wrapping_add(1))?;
+                    // verified in path_store.rs
+                    let limit = self.write_limit(frozen_at)?;
+                    crate::path_store::update_map_count(&mut DbStore::new(self), slot_ptr.slot.value, true, limit)?;
                 }
                 next(res.slot_ptr, ctx)
             }
@@ -1068,7 +963,7 @@ impl<C: Core> Database<C> {
                     _ => return Err(Error::UnexpectedTag),
                 };
                 let slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::HashMapInit { counted, set }, frozen_at)?;
-                let index_pos = slot_ptr.slot.value + if counted { 8 } else { 0 };
+                let index_pos = crate::path_store::map_index_pos(slot_ptr.slot.value, counted)?;
                 let hash = self.check_hash(hash)?;
                 let key_found = match self.remove_map_slot(index_pos, hash, 0, frozen_at) {
                     Ok(_) => true,
@@ -1079,8 +974,9 @@ impl<C: Core> Database<C> {
                     return Err(Error::KeyNotFound);
                 }
                 if counted {
-                    let count = self.read_i64_at(slot_ptr.slot.value)?;
-                    self.write_i64_at(slot_ptr.slot.value, count.wrapping_sub(1))?;
+                    // verified in path_store.rs
+                    let limit = self.write_limit(frozen_at)?;
+                    crate::path_store::update_map_count(&mut DbStore::new(self), slot_ptr.slot.value, false, limit)?;
                 }
                 Ok(slot_ptr)
             }
@@ -1091,22 +987,10 @@ impl<C: Core> Database<C> {
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 let tag = sorted_map_tag(set);
-                let header_ptr = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let root_ptr = self.write_sorted_node(&SortedNode::empty(BTreeNodeKind::Leaf, 0))?;
-                        self.append(&BTreeHeader { root_ptr, size: 0 }.to_bytes())?
-                    }
-                    Tag::SortedMap | Tag::SortedSet => {
-                        if slot_ptr.slot.tag != tag {
-                            return Err(Error::UnexpectedTag);
-                        }
-                        // copy the header into this transaction unless it was made in it
-                        self.copy_header_if_old(slot_ptr.slot.value, frozen_at)?
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(header_ptr, tag));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::sorted_map_init(&mut DbStore::new(self), position, slot_ptr.slot, tag, limit)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -1131,15 +1015,19 @@ impl<C: Core> Database<C> {
                     return next(target_slot, ctx);
                 }
 
-                let result = self.sorted_put(header.root_ptr, key, frozen_at)?;
-                let new_root_ptr = self.sorted_grow_root(&result)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent (the entry exists with an empty value) rather
-                // than inserted-but-uncounted
-                let size = header.size + i64::from(result.added);
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: new_root_ptr, size }.to_bytes())?;
-                let target_slot = self.sorted_target_slot(result.kv_slot, target)?;
+                // the entry for the key, inserted if new, with the header
+                // updated before the value is filled in. verified in
+                // path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                let kv_slot = crate::path_store::sorted_get_for_write(
+                    &mut DbStore::new(self),
+                    header_ptr,
+                    header,
+                    key,
+                    limit,
+                    self.hash_size(),
+                )?;
+                let target_slot = self.sorted_target_slot(kv_slot, target)?;
                 next(target_slot, ctx)
             }
 
@@ -1172,11 +1060,9 @@ impl<C: Core> Database<C> {
                 let slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::SortedMapInit { set }, frozen_at)?;
                 let header_ptr = slot_ptr.slot.value;
                 let header = self.read_btree_header(header_ptr)?;
-                let (node_ptr, found) = self.sorted_remove(header.root_ptr, key, frozen_at)?;
-                if !found {
-                    return Err(Error::KeyNotFound);
-                }
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: node_ptr, size: header.size - 1 }.to_bytes())?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::sorted_remove_key(&mut DbStore::new(self), header_ptr, header, key, limit, self.hash_size())?;
                 Ok(slot_ptr)
             }
 
@@ -1196,7 +1082,9 @@ impl<C: Core> Database<C> {
                         writer.slot
                     }
                 };
-                self.write_slot_at(position, slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_data_slot(&mut DbStore::new(self), position, slot, limit)?;
                 next(SlotPointer::new(slot_ptr.position, slot), ctx)
             }
         }
@@ -1223,13 +1111,11 @@ impl<C: Core> Database<C> {
     }
 
     // copies a b-tree header to the end unless it was made in this transaction
-    fn copy_header_if_old(&self, header_ptr: i64, frozen_at: i64) -> Result<i64> {
-        if !self.is_old(header_ptr, frozen_at)? {
-            return Ok(header_ptr);
-        }
-        let mut buf = [0u8; BTREE_HEADER_LENGTH];
-        self.read_at(header_ptr, &mut buf)?;
-        self.append(&buf)
+    // the copy-on-write limit of a write: max(tx_start, frozen_at). writes
+    // only happen inside a transaction.
+    fn write_limit(&self, frozen_at: i64) -> Result<i64> {
+        let tx_start = self.tx_start.get().ok_or(Error::ExpectedTxStart)?;
+        Ok(tx_start.max(frozen_at))
     }
 
     // hash map

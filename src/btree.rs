@@ -304,24 +304,6 @@ impl<C: Core> Database<C> {
     }
 
 
-    // appends the node as a fresh block and returns its position
-    pub(crate) fn write_btree_node(&self, node: &BTreeNode) -> Result<i64> {
-        self.append(&node.to_bytes())
-    }
-
-
-    // write a new version of a node, reusing old_ptr's position in place if
-    // that node belongs to this transaction, otherwise appending a copy
-    // verified in btree_io.rs
-    pub(crate) fn btree_write_node(&self, node: &BTreeNode, old_ptr: i64, frozen_at: i64) -> Result<i64> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::btree_io::btree_write_node(&mut DbStore::new(self), node, old_ptr, limit)
-    }
-
-    // verified in btree_join.rs
-    pub(crate) fn btree_new_root(&self) -> Result<i64> {
-        crate::btree_join::btree_new_root(&mut DbStore::new(self))
-    }
 
     // descend to the value slot at the given rank (0-based), returning a
     // pointer to it (its file position and current slot).
@@ -330,46 +312,4 @@ impl<C: Core> Database<C> {
         crate::btree_io::read_btree_slot(&mut DbStore::new(self), root_ptr, rank)
     }
 
-    // insert a placeholder slot at `rank` within the subtree at node_ptr,
-    // writing new nodes along the path. the caller fills in the value at the
-    // returned value_position.
-    pub(crate) fn btree_insert(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<InsertResult> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::btree_io::btree_insert(&mut DbStore::new(self), node_ptr, rank, limit)
-    }
-
-    // descend to the value slot at `rank` for writing, copy-on-writing only
-    // the nodes that belong to a past transaction. the element count is
-    // unchanged, so when the whole path is already this-transaction nothing
-    // is rewritten and the caller writes straight into the existing leaf.
-    pub(crate) fn btree_get_for_write(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<WriteSlot> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::btree_io::btree_get_for_write(&mut DbStore::new(self), node_ptr, rank, limit)
-    }
-
-    // remove the element at `rank` within the subtree at node_ptr, returning
-    // the node left behind for the caller to write. an emptied child is
-    // dropped and a child left under half full is merged with a neighbor it
-    // fits with, so every leaf stays at the same depth.
-    pub(crate) fn btree_remove(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<BTreeNode> {
-        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
-        crate::btree_io::btree_remove(&mut DbStore::new(self), node_ptr, rank, limit)
-    }
-
-    // turns a join result into a root pointer, growing the tree a level if
-    // the old root split. verified in btree_join.rs
-    pub(crate) fn btree_make_root(&self, result: JoinResult) -> Result<i64> {
-        crate::btree_join::btree_make_root(&mut DbStore::new(self), result)
-    }
-
-    // verified in btree_join.rs
-    pub(crate) fn btree_join(&self, root_a: i64, root_b: i64) -> Result<i64> {
-        crate::btree_join::btree_join(&mut DbStore::new(self), root_a, root_b)
-    }
-
-    /// Splits the tree at `rank`, returning the roots of the left and
-    /// right parts. verified in btree_join.rs
-    pub(crate) fn btree_split(&self, root_ptr: i64, rank: i64) -> Result<(i64, i64)> {
-        crate::btree_join::btree_split(&mut DbStore::new(self), root_ptr, rank)
-    }
 }

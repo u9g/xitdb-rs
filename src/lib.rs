@@ -79,6 +79,7 @@ mod path;
 mod record;
 #[cfg(feature = "serde")]
 mod replica_serde;
+mod path_store;
 mod slot;
 mod store;
 mod sorted;
