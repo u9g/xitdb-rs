@@ -173,14 +173,10 @@ impl<C: Core> Database<C> {
                 magic_number: MAGIC_NUMBER,
             };
             db.header.set(header);
-            db.write_bytes(&header.to_bytes())?;
-            // write the root header and commit an empty root, so the
-            // file ends with a trailer like after any transaction
-            db.write_bytes(&RootHeader { file_size: 0, root: Slot::default() }.to_bytes())?;
-            // the first commit's ID is 0, so a new database's bytes only
-            // depend on its file ID
-            db.commit_root(Slot::default(), 0)?;
-            db.core().sync()?;
+            // write the header and the root header and commit an empty
+            // root, so the file ends with a trailer like after any
+            // transaction. verified in commit_store.rs
+            crate::commit_store::init_file(&mut DbStore::new(&db), header)?;
         } else {
             let header = db.read_and_validate_header()?;
             db.header.set(header);
@@ -574,14 +570,6 @@ impl<C: Core> Database<C> {
         Ok(self.read_root_header()?.root)
     }
 
-    // completes a transaction by appending a trailer for root and updating
-    // the root header. callers must sync afterwards to make the header
-    // itself durable.
-    pub(crate) fn commit_root(&self, root: Slot, commit_id: u64) -> Result<()> {
-        // verified in commit_store.rs
-        crate::commit_store::commit_root(&mut DbStore::new(self), root, commit_id, self.header.get().file_id)
-    }
-
 
     fn check_hash<'h>(&self, hash: &'h [u8]) -> Result<&'h [u8]> {
         if hash.len() != self.hash_size() {
@@ -700,8 +688,9 @@ impl<C: Core> Database<C> {
             self.transaction.set(Some(active));
         }
 
-        // the transaction works on a copy of the root slot
-        self.write_slot_at(scratch_pos, root)?;
+        // the transaction works on a copy of the root slot, appended.
+        // verified in commit_store.rs
+        let scratch_pos = crate::commit_store::begin_transaction(&mut DbStore::new(self), root)?;
         let mut root_ptr = SlotPointer::new(Some(scratch_pos), root);
 
         // every collection expects its init part to copy its header or root
@@ -713,9 +702,15 @@ impl<C: Core> Database<C> {
 
         let mut result = self.read_slot_pointer(write_mode, path, path_i, root_ptr, frozen_at, ctx)?;
 
-        // the copy now holds the new root, so commit it
-        let next_root = self.read_slot_at(scratch_pos)?;
-        self.commit_root(next_root, random_u64()?)?;
+        // the copy now holds the new root, so commit it. verified in
+        // commit_store.rs
+        let commit_id = random_u64()?;
+        let next_root = crate::commit_store::finish_transaction(
+            &mut DbStore::new(self),
+            scratch_pos,
+            commit_id,
+            self.header.get().file_id,
+        )?;
 
         // a path that ends at the root (such as an init or a write) returns
         // a root cursor, so it can be used for later transactions

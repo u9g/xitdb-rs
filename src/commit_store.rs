@@ -442,4 +442,66 @@ pub fn finish_replicated<S: Store>(s: &mut S, start: i64, length: i64, file_id: 
     Ok(())
 }
 
+// creating a database and transactions
+
+/// `Database::new` on an empty file: the header, an empty root header, and
+/// the first commit (whose ID is 0, so a new database's bytes only depend
+/// on its file ID).
+pub fn init_file<S: Store>(s: &mut S, header: Header) -> (r: Result<()>)
+    requires
+        old(s).file().len() == 0,
+    ensures
+        r is Ok ==> final(s).file().len() == HEADER_LENGTH + ROOT_HEADER_LENGTH + ROOT_TRAILER_LENGTH,
+        r is Ok ==> final(s).file().subrange(0, HEADER_LENGTH as int) == header_encode_spec(header),
+{
+    let h = header.to_bytes();
+    append(s, &h)?;
+    let ghost f1 = s.file();
+    let rh = RootHeader { file_size: 0, root: Slot::new(0, Tag::None) }.to_bytes();
+    append(s, &rh)?;
+    let ghost f2 = s.file();
+    commit_root(s, Slot::new(0, Tag::None), 0, header.file_id)?;
+    s.sync()?;
+    proof {
+        let g = s.file();
+        assert(f1 =~= h@);
+        assert forall|i: int| 0 <= i < HEADER_LENGTH implies g[i] == h@[i] by {
+            assert(g[i] == f2[i]);
+            assert(f2[i] == f1[i]);
+        }
+        assert(g.subrange(0, HEADER_LENGTH as int) =~= header_encode_spec(header));
+    }
+    Ok(())
+}
+
+/// Starting a transaction: the root slot copied to the end of the file,
+/// where the transaction works on it.
+pub fn begin_transaction<S: Store>(s: &mut S, root: Slot) -> (r: Result<i64>)
+    ensures
+        r is Ok ==> r.unwrap() == old(s).file().len(),
+        r is Ok ==> final(s).file().len() >= old(s).file().len() && final(s).file().subrange(0, old(s).file().len() as int)
+            == old(s).file(),
+{
+    let scratch_pos = s.len()?;
+    write_slot_at(s, scratch_pos, root)?;
+    proof {
+        lemma_slot_roundtrip(root);
+        assert(s.file().subrange(0, old(s).file().len() as int) =~= old(s).file());
+    }
+    Ok(scratch_pos)
+}
+
+/// Finishing a transaction: the copy of the root slot holds the new root,
+/// so it is committed. Only the root header and the trailer change.
+pub fn finish_transaction<S: Store>(s: &mut S, scratch_pos: i64, commit_id: u64, file_id: u64) -> (r: Result<Slot>)
+    requires
+        old(s).file().len() >= ROOT_HEADER_END,
+    ensures
+        r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
+{
+    let next_root = read_slot_at(s, scratch_pos)?;
+    commit_root(s, next_root, commit_id, file_id)?;
+    Ok(next_root)
+}
+
 } // verus!
