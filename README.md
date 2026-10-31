@@ -172,6 +172,68 @@ Usually, you want to use a top-level `ArrayList` like in the example above, beca
 
 Since xitdb supports in-memory databases, you could use it as an over-the-wire serialization format. Much like "Cap'n Proto", xitdb has no encoding/decoding step: you just give the buffer to xitdb and it can immediately read from it (`CoreMemory::from_bytes`).
 
+## History
+
+`History` wraps a database whose root is a history of `HashMap` moments, like the example above, without the boilerplate. `History::transact` appends a copy of the latest moment, runs your function on it, and commits it. Whatever the function returns is returned. If it returns an error, which can be any type that `xitdb::Error` converts into, nothing is committed. If it leaves the moment unchanged, nothing is committed either, so the history only grows when the data changes:
+
+```rust
+use xitdb::*;
+
+#[derive(Debug)]
+enum AppError {
+    Db(xitdb::Error),
+    Overdrawn,
+}
+
+impl From<xitdb::Error> for AppError {
+    fn from(err: xitdb::Error) -> Self {
+        AppError::Db(err)
+    }
+}
+
+fn main() -> Result<(), AppError> {
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+
+    // a new database has no moments, and latest() is an empty map
+    assert!(history.latest()?.get_cursor("balance")?.is_none());
+
+    history.transact(|moment| moment.put("balance", 100u64))?;
+
+    // transactions can return a value, and read their own writes
+    let balance = history.transact(|moment| {
+        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        moment.put("balance", balance - 30)?;
+        Ok::<_, AppError>(moment.get_cursor("balance")?.unwrap().read_uint()?)
+    })?;
+    assert_eq!(balance, 70);
+
+    // an error aborts the transaction
+    let result = history.transact(|moment| {
+        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        if balance < 500 {
+            return Err(AppError::Overdrawn);
+        }
+        moment.put("balance", balance - 500)?;
+        Ok(())
+    });
+    assert!(matches!(result, Err(AppError::Overdrawn)));
+
+    // a transaction that changes nothing isn't committed
+    let (_, committed) = history.transact_with_status(|moment| {
+        Ok::<_, AppError>(moment.get_cursor("balance")?.is_some())
+    })?;
+    assert!(!committed);
+
+    assert_eq!(history.count()?, 2);
+    let first = history.moment(0)?.unwrap();
+    assert_eq!(first.get_cursor("balance")?.unwrap().read_uint()?, 100);
+    Ok(())
+}
+```
+
+The function can't return anything that borrows the moment, since an unchanged moment is discarded; read what you need into owned values. A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, so read and compare first if you rewrite values that rarely change.
+
 ## Types
 
 In xitdb there are a variety of immutable data structures that you can nest arbitrarily:
