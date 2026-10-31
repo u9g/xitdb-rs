@@ -1,0 +1,416 @@
+//! Tests for records: `#[derive(Record)]` and `Map::update`.
+#![cfg(feature = "derive")]
+
+use xitdb::*;
+
+const MAX_READ: Option<u64> = Some(1024);
+
+/// A merge, as gem's server stores it by hand.
+#[derive(Record, Debug, Clone, PartialEq, Default)]
+struct Merge {
+    title: String,
+    #[xitdb(rename = "started-at")]
+    started_at: i64,
+    question: bool,
+    #[xitdb(rename = "thread")]
+    thread_id: Option<String>,
+}
+
+const MERGES: Map<str, Merge> = Map::new("merges");
+const URL: &str = "https://example.com/pr/1";
+
+fn new_db() -> Database<CoreMemory> {
+    Database::in_memory().unwrap()
+}
+
+/// Runs `f` in a transaction on a new history and returns the database.
+fn with_moment(f: impl for<'t> FnOnce(&mut WriteHashMap<'t, CoreMemory>) -> Result<()>) -> Database<CoreMemory> {
+    let db = new_db();
+    History::new(&db).unwrap().transact(f).unwrap();
+    db
+}
+
+fn latest(db: &Database<CoreMemory>) -> ReadHashMap<'_, CoreMemory> {
+    History::new(db).unwrap().latest().unwrap()
+}
+
+/// The stored map of the merge at `URL`.
+fn stored<'a>(moment: &ReadHashMap<'a, CoreMemory>) -> ReadHashMap<'a, CoreMemory> {
+    moment.get_map("merges").unwrap().unwrap().get_map(URL).unwrap().unwrap()
+}
+
+fn decode_error<T: std::fmt::Debug>(result: Result<T>) -> DecodeError {
+    match result {
+        Err(Error::Decode(err)) => *err,
+        other => panic!("expected a decode error, got {other:?}"),
+    }
+}
+
+fn merge() -> Merge {
+    Merge { title: "Add records".into(), started_at: 1700000000, question: true, thread_id: Some("thread-0001".into()) }
+}
+
+#[test]
+fn records_round_trip_as_maps_of_their_fields() {
+    let merge = merge();
+    let db = with_moment(|moment| MERGES.put(moment, URL, &merge));
+    let moment = latest(&db);
+    assert_eq!(MERGES.get(&moment, URL).unwrap(), Some(merge.clone()));
+    assert_eq!(MERGES.iter(&moment).unwrap().collect::<Result<Vec<_>>>().unwrap(), [(URL.to_string(), merge)]);
+
+    // stored under the renamed keys, the way gem writes it by hand
+    let map = stored(&moment);
+    assert_eq!(map.get_string("title", MAX_READ).unwrap().as_deref(), Some("Add records"));
+    assert_eq!(map.get_int("started-at").unwrap(), Some(1700000000));
+    assert_eq!(map.get_uint("question").unwrap(), Some(1));
+    assert_eq!(map.get_string("thread", MAX_READ).unwrap().as_deref(), Some("thread-0001"));
+    assert!(map.get_slot("started_at").unwrap().is_none());
+    assert_eq!(<Merge as Record>::FIELDS, ["title", "started-at", "question", "thread"]);
+}
+
+#[test]
+fn reads_data_written_by_hand() {
+    let db = with_moment(|moment| {
+        let mut merge = moment.put_map("merges")?.put_map(URL)?;
+        merge.put("title", "By hand")?;
+        merge.put("started-at", 1700000000i64)?;
+        merge.put("question", 0u64)?;
+        // gem writes "thread" later, so it's absent here
+        Ok(())
+    });
+    let moment = latest(&db);
+    let expected = Merge { title: "By hand".into(), started_at: 1700000000, question: false, thread_id: None };
+    assert_eq!(MERGES.get(&moment, URL).unwrap(), Some(expected));
+
+    // and what gem's hand-written reader reads from a derived record
+    let db = with_moment(|moment| MERGES.put(moment, URL, &merge()));
+    let map = stored(&latest(&db));
+    assert_eq!(map.get_string("thread", None).unwrap().as_deref(), Some("thread-0001"));
+    assert_eq!(map.get_string("title", None).unwrap().unwrap_or_default(), "Add records");
+    assert_eq!(map.get_int("started-at").unwrap().unwrap_or_default(), 1700000000);
+    assert!(map.get_uint("question").unwrap().is_some_and(|q| q != 0));
+}
+
+#[test]
+fn missing_and_empty_fields_read_as_defaults() {
+    let db = with_moment(|moment| {
+        let mut merges = moment.put_map("merges")?;
+        merges.put_map("empty")?;
+        let mut nones = merges.put_map("nones")?;
+        nones.put("title", Data::None)?;
+        nones.put("thread", Data::None)?;
+        Ok(())
+    });
+    let moment = latest(&db);
+    assert_eq!(MERGES.get(&moment, "empty").unwrap(), Some(Merge::default()));
+    assert_eq!(MERGES.get(&moment, "nones").unwrap(), Some(Merge::default()));
+}
+
+#[test]
+fn required_fields_must_be_present() {
+    #[derive(Record, Debug, Clone, PartialEq)]
+    struct User {
+        #[xitdb(required)]
+        id: u64,
+        name: String,
+    }
+    const USERS: Map<str, User> = Map::new("users");
+
+    let db = with_moment(|moment| {
+        USERS.put(moment, "a", &User { id: 0, name: String::new() })?;
+        moment.put_map("users")?.put_map("b")?.put("name", "bob")?;
+        Ok(())
+    });
+    let moment = latest(&db);
+    assert_eq!(USERS.get(&moment, "a").unwrap(), Some(User { id: 0, name: String::new() }));
+    let err = decode_error(USERS.get(&moment, "b"));
+    assert_eq!(err.to_string(), r#"couldn't decode "users" at key "b" field "id": the field is missing"#);
+}
+
+#[test]
+fn none_is_a_missing_field_and_writing_it_removes_the_field() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| MERGES.put(moment, URL, &merge())).unwrap();
+    assert!(stored(&history.latest().unwrap()).get_slot("thread").unwrap().is_some());
+
+    history.transact(|moment| MERGES.put(moment, URL, &Merge { thread_id: None, ..merge() })).unwrap();
+    let moment = history.latest().unwrap();
+    // removed, not stored as an empty value
+    assert!(stored(&moment).get_slot("thread").unwrap().is_none());
+    assert_eq!(MERGES.get(&moment, URL).unwrap().unwrap().thread_id, None);
+
+    // put a record with None into a new key: the field is never written
+    history.transact(|moment| MERGES.put(moment, "new", &Merge::default())).unwrap();
+    let moment = history.latest().unwrap();
+    let new = moment.get_map("merges").unwrap().unwrap().get_map("new").unwrap().unwrap();
+    assert!(new.get_slot("thread").unwrap().is_none());
+    assert_eq!(new.get_string("title", MAX_READ).unwrap().as_deref(), Some(""));
+}
+
+#[test]
+fn unknown_fields_are_ignored_on_read_and_kept_on_write() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history
+        .transact(|moment| {
+            MERGES.put(moment, URL, &merge())?;
+            // written by newer code
+            moment.put_map("merges")?.put_map(URL)?.put("reviewer", "ann")?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    assert_eq!(MERGES.get(&history.latest().unwrap(), URL).unwrap(), Some(merge()));
+
+    history.transact(|moment| MERGES.update(moment, URL, |merge| merge.title = "Renamed".into())).unwrap();
+    let map = stored(&history.latest().unwrap());
+    assert_eq!(map.get_string("reviewer", MAX_READ).unwrap().as_deref(), Some("ann"));
+    assert_eq!(map.get_string("title", MAX_READ).unwrap().as_deref(), Some("Renamed"));
+
+    history.transact(|moment| MERGES.put(moment, URL, &Merge::default())).unwrap();
+    let map = stored(&history.latest().unwrap());
+    assert_eq!(map.get_string("reviewer", MAX_READ).unwrap().as_deref(), Some("ann"));
+    assert_eq!(MERGES.get(&history.latest().unwrap(), URL).unwrap(), Some(Merge::default()));
+}
+
+#[test]
+fn put_replaces_a_value_that_isnt_a_map() {
+    let db = with_moment(|moment| {
+        moment.put_map("merges")?.put(URL, "not a record")?;
+        MERGES.put(moment, URL, &merge())
+    });
+    assert_eq!(MERGES.get(&latest(&db), URL).unwrap(), Some(merge()));
+}
+
+#[test]
+fn update_writes_only_the_fields_that_changed() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| MERGES.put(moment, URL, &merge())).unwrap();
+    let before = stored(&history.latest().unwrap());
+
+    let updated = history
+        .transact(|moment| MERGES.update(moment, URL, |merge| merge.started_at = 1800000000))
+        .unwrap();
+    assert_eq!(updated, Some(Merge { started_at: 1800000000, ..merge() }));
+    let after = stored(&history.latest().unwrap());
+    assert_eq!(MERGES.get(&history.latest().unwrap(), URL).unwrap(), updated);
+    // unchanged fields keep their slots, so their bytes weren't written
+    // again (both strings are too long to be stored in the slot)
+    for field in ["title", "question", "thread"] {
+        assert_eq!(before.get_slot(field).unwrap(), after.get_slot(field).unwrap(), "{field}");
+    }
+    assert_eq!(after.get_int("started-at").unwrap(), Some(1800000000));
+    assert_eq!(updated.unwrap().changed_fields(&merge()), ["started-at"]);
+
+    // Some to None removes the field
+    history.transact(|moment| MERGES.update(moment, URL, |merge| merge.thread_id = None)).unwrap();
+    assert!(stored(&history.latest().unwrap()).get_slot("thread").unwrap().is_none());
+}
+
+#[test]
+fn update_that_changes_nothing_doesnt_commit() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| MERGES.put(moment, URL, &merge())).unwrap();
+    let count = history.count().unwrap();
+
+    // f runs but sets the values that are already there
+    let (updated, committed) = history
+        .transact_with_status(|moment| {
+            MERGES.update(moment, URL, |merge| {
+                merge.question = true;
+                merge.title = "Add records".into();
+            })
+        })
+        .unwrap();
+    assert_eq!(updated, Some(merge()));
+    assert!(!committed);
+
+    // a missing key or collection isn't created, and f isn't called
+    let (updated, committed) = history
+        .transact_with_status(|moment| {
+            let a = MERGES.update(moment, "missing", |_| panic!("f is only called for a stored record"))?;
+            const OTHER: Map<str, Merge> = Map::new("other");
+            let b = OTHER.update(moment, URL, |_| panic!("f is only called for a stored record"))?;
+            Ok::<_, Error>((a, b))
+        })
+        .unwrap();
+    assert_eq!(updated, (None, None));
+    assert!(!committed);
+    assert_eq!(history.count().unwrap(), count);
+
+    // and a field that's missing in storage but default in the struct stays
+    // missing
+    history.transact(|moment| moment.put_map("merges")?.put_map("bare")?.put("title", "t")).unwrap();
+    let (_, committed) = history
+        .transact_with_status(|moment| MERGES.update(moment, "bare", |merge| merge.started_at = 0))
+        .unwrap();
+    assert!(!committed);
+}
+
+#[test]
+fn upsert_starts_from_the_default() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    let created = history.transact(|moment| MERGES.upsert(moment, URL, |merge| merge.question = true)).unwrap();
+    assert_eq!(created, Merge { question: true, ..Merge::default() });
+    let map = stored(&history.latest().unwrap());
+    assert_eq!(map.get_string("title", MAX_READ).unwrap().as_deref(), Some(""));
+    assert_eq!(map.get_uint("question").unwrap(), Some(1));
+
+    let updated = history.transact(|moment| MERGES.upsert(moment, URL, |merge| merge.title = "t".into())).unwrap();
+    assert_eq!(updated, Merge { title: "t".into(), question: true, ..Merge::default() });
+
+    let (_, committed) =
+        history.transact_with_status(|moment| MERGES.upsert(moment, URL, |merge| merge.question = true)).unwrap();
+    assert!(!committed);
+}
+
+#[derive(Record, Debug, Clone, PartialEq, Default)]
+struct Moment {
+    #[xitdb(rename = "merge")]
+    current: Merge,
+    previous: Option<Merge>,
+    count: u64,
+    ratio: f64,
+    data: Vec<u8>,
+}
+
+const MOMENTS: Map<u64, Moment> = Map::new("moments");
+
+#[test]
+fn records_nest() {
+    let value = Moment { current: merge(), previous: None, count: 3, ratio: 0.5, data: vec![1, 2] };
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| MOMENTS.put(moment, &1, &value)).unwrap();
+    let moment = history.latest().unwrap();
+    assert_eq!(MOMENTS.get(&moment, &1).unwrap(), Some(value.clone()));
+    let stored = moment.get_map("moments").unwrap().unwrap().get_map(1u64.to_be_bytes()).unwrap().unwrap();
+    let merge_map = stored.get_map("merge").unwrap().unwrap();
+    assert_eq!(merge_map.get_int("started-at").unwrap(), Some(1700000000));
+    assert!(stored.get_slot("previous").unwrap().is_none());
+
+    // a changed nested record is rewritten in place, keeping its unknown
+    // keys
+    history
+        .transact(|moment| {
+            MOMENTS.collection_mut(moment)?.put_map(1u64.to_be_bytes())?.put_map("merge")?.put("x", 1u64)
+        })
+        .unwrap();
+    let updated = history
+        .transact(|moment| {
+            MOMENTS.update(moment, &1, |value| {
+                value.current.question = false;
+                value.previous = Some(Merge::default());
+            })
+        })
+        .unwrap()
+        .unwrap();
+    let moment = history.latest().unwrap();
+    assert_eq!(MOMENTS.get(&moment, &1).unwrap(), Some(updated));
+    let stored = moment.get_map("moments").unwrap().unwrap().get_map(1u64.to_be_bytes()).unwrap().unwrap();
+    let merge_map = stored.get_map("merge").unwrap().unwrap();
+    assert_eq!((merge_map.get_uint("question").unwrap(), merge_map.get_uint("x").unwrap()), (Some(0), Some(1)));
+    assert!(stored.get_map("previous").unwrap().is_some());
+}
+
+#[test]
+fn decode_errors_name_the_field() {
+    let db = with_moment(|moment| {
+        let mut merges = moment.put_map("merges")?;
+        merges.put_map("text-time")?.put("started-at", "today")?;
+        merges.put_map("two")?.put("question", 2u64)?;
+        merges.put_map("int-thread")?.put("thread", 5i64)?;
+        merges.put("not-a-map", "x")?;
+        let mut moments = moment.put_map("moments")?;
+        moments.put_map(1u64.to_be_bytes())?.put_map("merge")?.put("title", 1u64)?;
+        moments.put_map(2u64.to_be_bytes())?.put("merge", "x")?;
+        Ok(())
+    });
+    let moment = latest(&db);
+
+    let err = decode_error(MERGES.get(&moment, "text-time"));
+    assert_eq!(
+        (err.collection.as_deref(), err.key.as_deref(), err.field.as_deref()),
+        (Some("merges"), Some("\"text-time\""), Some("started-at"))
+    );
+    assert_eq!(
+        err.to_string(),
+        r#"couldn't decode "merges" at key "text-time" field "started-at": expected an integer, found ShortBytes"#
+    );
+    assert_eq!(decode_error(MERGES.get(&moment, "two")).message, "expected 0 or 1 for a bool, found 2");
+    let err = decode_error(MERGES.get(&moment, "int-thread"));
+    assert_eq!((err.field.as_deref(), err.message.as_str()), (Some("thread"), "expected bytes, found Int"));
+
+    let err = decode_error(MERGES.get(&moment, "not-a-map"));
+    assert_eq!((err.field, err.message.as_str()), (None, "expected a hash map, found ShortBytes"));
+
+    // a nested record's field is a path
+    let err = decode_error(MOMENTS.get(&moment, &1));
+    assert_eq!((err.key.as_deref(), err.field.as_deref()), (Some("1"), Some("merge.title")));
+    let err = decode_error(MOMENTS.get(&moment, &2));
+    assert_eq!((err.field.as_deref(), err.message.as_str()), (Some("merge"), "expected a hash map, found ShortBytes"));
+
+    // and update returns the error without writing
+    let history = History::new(&db).unwrap();
+    let result = history.transact_with_status(|moment| MERGES.update(moment, "two", |_| unreachable!()));
+    assert!(matches!(result, Err(Error::Decode(_))));
+}
+
+#[test]
+fn records_work_as_plain_value_codecs() {
+    // a record is a ValueCodec, so it can be written through any cursor
+    let db = with_moment(|moment| Merge::write(&merge(), &mut moment.put_cursor("merge")?));
+    let cursor = latest(&db).get_cursor("merge").unwrap().unwrap();
+    assert_eq!(Merge::read(&cursor).unwrap(), merge());
+    assert_eq!(Merge::read_fields(&ReadHashMap::new(&cursor).unwrap()).unwrap(), merge());
+}
+
+#[cfg(feature = "serde")]
+mod json {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+    struct Progress {
+        done: u64,
+        total: u64,
+    }
+
+    #[derive(Record, Debug, Clone, PartialEq, Default)]
+    struct Job {
+        #[xitdb(codec = Json<Progress>)]
+        progress: Progress,
+        #[xitdb(codec = Json<Vec<String>>, rename = "log")]
+        lines: Option<Vec<String>>,
+    }
+
+    const JOBS: Map<str, Job> = Map::new("jobs");
+
+    #[test]
+    fn json_fields() {
+        let job = Job { progress: Progress { done: 1, total: 2 }, lines: Some(vec!["a".into()]) };
+        let db = new_db();
+        let history = History::new(&db).unwrap();
+        history.transact(|moment| JOBS.put(moment, "j", &job)).unwrap();
+        let moment = history.latest().unwrap();
+        assert_eq!(JOBS.get(&moment, "j").unwrap(), Some(job.clone()));
+        let map = moment.get_map("jobs").unwrap().unwrap().get_map("j").unwrap().unwrap();
+        let progress = map.get_cursor("progress").unwrap().unwrap().read_bytes_object(MAX_READ).unwrap();
+        assert_eq!(progress.format_tag, Some(JSON_FORMAT_TAG));
+        assert_eq!(&*progress.value, br#"{"done":1,"total":2}"#);
+        assert_eq!(map.get_string("log", MAX_READ).unwrap().as_deref(), Some(r#"["a"]"#));
+
+        let (_, committed) = history
+            .transact_with_status(|moment| JOBS.update(moment, "j", |job| job.progress.total = 2))
+            .unwrap();
+        assert!(!committed);
+
+        history.transact(|moment| moment.put_map("jobs")?.put_map("bad")?.put("log", "[1]")).unwrap();
+        let err = decode_error(JOBS.get(&history.latest().unwrap(), "bad"));
+        assert_eq!(err.field.as_deref(), Some("log"));
+        assert!(err.message.starts_with("invalid json"), "{}", err.message);
+    }
+}

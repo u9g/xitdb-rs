@@ -19,7 +19,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * Incrementally reads and writes, so file-based databases can contain larger-than-memory datasets.
 * Reads never block writes, and a database can be read from multiple threads/processes without locks.
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
-* Dependencies: `getrandom` (for file and commit IDs) and, behind the default `sha1` feature, `sha1`. The optional `serde` feature adds `serde` and `serde_json`.
+* Dependencies: `getrandom` (for file and commit IDs) and, behind the default `sha1` feature, `sha1`. The optional `serde` feature adds `serde` and `serde_json`, and the optional `derive` feature adds `xitdb-derive`, the crate with `#[derive(Record)]`.
 
 * [Example](#example)
 * [Initializing a Database](#initializing-a-database)
@@ -30,6 +30,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Iterators](#iterators)
 * [Accessors](#accessors)
 * [Typed Collections](#typed-collections)
+* [Records](#records)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
 * [Replication](#replication)
@@ -782,6 +783,70 @@ fn main() -> xitdb::Result<()> {
     assert_eq!(BY_STATUS.get(&history.latest()?, "open")?.len(), 2);
     Ok(())
 }
+
+## Records
+
+A struct that's stored as a nested map of its fields, like the merges in the [Accessors](#accessors) example, otherwise needs its field names repeated wherever it's read and written. With the `derive` feature, `#[derive(Record)]` makes the struct a `ValueCodec` that does it, so a `Map` can store it:
+
+* Each field is stored under its name, or `#[xitdb(rename = "...")]`, with its type as its codec: `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` or another record. `#[xitdb(codec = Json<T>)]` picks another codec.
+* A missing field reads as `Default::default()`, so adding a field needs no migration. With `#[xitdb(required)]`, it's an error instead.
+* An `Option` field that's `None` is missing from the map, rather than stored as an empty value; writing `None` removes it.
+* Keys in the map that aren't fields, such as ones written by newer code, are ignored when reading and kept when writing, by `put` too: the stored map is changed in place, not replaced.
+* A field that doesn't decode is an `Error::Decode` that names it, along with the collection and the key.
+
+`Map::update` reads a record, applies a function to a copy, and writes only the fields whose values changed (compared with `PartialEq`). If none did, it writes nothing, so the transaction isn't committed; there's no need to compare first. A missing key is left missing, and `update` returns `None`; `Map::upsert` starts from the default record instead. The derive supports structs with named fields and no generics, and needs every field to implement `PartialEq`.
+
+```rust
+#[cfg(feature = "derive")]
+fn main() -> xitdb::Result<()> {
+    use xitdb::*;
+
+    #[derive(Record, Debug, Clone, PartialEq, Default)]
+    struct Merge {
+        title: String,
+        #[xitdb(rename = "started-at")]
+        started_at: i64,
+        question: bool,
+        #[xitdb(rename = "thread")]
+        thread_id: Option<String>,
+    }
+
+    const MERGES: Map<str, Merge> = Map::new("merges");
+    let url = "https://example.com/pr/1";
+
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+    let merge = Merge { title: "Add records".into(), started_at: 1700000000, ..Merge::default() };
+    history.transact(|moment| MERGES.put(moment, url, &merge))?;
+
+    // the same data as writing each field by hand, with no "thread" yet
+    let moment = history.latest()?;
+    let stored = moment.get_map("merges")?.unwrap().get_map(url)?.unwrap();
+    assert_eq!(stored.get_int("started-at")?, Some(1700000000));
+    assert_eq!(stored.get_uint("question")?, Some(0));
+    assert!(stored.get_cursor("thread")?.is_none());
+    assert_eq!(MERGES.get(&moment, url)?, Some(merge));
+
+    // only "question" and "thread" are written
+    history.transact(|moment| {
+        MERGES.update(moment, url, |merge| {
+            merge.question = true;
+            merge.thread_id = Some("thread-1".into());
+        })
+    })?;
+    let merge = MERGES.get(&history.latest()?, url)?.unwrap();
+    assert!(merge.question);
+    assert_eq!(merge.thread_id.as_deref(), Some("thread-1"));
+
+    // an update that changes nothing isn't committed
+    let (_, committed) =
+        history.transact_with_status(|moment| MERGES.update(moment, url, |merge| merge.question = true))?;
+    assert!(!committed);
+    Ok(())
+}
+
+#[cfg(not(feature = "derive"))]
+fn main() {}
 ```
 
 ## Hashing

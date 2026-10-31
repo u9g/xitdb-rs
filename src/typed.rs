@@ -419,7 +419,7 @@ pub(crate) fn with_context(err: Error, collection: &str, key: impl FnOnce() -> O
     let mut decode = match err {
         Error::Decode(decode) => decode,
         Error::Io(_) => return err,
-        other => Box::new(DecodeError { collection: None, key: None, message: other.to_string() }),
+        other => Box::new(DecodeError { collection: None, key: None, field: None, message: other.to_string() }),
     };
     decode.collection.get_or_insert_with(|| collection.to_owned());
     if decode.key.is_none() {
@@ -433,7 +433,7 @@ pub(crate) fn with_context(err: Error, collection: &str, key: impl FnOnce() -> O
 fn wrong_kind(collection: &str, expected: Tag, found: Tag) -> Error {
     let expected = if expected == Tag::HashSet { "a hash set" } else { "a hash map" };
     let message = format!("expected {expected}, found {found:?}");
-    Error::Decode(Box::new(DecodeError { collection: Some(collection.to_owned()), key: None, message }))
+    Error::Decode(Box::new(DecodeError { collection: Some(collection.to_owned()), key: None, field: None, message }))
 }
 
 /// The collection under `name` (whose hash is `hash`) in `parent`, or

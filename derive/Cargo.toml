@@ -1,0 +1,18 @@
+[package]
+name = "xitdb-derive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The derive macro for xitdb's Record trait. Use it through xitdb's `derive` feature."
+license = "MIT"
+repository = "https://github.com/u9g/xitdb-rs"
+keywords = ["database", "xitdb", "derive"]
+categories = ["database-implementations"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
