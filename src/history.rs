@@ -24,10 +24,10 @@ use crate::slot::{Slot, SlotPointer, Tag};
 /// [`History::moment`].
 ///
 /// ```
-/// use xitdb::{CoreMemory, Database, Hasher, History};
+/// use xitdb::{Database, History};
 ///
 /// # fn main() -> xitdb::Result<()> {
-/// let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+/// let db = Database::in_memory()?;
 /// let history = History::new(&db)?;
 ///
 /// history.transact(|moment| moment.put("foo", "bar"))?;
@@ -122,7 +122,7 @@ impl<'a, C: Core> History<'a, C> {
     ///
     /// ```compile_fail
     /// # use xitdb::*;
-    /// # let db = Database::new(CoreMemory::new(), Hasher::sha1()).unwrap();
+    /// # let db = Database::in_memory().unwrap();
     /// # let history = History::new(&db).unwrap();
     /// let moment = history.transact(|moment| ReadHashMap::new(moment.cursor().clone()));
     /// ```

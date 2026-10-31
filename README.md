@@ -192,7 +192,7 @@ impl From<xitdb::Error> for AppError {
 }
 
 fn main() -> Result<(), AppError> {
-    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let db = Database::in_memory()?;
     let history = History::new(&db)?;
 
     // a new database has no moments, and latest() is an empty map
@@ -232,7 +232,7 @@ fn main() -> Result<(), AppError> {
 }
 ```
 
-A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, so read and compare first if you rewrite values that rarely change.
+The function can't return anything that borrows the moment, since an unchanged moment is discarded; read what you need into owned values. A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, so read and compare first if you rewrite values that rarely change.
 
 ## Types
 

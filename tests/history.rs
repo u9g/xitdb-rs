@@ -5,7 +5,7 @@ use xitdb::*;
 const MAX_READ: Option<u64> = Some(1024);
 
 fn new_db() -> Database<CoreMemory> {
-    Database::new(CoreMemory::new(), Hasher::sha1()).unwrap()
+    Database::in_memory().unwrap()
 }
 
 fn read(moment: &ReadHashMap<'_, impl Core>, key: &str) -> Option<Vec<u8>> {
@@ -211,10 +211,11 @@ fn reads_own_writes_inside_transact() {
 fn reopens_existing_history() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     {
-        let db = Database::new(CoreFile::new(tmp.as_file().try_clone().unwrap()), Hasher::sha1()).unwrap();
+        let db = Database::open(tmp.path()).unwrap();
         History::new(&db).unwrap().transact(|moment| moment.put("foo", "foo")).unwrap();
+        db.close().unwrap();
     }
-    let db = Database::new(CoreFile::new(tmp.as_file().try_clone().unwrap()), Hasher::sha1()).unwrap();
+    let db = Database::open(tmp.path()).unwrap();
     let history = History::new(&db).unwrap();
     assert_eq!(history.count().unwrap(), 1);
     assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"foo");
