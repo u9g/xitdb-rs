@@ -13,13 +13,18 @@ categories = ["database-implementations", "data-structures"]
 [dependencies]
 getrandom = "0.3"
 sha1 = { version = "0.10", optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 default = ["sha1"]
 # adds Hasher::sha1(), the hasher used by the other xitdb implementations' examples
 sha1 = ["dep:sha1"]
+# adds the Json codec for typed collections
+serde = ["dep:serde", "dep:serde_json"]
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 sha2 = "0.10"
 tempfile = "3"

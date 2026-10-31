@@ -80,6 +80,45 @@ pub enum Error {
         /// The version before it.
         previous: u64,
     },
+    /// A typed collection's codec couldn't decode a stored key or value.
+    /// Boxed so that it doesn't make every `Result` bigger.
+    Decode(Box<DecodeError>),
+}
+
+/// The details of an [`Error::Decode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecodeError {
+    /// The name of the typed collection, if the value was read through one.
+    pub collection: Option<String>,
+    /// The key, formatted with `Debug`, if it's known. A key that couldn't
+    /// be decoded is shown as a lossy UTF-8 string.
+    pub key: Option<String>,
+    /// What the codec found wrong.
+    pub message: String,
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("couldn't decode")?;
+        if let Some(collection) = &self.collection {
+            write!(f, " {collection:?}")?;
+        }
+        if let Some(key) = &self.key {
+            write!(f, " at key {key}")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl Error {
+    /// An [`Error::Decode`] with just a message, as a codec returns it. The
+    /// typed collection that called the codec adds its name and the key.
+    pub fn decode(message: impl Into<String>) -> Error {
+        Error::Decode(Box::new(DecodeError { collection: None, key: None, message: message.into() }))
+    }
 }
 
 impl fmt::Display for Error {
@@ -106,6 +145,7 @@ impl fmt::Display for Error {
             Error::MigrationOutOfOrder { version, previous } => {
                 return write!(f, "migration version {version} must be greater than {previous}");
             }
+            Error::Decode(err) => return write!(f, "{err}"),
             Error::NestedTopLevelWrite => "nested top-level writes are not allowed",
             Error::FrozenSlot => {
                 "writer points into frozen data; reacquire it from the transaction root"
@@ -143,6 +183,7 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             Error::CompactFileReopenFailed { rename_error, .. } => Some(rename_error),
             Error::InvalidUtf8(err) => Some(err),
+            Error::Decode(err) => Some(err),
             _ => None,
         }
     }
