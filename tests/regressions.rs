@@ -108,3 +108,28 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// Hashes longer than 127 bytes have more than 255 nibbles, so the offset
+/// into the hash that the hash map walks must not be a `u8`: two keys whose
+/// hashes differ only in their most significant byte overflowed it, which
+/// panicked in debug builds and recursed forever in release builds.
+#[test]
+fn hash_map_with_long_hashes() -> Result<()> {
+    let hasher = Hasher::new(|data: &[u8]| {
+        let mut hash = vec![0u8; 129];
+        hash[0] = data.first().copied().unwrap_or(0);
+        hash
+    });
+    let db = Database::new(CoreMemory::new(), hasher)?;
+    db.run_context(|cursor| {
+        let mut map = WriteHashMap::new(cursor)?;
+        map.put("a", "1")?;
+        map.put("b", "2")?;
+        Ok(())
+    })?;
+    let map = ReadHashMap::new(db.root_cursor())?;
+    assert_eq!(map.get_cursor("a")?.unwrap().read_bytes(None)?, b"1");
+    assert_eq!(map.get_cursor("b")?.unwrap().read_bytes(None)?, b"2");
+    assert!(map.get_cursor("c")?.is_none());
+    Ok(())
+}
