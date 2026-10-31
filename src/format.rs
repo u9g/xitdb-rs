@@ -652,7 +652,8 @@ impl KeyValuePair {
     pub fn decode(buf: &[u8], tag: Tag, hash_size: usize) -> (r: Result<KeyValuePair>)
         requires
             hash_size + SLOT_LENGTH * 2 <= usize::MAX,
-            buf@.len() >= hash_size + SLOT_LENGTH * 2,
+            tag == Tag::KvPair ==> buf@.len() >= hash_size + SLOT_LENGTH * 2,
+            tag == Tag::SortedKvPair ==> buf@.len() >= SLOT_LENGTH * 2,
         ensures
             r matches Ok(kv) ==> kv.hash@.len() == hash_size,
             r matches Ok(kv) ==> tag == Tag::KvPair ==> kv_encode_spec(kv) == buf@.subrange(0, hash_size + SLOT_LENGTH * 2),
@@ -961,6 +962,7 @@ impl BTreeNode {
         ensures
             r.kind == kind,
             r.num == num,
+            forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] r.counts[i] == 0,
     {
         BTreeNode {
             kind,
@@ -1057,6 +1059,7 @@ impl SortedNode {
         ensures
             r.kind == kind,
             r.num == num,
+            forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] r.counts[i] == 0,
     {
         SortedNode {
             kind,

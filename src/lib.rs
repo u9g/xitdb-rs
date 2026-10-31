@@ -83,6 +83,7 @@ mod sorted;
 #[cfg(feature = "serde")]
 mod structured;
 mod typed;
+mod sorted_store;
 
 pub use crate::collections::{KeyIterator, KvPairIterator};
 pub use crate::collections::{

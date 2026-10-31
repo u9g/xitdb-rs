@@ -309,15 +309,6 @@ impl<C: Core> Database<C> {
         self.append(&node.to_bytes())
     }
 
-    // a node is safe to mutate in place when it was created in the current
-    // transaction after the writing cursor's freeze point (see is_old), since
-    // no committed moment and no pre-concat sharing can reference it. concat
-    // advances tx_start (an implicit freeze) precisely so its shared subtrees
-    // fall below it here.
-    pub(crate) fn btree_reusable(&self, ptr: i64, frozen_at: i64) -> bool {
-        // outside a transaction nothing can be reused
-        matches!(self.is_old(ptr, frozen_at), Ok(false))
-    }
 
     // write a new version of a node, reusing old_ptr's position in place if
     // that node belongs to this transaction, otherwise appending a copy
