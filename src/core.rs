@@ -18,14 +18,17 @@ pub trait Core {
     fn flush(&mut self) -> io::Result<()>;
     /// Flushes and makes the data durable.
     fn sync(&mut self) -> io::Result<()>;
-    /// Called when the core is done being used, to flush anything it
-    /// buffers and report errors that dropping it would ignore. The
-    /// default calls [`Core::sync`]. The core may still be used afterwards.
+    /// Called when the core is done being used, to write out anything it
+    /// buffers and report errors that dropping it would ignore. The default
+    /// calls [`Core::flush`]. It doesn't make the data durable (committed
+    /// transactions already are; call [`Core::sync`] for other writes), so
+    /// it also succeeds on a read-only core. The core may still be used
+    /// afterwards.
     ///
-    /// Unlike [`CoreBufferedFile::close`], this works through a
-    /// [`DynCore`] or any other wrapper, since it doesn't consume the core.
-    fn close(&mut self) -> io::Result<()> {
-        self.sync()
+    /// This works through a [`DynCore`] or any other wrapper, since it
+    /// doesn't consume the core.
+    fn finish(&mut self) -> io::Result<()> {
+        self.flush()
     }
 }
 
@@ -59,8 +62,8 @@ impl<C: Core + ?Sized> Core for &mut C {
     fn sync(&mut self) -> io::Result<()> {
         (**self).sync()
     }
-    fn close(&mut self) -> io::Result<()> {
-        (**self).close()
+    fn finish(&mut self) -> io::Result<()> {
+        (**self).finish()
     }
 }
 
@@ -89,8 +92,8 @@ impl<C: Core + ?Sized> Core for Box<C> {
     fn sync(&mut self) -> io::Result<()> {
         (**self).sync()
     }
-    fn close(&mut self) -> io::Result<()> {
-        (**self).close()
+    fn finish(&mut self) -> io::Result<()> {
+        (**self).finish()
     }
 }
 
@@ -252,7 +255,7 @@ pub const DEFAULT_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 /// file-based databases.
 ///
 /// Buffered data is flushed when the core is dropped, but errors are
-/// ignored there, so call [`CoreBufferedFile::close`] (or [`Core::close`]
+/// ignored there, so call [`CoreBufferedFile::close`] (or [`Core::finish`]
 /// when the core is behind a [`DynCore`] or a generic `C: Core`) to
 /// observe them.
 #[derive(Debug)]
@@ -289,8 +292,10 @@ impl CoreBufferedFile {
     /// doesn't exist. Existing contents are kept.
     ///
     /// The file isn't locked. Only one process may write to a database at
-    /// a time, so when writing from multiple processes, take an exclusive
-    /// lock on the file first (see [`CoreBufferedFile::get_ref`]).
+    /// a time, so when writing from multiple processes, hold an exclusive
+    /// lock on a separate lock file (such as `<path>.lock`) while opening
+    /// and writing. Don't lock the database file itself: on some platforms,
+    /// such as Windows, that lock is mandatory and would block readers.
     pub fn open(path: impl AsRef<Path>) -> io::Result<CoreBufferedFile> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         Ok(CoreBufferedFile::new(file))
@@ -298,15 +303,12 @@ impl CoreBufferedFile {
 
     /// Opens the existing file at `path` for reading only. Reads never block
     /// writes, so this is safe while another process is writing to the file.
-    /// Writing to a database opened this way fails with an i/o error.
+    /// Writing to a database opened this way fails with an i/o error, and
+    /// so does passing an empty file to [`Database::new`](crate::Database::new),
+    /// which would initialize it; [`Database::open_read_only`](crate::Database::open_read_only)
+    /// checks for that.
     pub fn open_read_only(path: impl AsRef<Path>) -> io::Result<CoreBufferedFile> {
         Ok(CoreBufferedFile::new(File::open(path)?))
-    }
-
-    /// Borrows the file, for example to lock it. Don't read or write
-    /// through it, because buffered writes may not have reached it yet.
-    pub fn get_ref(&self) -> &File {
-        self.file.as_ref().expect("file is only taken on close")
     }
 
     /// Flushes buffered data and returns the file.

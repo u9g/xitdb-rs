@@ -109,19 +109,25 @@ impl Database<CoreBufferedFile> {
     /// Opens the database file at `path` with [`CoreBufferedFile::open`] and
     /// [`Hasher::sha1`], creating and initializing it if it doesn't exist.
     ///
-    /// The file isn't locked. When writing from multiple processes, take an
-    /// exclusive lock on it first. For another hasher, use
-    /// `Database::new(CoreBufferedFile::open(path)?, hasher)`.
+    /// The file isn't locked. When writing from multiple processes, hold an
+    /// exclusive lock on a separate lock file before calling this, since it
+    /// may initialize the file; see [`CoreBufferedFile::open`]. For another
+    /// hasher, use `Database::new(CoreBufferedFile::open(path)?, hasher)`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Database<CoreBufferedFile>> {
         Database::new(CoreBufferedFile::open(path)?, Hasher::sha1())
     }
 
     /// Opens the existing database file at `path` for reading only, with
     /// [`CoreBufferedFile::open_read_only`] and [`Hasher::sha1`]. This is
-    /// how to read a database that another process is writing to. Writes
-    /// fail with [`Error::Io`].
+    /// how to read a database that another process is writing to, and it
+    /// needs no lock. It never initializes the file, so an empty file fails
+    /// with [`Error::InvalidDatabase`]. Writes fail with [`Error::Io`].
     pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Database<CoreBufferedFile>> {
-        Database::new(CoreBufferedFile::open_read_only(path)?, Hasher::sha1())
+        let mut core = CoreBufferedFile::open_read_only(path)?;
+        if core.length()? == 0 {
+            return Err(Error::InvalidDatabase);
+        }
+        Database::new(core, Hasher::sha1())
     }
 }
 
@@ -206,10 +212,12 @@ impl<C: Core> Database<C> {
         self.core.into_inner()
     }
 
-    /// Closes the core with [`Core::close`], returning any error from
-    /// flushing it. Dropping the database flushes too, but ignores errors.
+    /// Consumes the database and calls [`Core::finish`] on its core,
+    /// returning any error from writing out buffered data. Dropping a
+    /// [`CoreBufferedFile`](crate::CoreBufferedFile) also writes out its
+    /// buffer, but ignores errors.
     pub fn close(self) -> Result<()> {
-        Ok(self.into_core().close()?)
+        Ok(self.into_core().finish()?)
     }
 
     /// Boxes the core, so databases with different cores have the same

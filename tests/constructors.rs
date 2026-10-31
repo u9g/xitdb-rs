@@ -82,7 +82,7 @@ fn open_read_only() -> Result<()> {
 }
 
 #[test]
-fn close_flushes_boxed_buffered_file() -> Result<()> {
+fn finish_flushes_boxed_buffered_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("raw.bin");
 
@@ -91,7 +91,7 @@ fn close_flushes_boxed_buffered_file() -> Result<()> {
     core.seek_to(0)?;
     core.write(b"hello")?;
     assert_eq!(std::fs::metadata(&path)?.len(), 0);
-    core.close()?;
+    core.finish()?;
     assert_eq!(std::fs::read(&path)?, b"hello");
     drop(core);
 
@@ -106,7 +106,7 @@ fn close_flushes_boxed_buffered_file() -> Result<()> {
 }
 
 #[test]
-fn close_reports_flush_errors_through_dyn_core() -> Result<()> {
+fn finish_reports_flush_errors_through_dyn_core() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("raw.bin");
     std::fs::write(&path, b"")?;
@@ -116,7 +116,7 @@ fn close_reports_flush_errors_through_dyn_core() -> Result<()> {
     let mut core: DynCore = Box::new(CoreBufferedFile::open_read_only(&path)?);
     core.seek_to(0)?;
     core.write(b"hello")?;
-    assert!(core.close().is_err());
+    assert!(core.finish().is_err());
     Ok(())
 }
 
@@ -155,5 +155,33 @@ fn into_dyn_keeps_state() -> Result<()> {
     assert_eq!(last_moment(&db)?.as_deref(), Some(&b"before"[..]));
     append_moment(&db, "after")?;
     assert_eq!(ReadArrayList::new(db.root_cursor())?.count()?, 2);
+    Ok(())
+}
+
+#[test]
+fn close_read_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("test.db");
+    let db = Database::open(&path)?;
+    append_moment(&db, "first")?;
+    db.close()?;
+
+    // finishing a core that wrote nothing never needs write access
+    let reader = Database::open_read_only(&path)?;
+    assert_eq!(last_moment(&reader)?.as_deref(), Some(&b"first"[..]));
+    reader.close()?;
+    Database::open_read_only(&path)?.into_dyn().close()?;
+    Ok(())
+}
+
+#[test]
+fn open_read_only_empty_file() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("test.db");
+    std::fs::write(&path, b"")?;
+
+    // a read-only open never initializes the file
+    assert!(matches!(Database::open_read_only(&path), Err(Error::InvalidDatabase)));
+    assert_eq!(std::fs::metadata(&path)?.len(), 0);
     Ok(())
 }
