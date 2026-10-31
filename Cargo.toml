@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "An immutable, embedded database. A Rust port of xitdb."
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/u9g/xitdb-rs"
 keywords = ["database", "immutable", "embedded", "persistent", "hamt"]
 categories = ["database-implementations", "data-structures"]
 
