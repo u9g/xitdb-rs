@@ -63,6 +63,7 @@ mod error;
 mod file_offset_map;
 mod format;
 mod hasher;
+mod history;
 mod path;
 mod slot;
 mod sorted;
@@ -83,6 +84,7 @@ pub use crate::error::{Error, Result};
 pub use crate::file_offset_map::FileOffsetMap;
 pub use crate::format::{Header, ReplicaState, root_trailer_checksum};
 pub use crate::hasher::{Hasher, bytes_to_id, id_to_bytes};
+pub use crate::history::History;
 pub use crate::path::{HashMapGetTarget, PathPart, SortedMapGetTarget, WriteMode};
 pub use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 
