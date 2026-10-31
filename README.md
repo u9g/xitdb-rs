@@ -131,6 +131,38 @@ A `Database` is initialized with an implementation of the `Core` trait, which de
 
 The database owns its core. Get it back with `Database::into_core`, or borrow it with `Database::core`. `CoreBufferedFile` flushes its buffer when dropped; call `CoreBufferedFile::close` if you want to see errors from that flush.
 
+With the default `sha1` feature, there are shortcuts that use `Hasher::sha1()`: `Database::open(path)` opens a `CoreBufferedFile` database for reading and writing, creating it if it doesn't exist; `Database::open_read_only(path)` opens an existing one for reading only, which is how another process reads a database while it's being written to (writes through it fail); and `Database::in_memory()` creates a `CoreMemory` database. For another hasher, pass `CoreBufferedFile::open(path)?` or `CoreBufferedFile::open_read_only(path)?` to `Database::new`. These don't lock the file: when writing from multiple processes, take an exclusive lock on it first, for example with `File::lock` (Rust 1.89+) on `CoreBufferedFile::get_ref`.
+
+To choose the core at runtime, such as a file in production and memory in tests, use `Database<DynCore>`, where `DynCore` is a `Box<dyn Core + Send>`. `Database::into_dyn` boxes the core of any database. `Database::close` flushes the core and returns any error from it, even when the core is boxed; it calls `Core::close`, which by default calls `Core::sync`.
+
+```rust
+use xitdb::*;
+
+fn open_db(path: Option<&std::path::Path>) -> xitdb::Result<Database<DynCore>> {
+    Ok(match path {
+        Some(path) => Database::open(path)?.into_dyn(),
+        None => Database::in_memory()?.into_dyn(),
+    })
+}
+
+fn main() -> xitdb::Result<()> {
+    let path = std::env::temp_dir().join("xitdb-readme-dyn-core.db");
+    # let _ = std::fs::remove_file(&path);
+    for path in [Some(path.as_path()), None] {
+        let db = open_db(path)?;
+        let mut history = WriteArrayList::new(&mut db.root_cursor())?;
+        history.append("hello")?;
+        db.close()?;
+    }
+
+    // the file still has the data, and other processes can read it
+    let db = Database::open_read_only(&path)?;
+    let history = ReadArrayList::new(db.root_cursor())?;
+    assert_eq!(history.get_cursor(-1)?.unwrap().read_bytes(Some(1024))?, b"hello");
+    Ok(())
+}
+```
+
 Since xitdb is an append-only database, the data you are writing is invisible to any reader until the very last step, when a small header at the start of the file is updated to point at it. This is how it supports transactions, despite not having any rollback journal or write-ahead log: if a transaction fails, the data it appended is simply discarded.
 
 Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"), so past copies stay readable and can be reverted to. If you don't need to keep past copies, you can also use a top-level `HashMap`. Keep in mind that each write to a top-level `HashMap` is its own transaction, so if you make many writes, group them into one transaction with `Database::run_context`.
