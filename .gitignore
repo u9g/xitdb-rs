@@ -1,1 +1,3 @@
 /target
+interop/telephone/ts/node_modules
+interop/telephone/ts/*lock*

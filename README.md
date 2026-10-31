@@ -533,6 +533,8 @@ It is possible to read the database from multiple threads without locks, even wh
 
 This crate reads and writes the same format as the other implementations. Its test suite is a port of the Go implementation's, and it includes a database written by the Go implementation (`tests/testdata/test.db`). `interop/run.sh` round-trips a database between this crate and the Go implementation: Rust writes every data type, Go verifies it and appends a moment, Rust verifies that and compacts the database, and Go verifies the compacted copy.
 
+`interop/telephone.sh [rounds] [seed]` goes further and plays telephone with one database between this crate and the Go, Java and TypeScript implementations. They take turns appending a moment of random edits to every collection type, and after each turn the next implementation reads back the whole history and checks every moment against a model. At the end, every implementation must read the file, and a compacted copy, identically, including the order hash maps iterate in.
+
 The API follows the Go implementation's, adapted to Rust:
 
 * Lookups that can miss return `Result<Option<_>>` instead of a nil cursor.
