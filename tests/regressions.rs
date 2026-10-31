@@ -108,3 +108,30 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// Changing a list reached through a copied hash map, without its init
+/// part, must copy the list rather than change the previous moment's.
+#[test]
+fn remove_without_init_keeps_old_moment() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let mut root = db.root_cursor();
+    let key = db.digest(b"list");
+    let kv = PathPart::HashMapGet(HashMapGetTarget::Value(&key));
+    let map = PathPart::HashMapInit { counted: false, set: false };
+    let list = PathPart::LinkedArrayListInit;
+    let append = PathPart::LinkedArrayListAppend;
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListAppend, map, kv, list, append, PathPart::WriteData(&Data::Uint(1))])?;
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListGet(-1), map, kv, list, append, PathPart::WriteData(&Data::Uint(2))])?;
+    fn count(db: &Database<CoreMemory>, kv: PathPart, i: i64) -> Result<i64> {
+        let c = db.root_cursor().read_path(&[PathPart::ArrayListGet(i), kv])?.unwrap();
+        ReadLinkedArrayList::new(c)?.count()
+    }
+    assert_eq!(count(&db, kv, 0)?, 2);
+    let last = Data::from(root.read_path_slot(&[PathPart::ArrayListGet(-1)])?);
+    // a new moment copies the map, then removes from its list without
+    // initializing it
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListAppend, PathPart::WriteData(&last), map, kv, PathPart::LinkedArrayListRemove(0)])?;
+    assert_eq!(count(&db, kv, 0)?, 2);
+    assert_eq!(count(&db, kv, 1)?, 1);
+    Ok(())
+}

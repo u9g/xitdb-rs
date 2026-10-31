@@ -54,6 +54,10 @@ pub struct Database<C: Core> {
     hasher: Hasher,
     header: Cell<Header>,
     pub(crate) tx_start: Cell<Option<i64>>,
+    // where the current transaction started: everything before it is
+    // committed. tx_start can move past it (freezing, concatenation), but
+    // this doesn't.
+    tx_floor: Cell<Option<i64>>,
     pub(crate) transaction: Cell<Option<Transaction>>,
     next_transaction_id: Cell<u64>,
 }
@@ -153,6 +157,7 @@ impl<C: Core> Database<C> {
             }),
             hasher,
             tx_start: Cell::new(None),
+            tx_floor: Cell::new(None),
             transaction: Cell::new(None),
             next_transaction_id: Cell::new(1),
         };
@@ -247,6 +252,7 @@ impl<C: Core> Database<C> {
             hasher: self.hasher,
             header: self.header,
             tx_start: self.tx_start,
+            tx_floor: self.tx_floor,
             transaction: self.transaction,
             next_transaction_id: self.next_transaction_id,
         }
@@ -725,16 +731,19 @@ impl<C: Core> Database<C> {
         Ok(())
     }
 
-    // copy frozen collection storage before mutation to preserve existing readers
+    // copy frozen or committed collection storage before mutation to
+    // preserve existing readers. a path can reach a collection without its
+    // init part (such as through a copied hash map), and a collection from a
+    // past transaction must not change in place.
     fn copy_collection_if_frozen(
         &self,
         slot_ptr: SlotPointer,
         init: PathPart<'_>,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        if let Some(tx_frozen_at) = self.transaction.get().and_then(|t| t.frozen_at)
-            && slot_ptr.slot.value < tx_frozen_at
-        {
+        let frozen = self.transaction.get().and_then(|t| t.frozen_at).is_some_and(|f| slot_ptr.slot.value < f);
+        let committed = self.tx_floor.get().is_some_and(|floor| slot_ptr.slot.value < floor);
+        if frozen || committed {
             return self.read_part(init, WriteMode::ReadWrite, &[init], 0, slot_ptr, frozen_at, &mut None);
         }
         Ok(slot_ptr)
@@ -816,6 +825,8 @@ impl<C: Core> Database<C> {
         let scratch_pos = self.len()?;
         self.tx_start.set(Some(scratch_pos));
         let _reset_tx_start = ResetOnDrop(&self.tx_start);
+        self.tx_floor.set(Some(scratch_pos));
+        let _reset_tx_floor = ResetOnDrop(&self.tx_floor);
         // the copy is the transaction's root, so it stays writable after freezing
         if let Some(mut active) = self.transaction.get() {
             active.root_position = Some(scratch_pos);
