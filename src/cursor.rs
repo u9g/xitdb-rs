@@ -83,9 +83,8 @@ impl<'a, C: Core> ReadCursor<'a, C> {
         if slot.tag != Tag::Uint {
             return Err(Error::UnexpectedTag);
         }
-        if slot.value < 0 {
-            return Err(Error::ExpectedUnsignedLong);
-        }
+        // the slot stores the u64's bits, so values above i64::MAX look
+        // negative here. the Zig implementation reads them the same way
         Ok(slot.value as u64)
     }
 
