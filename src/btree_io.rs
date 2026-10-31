@@ -212,16 +212,14 @@ proof fn lemma_btree_read_step(f: Seq<u8>, ptr: int, rank: int, depth: nat, n: B
     }
 }
 
-/// `read_btree_slot`: the descent to the value at `rank`. A corrupt file
-/// whose node pointers form a cycle makes it loop, so only what it returns
-/// is proved, not that it returns.
-#[verifier::exec_allows_no_decreases_clause]
+/// `read_btree_slot`: the descent to the value at `rank`.
 pub fn read_btree_slot<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<SlotPointer>)
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> r.unwrap().position is Some && exists|d: nat| #[trigger] btree_read(old(s).file(), root_ptr as int, rank as int, d)
             == Some((r.unwrap().position.unwrap() as int, r.unwrap().slot)),
 {
+    let mut fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f = s.file();
     let mut node_ptr = root_ptr;
     let mut rem = rank;
@@ -232,7 +230,12 @@ pub fn read_btree_slot<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Res
             f == old(s).file(),
             forall|d: nat| #[trigger] btree_read(f, node_ptr as int, rem as int, d) is Some ==> btree_read(f, root_ptr as int, rank as int, d + k)
                 == btree_read(f, node_ptr as int, rem as int, d),
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_btree_node(s, node_ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             let r = check_rank(rem, node.num, false)?;
@@ -354,16 +357,18 @@ fn counts_to_vec(a: &[i64; BTREE_SLOT_COUNT], to: usize) -> (r: Vec<i64>)
 }
 
 /// `btree_insert`: a placeholder slot inserted at `rank` under the node at
-/// `node_ptr`. A cyclic corrupt file makes it recurse without end, so only
-/// what it returns is proved.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>) -> (r: Result<InsertResult>)
+/// `node_ptr`, descending at most `fuel` levels.
+pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<InsertResult>)
     requires
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
         (r is Ok && limit is Some) ==> r.unwrap().value_position >= limit.unwrap() && r.unwrap().join.node_ptr >= limit.unwrap(),
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let node = read_btree_node(s, node_ptr)?;
     let ghost f0 = s.file();
     match node.kind {
@@ -420,7 +425,7 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             }
             // pick the child that contains `rank`
             let (i, rem) = crate::btree::child_for_rank_pub(&node, rank, true);
-            let child = btree_insert(s, node.children[i].value, rem, limit)?;
+            let child = btree_insert(s, node.children[i].value, rem, limit, fuel - 1)?;
             let ghost f1 = s.file();
 
             // rebuild this branch with the (possibly split) child
@@ -477,15 +482,18 @@ pub fn btree_insert<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
 
 /// `btree_get_for_write`: the slot at `rank`, copying committed nodes on
 /// the way so the returned position is writable.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>) -> (r: Result<WriteSlot>)
+pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<WriteSlot>)
     requires
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
         (r is Ok && limit is Some) ==> r.unwrap().value_position >= limit.unwrap(),
         (r is Ok && limit is Some) ==> (r.unwrap().node_ptr == node_ptr || r.unwrap().node_ptr >= limit.unwrap()),
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let mut node = read_btree_node(s, node_ptr)?;
     let ghost f0 = s.file();
     if matches!(node.kind, BTreeNodeKind::Leaf) {
@@ -511,7 +519,7 @@ pub fn btree_get_for_write<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit:
     }
     let (i, rem) = crate::btree::child_for_rank_pub(&node, rank, false);
     let child_ptr = node.children[i].value;
-    let child = btree_get_for_write(s, child_ptr, rem, limit)?;
+    let child = btree_get_for_write(s, child_ptr, rem, limit, fuel - 1)?;
     // if the child stayed put, this branch is unchanged too
     if child.node_ptr == child_ptr {
         return Ok(WriteSlot { node_ptr, ..child });
@@ -541,14 +549,17 @@ fn same_kind(a: BTreeNodeKind, b: BTreeNodeKind) -> (r: bool)
 /// `btree_remove`: the node left after removing the value at `rank`, for
 /// the caller to write. Emptied children are dropped and underfull ones
 /// merged with a neighbor.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>) -> (r: Result<BTreeNode>)
+pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option<i64>, fuel: u64) -> (r: Result<BTreeNode>)
     requires
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
         r is Ok ==> r.unwrap().num <= BTREE_SLOT_COUNT,
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let mut node = read_btree_node(s, node_ptr)?;
     let ghost f0 = s.file();
     match node.kind {
@@ -573,7 +584,7 @@ pub fn btree_remove<S: Store>(s: &mut S, node_ptr: i64, rank: i64, limit: Option
             let (i0, rem) = crate::btree::child_for_rank_pub(&node, rank, false);
             let mut i = i0;
             let child_ptr = node.children[i].value;
-            let mut child = btree_remove(s, child_ptr, rem, limit)?;
+            let mut child = btree_remove(s, child_ptr, rem, limit, fuel - 1)?;
             let ghost f1 = s.file();
             if child.num == 0 {
                 crate::btree::drop_child(&mut node, i);

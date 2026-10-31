@@ -382,7 +382,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
         };
         let stack = iter_store::array_list_seek(&mut DbStore::new(db), header, idx)?;
         let leaf_depth = stack.len();
-        let mut state = iter_store::seeked_state(header.size, idx, 0, stack);
+        let mut state = iter_store::seeked_state(&mut DbStore::new(db), header.size, idx, 0, stack)?;
         state.leaf_depth = Some(leaf_depth);
         Ok(CursorIterator { db, state })
     }
@@ -402,7 +402,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             return Ok(CursorIterator::empty(db));
         };
         let stack = iter_store::linked_array_list_seek(&mut DbStore::new(db), header, idx)?;
-        let state = iter_store::seeked_state(header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack);
+        let state = iter_store::seeked_state(&mut DbStore::new(db), header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack)?;
         Ok(CursorIterator { db, state })
     }
 
@@ -437,7 +437,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             return Ok(CursorIterator::empty(db));
         };
         let stack = Self::levels(db.sorted_path_from_index(root_ptr, idx)?);
-        let state = iter_store::seeked_state(size, idx, BTREE_NODE_HEADER_SIZE as i64, stack);
+        let state = iter_store::seeked_state(&mut DbStore::new(db), size, idx, BTREE_NODE_HEADER_SIZE as i64, stack)?;
         Ok(CursorIterator { db, state })
     }
 
@@ -450,7 +450,7 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             return Ok(CursorIterator::empty(db));
         };
         let (path, before) = db.sorted_path_from_key(root_ptr, start_key)?;
-        let state = iter_store::seeked_state(size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path));
+        let state = iter_store::seeked_state(&mut DbStore::new(db), size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path))?;
         Ok(CursorIterator { db, state })
     }
 }

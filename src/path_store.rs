@@ -322,8 +322,9 @@ pub fn linked_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeH
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().position is Some && r.unwrap().position.unwrap() >= limit,
 {
+    let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let write_slot = btree_get_for_write(s, header.root_ptr, rank, Some(limit))?;
+    let write_slot = btree_get_for_write(s, header.root_ptr, rank, Some(limit), fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -352,8 +353,9 @@ pub fn linked_insert<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
         Some(n) => n,
         None => return Err(Error::InvalidDatabase),
     };
+    let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let result = btree_insert(s, header.root_ptr, rank, Some(limit))?;
+    let result = btree_insert(s, header.root_ptr, rank, Some(limit), fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -385,11 +387,13 @@ pub fn linked_slice<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, o
     if offset < 0 || size < 0 || offset > header.size || size > header.size - offset {
         return Err(Error::KeyNotFound);
     }
+    let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
     // slice = drop [0, offset) then keep [0, size) of what's left
-    let after_offset = btree_split(s, header.root_ptr, offset)?;
+    let after_offset = btree_split(s, header.root_ptr, offset, fuel)?;
+    let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let ghost fm = s.file();
-    let sliced = btree_split(s, after_offset.1, size)?;
+    let sliced = btree_split(s, after_offset.1, size, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_grows_trans(f0, fm, f1);
@@ -430,7 +434,6 @@ pub fn linked_concat<S: Store>(s: &mut S, header_ptr: i64, header_a: BTreeHeader
 
 /// `LinkedArrayListRemove`: the item at `rank` removed. A list of one item
 /// gets a new empty root, and a root left with one child is replaced by it.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, rank: i64, limit: i64) -> (r: Result<()>)
     requires
         0 <= limit <= old(s).file().len(),
@@ -450,7 +453,8 @@ pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
         }
         p
     } else {
-        let mut root = btree_remove(s, header.root_ptr, rank, Some(limit))?;
+        let fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
+        let mut root = btree_remove(s, header.root_ptr, rank, Some(limit), fuel)?;
         let ghost f1 = s.file();
         proof {
             lemma_tx_hdr(f0, f1, Some(limit));
@@ -461,11 +465,17 @@ pub fn linked_remove<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHeader, 
             lemma_hdr_trans(f0, f1, s.file(), limit as int);
         }
         // a root left with one child is replaced by it
+        let mut fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
         while matches!(root.kind, BTreeNodeKind::Branch) && root.num == 1
             invariant
                 tx_hdr_ok(f0, s.file(), limit as int),
                 0 <= limit <= f0.len(),
+            decreases fuel,
         {
+            if fuel == 0 {
+                return Err(Error::InvalidBTreeNode);
+            }
+            fuel = fuel - 1;
             new_root_ptr = root.children[0].value;
             root = read_btree_node(s, new_root_ptr)?;
         }
@@ -638,8 +648,9 @@ pub fn sorted_get_for_write<S: Store>(s: &mut S, header_ptr: i64, header: BTreeH
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
         r is Ok ==> r.unwrap().value >= limit,
 {
+    let fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let result = crate::sorted_store::sorted_put(s, header.root_ptr, key, Some(limit), hash_size)?;
+    let result = crate::sorted_store::sorted_put(s, header.root_ptr, key, Some(limit), hash_size, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));
@@ -674,8 +685,9 @@ pub fn sorted_remove_key<S: Store>(s: &mut S, header_ptr: i64, header: BTreeHead
     ensures
         r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
 {
+    let fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     let ghost f0 = s.file();
-    let (node_ptr, found) = crate::sorted_store::sorted_remove(s, header.root_ptr, key, Some(limit), hash_size)?;
+    let (node_ptr, found) = crate::sorted_store::sorted_remove(s, header.root_ptr, key, Some(limit), hash_size, fuel)?;
     let ghost f1 = s.file();
     proof {
         lemma_tx_hdr(f0, f1, Some(limit));

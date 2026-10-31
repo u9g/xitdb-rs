@@ -84,6 +84,8 @@ mod replica_serde;
 mod path_store;
 mod slot;
 mod store;
+#[cfg(test)]
+mod termination_tests;
 mod sorted;
 #[cfg(feature = "serde")]
 mod structured;

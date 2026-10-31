@@ -47,17 +47,22 @@ pub fn btree_new_root<S: Store>(s: &mut S) -> (r: Result<i64>)
 }
 
 /// `btree_height`: the number of branch levels, following first children.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn btree_height<S: Store>(s: &mut S, root_ptr: i64) -> (r: Result<usize>)
     ensures
         final(s).file() == old(s).file(),
 {
+    let mut fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let mut ptr = root_ptr;
     let mut height: usize = 0;
     loop
         invariant
             s.file() == old(s).file(),
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_btree_node(s, ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             return Ok(height);
@@ -341,11 +346,14 @@ fn btree_subtree<S: Store>(s: &mut S, children: &[Slot], counts: &[i64]) -> (r: 
 }
 
 /// `btree_split`: the roots of the values before and from `rank`.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn btree_split<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<(i64, i64)>)
+pub fn btree_split<S: Store>(s: &mut S, root_ptr: i64, rank: i64, fuel: u64) -> (r: Result<(i64, i64)>)
     ensures
         r is Ok ==> grows(old(s).file(), final(s).file()),
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let node = read_btree_node(s, root_ptr)?;
     let ghost f0 = s.file();
     if matches!(node.kind, BTreeNodeKind::Leaf) {
@@ -362,7 +370,7 @@ pub fn btree_split<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<
         return Err(Error::InvalidBTreeNode);
     }
     let (i, rem) = child_for_rank_pub(&node, rank, true);
-    let (child_left, child_right) = btree_split(s, node.children[i].value, rem)?;
+    let (child_left, child_right) = btree_split(s, node.children[i].value, rem, fuel - 1)?;
     let ghost f1 = s.file();
     let left_sub = btree_subtree(s, slice_subrange(node.children.as_slice(), 0, i), slice_subrange(node.counts.as_slice(), 0, i))?;
     let ghost f2 = s.file();

@@ -98,6 +98,27 @@ pub fn append<S: Store>(s: &mut S, data: &[u8]) -> (r: Result<i64>)
     Ok(pos)
 }
 
+/// How many steps a walk down the file may take, when each step but the
+/// last reads a different block of at least `block` bytes: one more than
+/// the number of such blocks that fit in the file. A path through a file
+/// without cycles never visits a block twice, so on a valid file the walk
+/// finishes first. A corrupt file whose pointers form a cycle fails when
+/// the steps run out instead of looping forever, which is what lets every
+/// walk be proved to finish.
+pub fn walk_bound<S: Store>(s: &mut S, block: u64) -> (r: Result<u64>)
+    requires
+        block > 0,
+    ensures
+        final(s).file() == old(s).file(),
+        r matches Ok(n) ==> n > 0,
+{
+    let len = s.len()?;
+    if len < 0 {
+        return Err(crate::Error::InvalidOffset);
+    }
+    Ok(len as u64 / block + 1)
+}
+
 #[verifier::external_trait_specification]
 #[allow(dead_code)]
 pub trait ExCore {

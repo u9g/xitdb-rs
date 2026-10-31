@@ -363,7 +363,6 @@ fn entry_position(node_ptr: i64, i: usize) -> (r: Result<i64>)
 }
 
 /// `sorted_get`: the entry with `key`, if any.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<Option<SortedSlot>>)
     requires
         hash_size <= 0xffff,
@@ -371,11 +370,17 @@ pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usi
         final(s).file() == old(s).file(),
 {
     let mut node_ptr = root_ptr;
+    let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
         invariant
             s.file() == old(s).file(),
             hash_size <= 0xffff,
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             let mut i: usize = 0;
@@ -406,17 +411,22 @@ pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usi
 }
 
 /// `sorted_get_by_index`: the entry at `rank`.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn sorted_get_by_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<SortedSlot>)
     ensures
         final(s).file() == old(s).file(),
 {
     let mut node_ptr = root_ptr;
     let mut rem = rank;
+    let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
         invariant
             s.file() == old(s).file(),
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             let i = check_rank(rem, node.num, false)?;
@@ -430,7 +440,6 @@ pub fn sorted_get_by_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r:
 }
 
 /// `sorted_rank`: the number of keys below `key`.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn sorted_rank<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<i64>)
     requires
         hash_size <= 0xffff,
@@ -439,11 +448,17 @@ pub fn sorted_rank<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: us
 {
     let mut node_ptr = root_ptr;
     let mut rank: i64 = 0;
+    let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
         invariant
             s.file() == old(s).file(),
             hash_size <= 0xffff,
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             let mut i: usize = 0;
@@ -477,7 +492,6 @@ pub fn sorted_rank<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: us
 
 /// `sorted_path_from_key`: the path to the first entry with a key at
 /// least `key`, and the number of entries before it.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn sorted_path_from_key<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<(NodePath, i64)>)
     requires
         hash_size <= 0xffff,
@@ -487,11 +501,17 @@ pub fn sorted_path_from_key<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash
     let mut stack: NodePath = Vec::new();
     let mut node_ptr = root_ptr;
     let mut before: i64 = 0;
+    let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
         invariant
             s.file() == old(s).file(),
             hash_size <= 0xffff,
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         let position = match node_ptr.checked_add(BTREE_NODE_HEADER_SIZE as i64) {
             Some(p) => p,
@@ -533,7 +553,6 @@ pub fn sorted_path_from_key<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash
 }
 
 /// `sorted_path_from_index`: the path to the entry at `rank`.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn sorted_path_from_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<NodePath>)
     ensures
         final(s).file() == old(s).file(),
@@ -541,10 +560,16 @@ pub fn sorted_path_from_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> 
     let mut stack: NodePath = Vec::new();
     let mut node_ptr = root_ptr;
     let mut rem = rank;
+    let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
     loop
         invariant
             s.file() == old(s).file(),
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         let position = match node_ptr.checked_add(BTREE_NODE_HEADER_SIZE as i64) {
             Some(p) => p,
@@ -685,15 +710,18 @@ fn counts_vec(a: &[i64; BTREE_SLOT_COUNT], n: usize) -> (r: Vec<i64>)
 /// `sorted_put`: inserts `key` (or finds it) under the node at
 /// `node_ptr`, copying committed nodes. The caller writes the value of the
 /// returned entry.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize) -> (r: Result<SortedInsertResult>)
+pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize, fuel: u64) -> (r: Result<SortedInsertResult>)
     requires
         hash_size <= 0xffff,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
         (r is Ok && limit is Some) ==> r.unwrap().kv_slot.value >= limit.unwrap() && r.unwrap().node_ptr >= limit.unwrap(),
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let node = read_sorted_node(s, node_ptr)?;
     let ghost f0 = s.file();
     match node.kind {
@@ -800,7 +828,7 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
             if node.num == 0 {
                 return Err(Error::InvalidBTreeNode);
             }
-            let child = sorted_put(s, node.children[i].value, key, limit, hash_size)?;
+            let child = sorted_put(s, node.children[i].value, key, limit, hash_size, fuel - 1)?;
             let ghost f1 = s.file();
 
             let mut children = entries_vec(&node.children, node.num);
@@ -865,14 +893,17 @@ pub fn sorted_put<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<
 
 /// `sorted_remove`: removes `key` under the node at `node_ptr`, copying
 /// committed nodes; an emptied leaf is left in place.
-#[verifier::exec_allows_no_decreases_clause]
-pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize) -> (r: Result<(i64, bool)>)
+pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Option<i64>, hash_size: usize, fuel: u64) -> (r: Result<(i64, bool)>)
     requires
         hash_size <= 0xffff,
         limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
     ensures
         r is Ok ==> tx_ok(old(s).file(), final(s).file(), limit),
+    decreases fuel,
 {
+    if fuel == 0 {
+        return Err(Error::InvalidBTreeNode);
+    }
     let node = read_sorted_node(s, node_ptr)?;
     let ghost f0 = s.file();
     match node.kind {
@@ -918,7 +949,7 @@ pub fn sorted_remove<S: Store>(s: &mut S, node_ptr: i64, key: &[u8], limit: Opti
             if node.num == 0 {
                 return Err(Error::InvalidBTreeNode);
             }
-            let (child_ptr, found) = sorted_remove(s, node.children[i].value, key, limit, hash_size)?;
+            let (child_ptr, found) = sorted_remove(s, node.children[i].value, key, limit, hash_size, fuel - 1)?;
             if !found {
                 return Ok((node_ptr, false));
             }

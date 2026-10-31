@@ -88,6 +88,17 @@ Every offset computed from data read from the file is overflow-checked.
 Corrupt pointers, sizes and counts make these functions return an error
 instead of panicking.
 
+Every verified function is proved to finish. Walks down the file (B-tree
+and sorted map descents, iteration, compaction) take at most
+`walk_bound` steps: one more than the number of the smallest blocks they
+visit that fit in the file. A path through a valid file never visits a
+block twice, so valid files behave as before. A corrupt file whose pointers
+form a cycle now fails with `InvalidBTreeNode` or `InvalidDatabase` instead
+of looping forever (`src/termination_tests.rs`). The recursive walks
+(B-tree and sorted map writes, splits, compaction) use one stack frame per
+step, so on a large enough corrupt file they can still overflow the stack
+before the bound is reached. That is a crash, not a hang.
+
 ## Trusted
 
 - **`DbStore`** (`store.rs`) forwards `Store` to a `Database`'s core
@@ -118,9 +129,6 @@ calls the verified functions above.
   `read_int` / `read_float`, `write_path`, and frozen checks.
 - **The public wrappers** in `collections.rs` and the value types in
   `data.rs`, `hasher.rs` and `path.rs`.
-- **Termination:** a corrupt file whose B-tree or index pointers form a
-  cycle makes the B-tree walks, sorted map walks, iterators and compaction
-  loop. For those, what they return is proved, not that they return.
 - **Crash consistency:** writes are treated as atomic.
 
 ## Found by verifying

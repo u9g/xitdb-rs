@@ -3,9 +3,9 @@
 //!
 //! Iterating only reads the file. Every stack index and position the
 //! traversal computes is in range, and offsets read from a corrupt file
-//! fail with an error instead of overflowing. A corrupt file whose index
-//! blocks form a cycle makes the walk go on forever, so only what it
-//! returns is proved, not that it returns.
+//! fail with an error instead of overflowing. Every walk is bounded (see
+//! [`walk_bound`] and [`step_bound`]), so a corrupt file whose index blocks
+//! form a cycle fails with an error, and the traversal is proved to finish.
 
 use crate::error::{Error, Result};
 use crate::format::*;
@@ -42,6 +42,8 @@ pub struct IterState {
     // is an item, even an empty one, so they are counted even when empty.
     pub leaf_depth: Option<usize>,
     pub done: bool,
+    // how many steps one call to next_internal may take (see step_bound)
+    pub steps: u64,
 }
 
 /// Every level's index is at most the block length.
@@ -52,6 +54,22 @@ pub open spec fn stack_ok(stack: Seq<IterLevel>) -> bool {
 pub open spec fn state_ok(st: IterState) -> bool {
     &&& stack_ok(st.stack@)
     &&& 0 <= st.node_offset <= BTREE_NODE_HEADER_SIZE
+}
+
+/// How many steps one call to [`next_internal`] may take. Each step pops a
+/// level, pushes one or passes a slot. In a valid file, between two items
+/// the walk goes up and back down a path of distinct blocks (at most
+/// [`walk_bound`] of them) or, in a hash map, crosses blocks that are each
+/// visited once, so it takes fewer steps than this.
+pub fn step_bound<S: Store>(s: &mut S) -> (r: Result<u64>)
+    ensures
+        final(s).file() == old(s).file(),
+{
+    let n = walk_bound(s, INDEX_BLOCK_SIZE as u64)?;
+    Ok(match n.checked_mul(2 * (SLOT_COUNT as u64 + 2)) {
+        Some(m) => m,
+        None => u64::MAX,
+    })
 }
 
 /// Reads the index block at `position` as a fresh level.
@@ -70,7 +88,7 @@ pub fn empty_state() -> (r: IterState)
         state_ok(r),
         r.done,
 {
-    IterState { kind: IterKind::Empty, size: 0, index: 0, stack: Vec::new(), node_offset: 0, leaf_depth: None, done: true }
+    IterState { kind: IterKind::Empty, size: 0, index: 0, stack: Vec::new(), node_offset: 0, leaf_depth: None, done: true, steps: 0 }
 }
 
 /// `CursorIterator::new`: the iterator over the collection `slot` holds.
@@ -129,6 +147,7 @@ pub fn new_state<S: Store>(s: &mut S, slot: Slot) -> (r: Result<IterState>)
         _ => return Err(Error::UnexpectedTag),
     }
     it.done = matches!(it.kind, IterKind::Empty);
+    it.steps = step_bound(s)?;
     proof {
         assert(stack_ok(it.stack@));
     }
@@ -136,14 +155,16 @@ pub fn new_state<S: Store>(s: &mut S, slot: Slot) -> (r: Result<IterState>)
 }
 
 /// A counted iterator started at `index`, with a stack from a seek.
-pub fn seeked_state(size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> (r: IterState)
+pub fn seeked_state<S: Store>(s: &mut S, size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> (r: Result<IterState>)
     requires
         stack_ok(stack@),
         0 <= node_offset <= BTREE_NODE_HEADER_SIZE,
     ensures
-        state_ok(r),
+        final(s).file() == old(s).file(),
+        r is Ok ==> state_ok(r.unwrap()),
 {
-    IterState { kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false }
+    let steps = step_bound(s)?;
+    Ok(IterState { kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false, steps })
 }
 
 /// `resolve_start_index`: a possibly-negative start index as a rank, or
@@ -214,12 +235,12 @@ pub fn array_list_seek<S: Store>(s: &mut S, header: ArrayListHeader, idx: i64) -
 
 /// `linked_array_list_from`: the stack of a linked array list iterator
 /// seeked to `idx`.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn linked_array_list_seek<S: Store>(s: &mut S, header: BTreeHeader, idx: i64) -> (r: Result<Vec<IterLevel>>)
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> stack_ok(r.unwrap()@),
 {
+    let mut fuel = walk_bound(s, BTREE_BRANCH_BLOCK_SIZE as u64)?;
     let mut stack: Vec<IterLevel> = Vec::new();
     let mut node_ptr = header.root_ptr;
     let mut rem = idx;
@@ -227,7 +248,12 @@ pub fn linked_array_list_seek<S: Store>(s: &mut S, header: BTreeHeader, idx: i64
         invariant
             s.file() == old(s).file(),
             stack_ok(stack@),
+        decreases fuel,
     {
+        if fuel == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
+        fuel = fuel - 1;
         let node = crate::btree_io::read_btree_node(s, node_ptr)?;
         let position = match node_ptr.checked_add(BTREE_NODE_HEADER_SIZE as i64) {
             Some(p) => p,
@@ -251,7 +277,6 @@ pub fn linked_array_list_seek<S: Store>(s: &mut S, header: BTreeHeader, idx: i64
 
 /// `next_internal`: the next slot, or `None` once the stack is exhausted.
 /// Empty slots are skipped, except in array list leaf blocks.
-#[verifier::exec_allows_no_decreases_clause]
 pub fn next_internal<S: Store>(s: &mut S, st: &mut IterState) -> (r: Result<Option<SlotPointer>>)
     requires
         state_ok(*old(st)),
@@ -259,11 +284,17 @@ pub fn next_internal<S: Store>(s: &mut S, st: &mut IterState) -> (r: Result<Opti
         final(s).file() == old(s).file(),
         state_ok(*final(st)),
 {
+    let mut steps = st.steps;
     while st.stack.len() > 0
         invariant
             s.file() == old(s).file(),
             state_ok(*st),
+        decreases steps,
     {
+        if steps == 0 {
+            return Err(Error::InvalidDatabase);
+        }
+        steps = steps - 1;
         let top = st.stack.len() - 1;
         let lvl = st.stack[top];
         if lvl.index >= SLOT_COUNT {
