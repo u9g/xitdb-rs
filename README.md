@@ -203,15 +203,15 @@ fn main() -> Result<(), AppError> {
 
     // transactions can return a value, and read their own writes
     let balance = history.transact(|moment| {
-        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        let balance = moment.get_uint("balance")?.unwrap();
         moment.put("balance", balance - 30)?;
-        Ok::<_, AppError>(moment.get_cursor("balance")?.unwrap().read_uint()?)
+        Ok::<_, AppError>(moment.get_uint("balance")?.unwrap())
     })?;
     assert_eq!(balance, 70);
 
     // an error aborts the transaction
     let result = history.transact(|moment| {
-        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        let balance = moment.get_uint("balance")?.unwrap();
         if balance < 500 {
             return Err(AppError::Overdrawn);
         }
@@ -228,7 +228,7 @@ fn main() -> Result<(), AppError> {
 
     assert_eq!(history.count()?, 2);
     let first = history.moment(0)?.unwrap();
-    assert_eq!(first.get_cursor("balance")?.unwrap().read_uint()?, 100);
+    assert_eq!(first.get_uint("balance")?.unwrap(), 100);
     Ok(())
 }
 ```
