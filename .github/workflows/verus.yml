@@ -44,3 +44,14 @@ jobs:
         run: cargo-verus verus verify
       - name: Check the boundary between verified and unverified code
         run: python3 verus/check_boundary.py
+
+  # the verified code must still build and pass the tests once the proofs
+  # are erased
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
