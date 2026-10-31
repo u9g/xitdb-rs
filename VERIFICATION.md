@@ -51,6 +51,20 @@ return exactly that: `read_array_list_slot` (`al_read`), `read_map_slot`
 (`sorted_read`) and `sorted_get` (`sorted_find`, which compares keys stored
 inline or as byte arrays in lexicographic order).
 
+## The history
+
+The database's history is its commits: each one appends a trailer, with a
+checksum, recording the new root (`in_history` in `commit_store.rs`).
+
+- A transaction's writes keep every commit made before it started
+  (`theorem_history_kept_by_writes`), along with every read of committed
+  data.
+- Its commit (`finish_transaction`, through `commit_root`) adds exactly one
+  entry, for the new root, and keeps every earlier one.
+
+So the history only grows, and nothing reachable from a past commit
+changes: the database is an immutable map of history.
+
 ## The boundary
 
 Verus checks verified code against its specification, but code outside

@@ -15,6 +15,7 @@ use crate::arith::*;
 use crate::array_list_store::*;
 use crate::btree_io::*;
 use crate::bytes::*;
+use crate::commit_store::*;
 use crate::format::*;
 use crate::map_store::*;
 use crate::path_store::*;
@@ -744,6 +745,21 @@ pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
             && find_fits(g, limit, ptr, key, hash_size, depth) by {
         lemma_find_frame(f, g, limit, ptr, key, hash_size, depth);
     }
+}
+
+/// The database is an immutable map of history. A transaction's writes
+/// keep every commit made before it started (`limit`, which is where the
+/// last commit's trailer ends) and every read of committed data
+/// (`theorem_snapshots_unchanged`). Its commit then adds one entry, for the
+/// new root, and keeps every earlier one (`finish_transaction`).
+pub proof fn theorem_history_kept_by_writes(f: Seq<u8>, g: Seq<u8>, file_id: u64, limit: int)
+    requires
+        tx_hdr_ok(f, g, limit),
+        0 <= limit <= f.len(),
+    ensures
+        history_kept(f, g, file_id, limit),
+{
+    lemma_history_kept(f, g, file_id, limit);
 }
 
 } // verus!

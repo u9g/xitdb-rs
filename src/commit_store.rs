@@ -37,6 +37,38 @@ pub open spec fn trailer_ok(f: Seq<u8>, end: int, file_id: u64, t: RootTrailer) 
     &&& t.checksum == crc64_spec(trailer_checksum_input(file_id, (end - ROOT_TRAILER_LENGTH) as i64, t.root, t.commit_id))
 }
 
+/// The history: a commit for `root` whose trailer ends at `end`. Every
+/// commit appends one, after the root header.
+pub open spec fn in_history(f: Seq<u8>, file_id: u64, end: int, root: Slot) -> bool {
+    &&& ROOT_HEADER_END + ROOT_TRAILER_LENGTH <= end
+    &&& exists|t: RootTrailer| #[trigger] trailer_ok(f, end, file_id, t) && t.root == root
+}
+
+/// Every commit in `f`'s history up to `upto` is in `g`'s.
+pub open spec fn history_kept(f: Seq<u8>, g: Seq<u8>, file_id: u64, upto: int) -> bool {
+    forall|end: int, root: Slot| end <= upto && #[trigger] in_history(f, file_id, end, root) ==> in_history(g, file_id, end, root)
+}
+
+/// A file that agrees with `f` outside the root header keeps its history.
+pub proof fn lemma_history_kept(f: Seq<u8>, g: Seq<u8>, file_id: u64, upto: int)
+    requires
+        upto <= f.len(),
+        upto <= g.len(),
+        forall|i: int| 0 <= i < upto && !(ROOT_HEADER_START <= i < ROOT_HEADER_END) ==> #[trigger] g[i] == f[i],
+    ensures
+        history_kept(f, g, file_id, upto),
+{
+    assert forall|end: int, root: Slot| end <= upto && #[trigger] in_history(f, file_id, end, root) implies in_history(g, file_id, end, root) by {
+        let t = choose|t: RootTrailer| #[trigger] trailer_ok(f, end, file_id, t) && t.root == root;
+        let a = end - ROOT_TRAILER_LENGTH;
+        assert forall|i: int| 0 <= i < ROOT_TRAILER_LENGTH implies #[trigger] g.subrange(a, end)[i] == f.subrange(a, end)[i] by {
+            assert(g[a + i] == f[a + i]);
+        }
+        assert(g.subrange(a, end) =~= f.subrange(a, end));
+        assert(trailer_ok(g, end, file_id, t));
+    }
+}
+
 /// `read_root_header`.
 pub fn read_root_header<S: Store>(s: &mut S) -> (r: Result<RootHeader>)
     ensures
@@ -193,12 +225,17 @@ pub fn commit_root<S: Store>(s: &mut S, root: Slot, commit_id: u64, file_id: u64
     ensures
         r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
         r is Ok ==> final(s).file().len() == old(s).file().len() + ROOT_TRAILER_LENGTH,
+        r is Ok ==> in_history(final(s).file(), file_id, final(s).file().len() as int, root),
+        r is Ok ==> history_kept(old(s).file(), final(s).file(), file_id, old(s).file().len() as int),
 {
     let trailer_pos = s.len()?;
     let trailer = RootTrailer::new(file_id, trailer_pos, root, commit_id);
     let bytes = trailer.to_bytes();
     s.write_at(trailer_pos, &bytes)?;
     let ghost f1 = s.file();
+    proof {
+        assert(f1 =~= old(s).file() + bytes@);
+    }
     proof {
         let f = old(s).file();
         assert forall|i: int| 0 <= i < f.len() && !(ROOT_HEADER_START <= i < ROOT_HEADER_END) implies #[trigger] f1[i] == f[i] by {
@@ -220,6 +257,15 @@ pub fn commit_root<S: Store>(s: &mut S, root: Slot, commit_id: u64, file_id: u64
         assert forall|i: int| 0 <= i < f.len() && !(ROOT_HEADER_START <= i < ROOT_HEADER_END) implies #[trigger] g[i] == f[i] by {
             assert(g[i] == f1[i]);
         }
+        // the new commit
+        let end = g.len() as int;
+        let a = trailer_pos as int;
+        assert forall|i: int| 0 <= i < ROOT_TRAILER_LENGTH implies #[trigger] g.subrange(a, end)[i] == bytes@[i] by {
+            assert(g[a + i] == f1[a + i]);
+        }
+        assert(g.subrange(a, end) =~= bytes@);
+        assert(trailer_ok(g, end, file_id, trailer));
+        lemma_history_kept(f, g, file_id, f.len() as int);
     }
     Ok(())
 }
@@ -498,6 +544,8 @@ pub fn begin_transaction<S: Store>(s: &mut S, root: Slot) -> (r: Result<i64>)
 pub fn finish_transaction<S: Store>(s: &mut S, scratch_pos: i64, commit_id: u64, file_id: u64) -> (r: Result<Slot>)
     ensures
         r is Ok ==> same_outside_header(old(s).file(), final(s).file(), old(s).file().len() as int),
+        r is Ok ==> in_history(final(s).file(), file_id, final(s).file().len() as int, r.unwrap()),
+        r is Ok ==> history_kept(old(s).file(), final(s).file(), file_id, old(s).file().len() as int),
 {
     if s.len()? < ROOT_HEADER_END {
         return Err(Error::InvalidDatabase);
