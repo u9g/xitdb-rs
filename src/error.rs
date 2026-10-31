@@ -2,6 +2,15 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use vstd::prelude::*;
+
+verus! {
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExIoError(io::Error);
+
 /// Every error that xitdb can return.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -157,6 +166,10 @@ impl Error {
     }
 }
 
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+} // verus!
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
@@ -240,4 +253,3 @@ impl From<Error> for io::Error {
     }
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
