@@ -1,5 +1,6 @@
 use crate::data::Data;
 use crate::slot::{Slot, Tag};
+use vstd::prelude::*;
 
 /// Whether a path traversal may write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +101,12 @@ impl PathPart<'_> {
     }
 }
 
-pub(crate) fn hash_map_tag(counted: bool, set: bool) -> Tag {
+verus! {
+
+pub(crate) fn hash_map_tag(counted: bool, set: bool) -> (r: Tag)
+    ensures
+        r == (if counted { if set { Tag::CountedHashSet } else { Tag::CountedHashMap } } else { if set { Tag::HashSet } else { Tag::HashMap } }),
+{
     match (counted, set) {
         (true, true) => Tag::CountedHashSet,
         (true, false) => Tag::CountedHashMap,
@@ -109,6 +115,11 @@ pub(crate) fn hash_map_tag(counted: bool, set: bool) -> Tag {
     }
 }
 
-pub(crate) fn sorted_map_tag(set: bool) -> Tag {
+pub(crate) fn sorted_map_tag(set: bool) -> (r: Tag)
+    ensures
+        r == (if set { Tag::SortedSet } else { Tag::SortedMap }),
+{
     if set { Tag::SortedSet } else { Tag::SortedMap }
 }
+
+} // verus!
