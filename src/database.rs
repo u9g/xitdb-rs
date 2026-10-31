@@ -589,48 +589,25 @@ impl<C: Core> Database<C> {
     /// never change except for the root header (see
     /// [`Database::read_committed`]).
     pub fn committed_size(&self) -> Result<i64> {
-        let header = self.read_root_header()?;
-        let minimum_size = ROOT_HEADER_END + ROOT_TRAILER_LENGTH as i64;
-        if header.file_size < minimum_size {
-            return Err(Error::InvalidDatabase);
-        }
-        if self.len()? < header.file_size {
-            return Err(Error::TruncatedDatabase);
-        }
-        // the committed bytes must end with a trailer matching the header
-        let trailer = self.read_root_trailer(header.file_size)?;
-        if trailer.root != header.root {
-            return Err(Error::InvalidDatabase);
-        }
-        Ok(header.file_size)
+        // verified in commit_store.rs
+        crate::commit_store::committed_size(&mut DbStore::new(self), self.header.get().file_id)
     }
 
     pub(crate) fn truncate(&self) -> Result<()> {
+        // verified in commit_store.rs
+        let file_id = self.header.get().file_id;
         let committed_size = self.committed_size()?;
         if let Some(frozen_at) = self.transaction.get().and_then(|t| t.frozen_at)
             && frozen_at > committed_size
         {
-            // retain frozen bytes without publishing the failed transaction.
-            // discard what follows the frozen bytes, then commit the current
-            // root again after them, so they end with a trailer
-            if self.len()? > frozen_at {
-                self.core().set_length(frozen_at as u64)?;
-            }
-            let root = self.read_root_slot()?;
-            self.commit_root(root, random_u64()?)?;
-            self.core().sync()?;
-            return Ok(());
+            // retain frozen bytes without publishing the failed transaction
+            return crate::commit_store::truncate_to_frozen(&mut DbStore::new(self), frozen_at, random_u64()?, file_id);
         }
-        if self.len()? > committed_size {
-            self.core().set_length(committed_size as u64)?;
-        }
-        Ok(())
+        crate::commit_store::truncate_to_committed(&mut DbStore::new(self), committed_size)
     }
 
     pub(crate) fn read_root_header(&self) -> Result<RootHeader> {
-        let mut buf = [0u8; ROOT_HEADER_LENGTH];
-        self.read_at(ROOT_HEADER_START, &mut buf)?;
-        RootHeader::from_bytes(&buf)
+        crate::commit_store::read_root_header(&mut DbStore::new(self))
     }
 
     // the most recently committed root slot
@@ -640,54 +617,21 @@ impl<C: Core> Database<C> {
 
     // the trailer that ends at end
     pub(crate) fn read_root_trailer(&self, end: i64) -> Result<RootTrailer> {
-        if end < ROOT_TRAILER_LENGTH as i64 {
-            return Err(Error::InvalidDatabase);
-        }
-        let trailer_pos = end - ROOT_TRAILER_LENGTH as i64;
-        let mut buf = [0u8; ROOT_TRAILER_LENGTH];
-        self.read_at(trailer_pos, &mut buf)?;
-        // check the checksum before decoding the root, because a corrupt
-        // trailer can hold an unknown tag
-        let checksum = read_u64(&buf[SLOT_LENGTH + 8..]);
-        let commit_id = read_u64(&buf[SLOT_LENGTH..SLOT_LENGTH + 8]);
-        let root_bytes: [u8; SLOT_LENGTH] = buf[..SLOT_LENGTH].try_into().unwrap();
-        let expected = crate::crc64::checksum(&{
-            let mut data = [0u8; 24 + SLOT_LENGTH];
-            data[0..8].copy_from_slice(&self.header.get().file_id.to_be_bytes());
-            data[8..16].copy_from_slice(&trailer_pos.to_be_bytes());
-            data[16..16 + SLOT_LENGTH].copy_from_slice(&root_bytes);
-            data[16 + SLOT_LENGTH..].copy_from_slice(&commit_id.to_be_bytes());
-            data
-        });
-        if checksum != expected {
-            return Err(Error::InvalidDatabase);
-        }
-        RootTrailer::from_bytes(&buf)
+        crate::commit_store::read_root_trailer(&mut DbStore::new(self), end, self.header.get().file_id)
     }
 
     // completes a transaction by appending a trailer for root and updating
     // the root header. callers must sync afterwards to make the header
     // itself durable.
     pub(crate) fn commit_root(&self, root: Slot, commit_id: u64) -> Result<()> {
-        let trailer_pos = self.len()?;
-        let trailer = RootTrailer::new(self.header.get().file_id, trailer_pos, root, commit_id);
-        self.write_at(trailer_pos, &trailer.to_bytes())?;
-
-        // flush and fsync before updating the header, because updating
-        // the header is what completes the transaction. without the
-        // fsync, the OS could persist the header before the data it
-        // points to, so a crash could commit a transaction whose data
-        // never reached disk.
-        self.core().sync()?;
-
-        self.write_root_header(root)
+        // verified in commit_store.rs
+        crate::commit_store::commit_root(&mut DbStore::new(self), root, commit_id, self.header.get().file_id)
     }
 
     // points the root header at root, which must be in the trailer that ends
     // the file.
     fn write_root_header(&self, root: Slot) -> Result<()> {
-        let file_size = self.len()?;
-        self.write_at(ROOT_HEADER_START, &RootHeader { file_size, root }.to_bytes())
+        crate::commit_store::write_root_header(&mut DbStore::new(self), root)
     }
 
     // whether the data at ptr predates this transaction, or the writing

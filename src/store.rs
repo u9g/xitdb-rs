@@ -51,6 +51,27 @@ pub trait Store {
             final(self).file() == old(self).file(),
             r matches Ok(n) ==> n == old(self).file().len(),
     ;
+
+    /// Truncates or zero-extends the file to `len` bytes.
+    fn set_length(&mut self, len: u64) -> (r: Result<()>)
+        ensures
+            r is Ok ==> final(self).file() == resize(old(self).file(), len as int),
+    ;
+
+    /// Makes the file durable. Its bytes don't change.
+    fn sync(&mut self) -> (r: Result<()>)
+        ensures
+            final(self).file() == old(self).file(),
+    ;
+}
+
+/// `f` truncated or zero-extended to `len` bytes.
+pub open spec fn resize(f: Seq<u8>, len: int) -> Seq<u8> {
+    if len <= f.len() {
+        f.subrange(0, len)
+    } else {
+        f + Seq::new((len - f.len()) as nat, |i: int| 0u8)
+    }
 }
 
 /// Writes `data` at the end of the file and returns where.
@@ -101,6 +122,16 @@ impl<'a, C: Core> Store for DbStore<'a, C> {
     #[verifier::external_body]
     fn len(&mut self) -> (r: Result<i64>) {
         self.db.len()
+    }
+
+    #[verifier::external_body]
+    fn set_length(&mut self, len: u64) -> (r: Result<()>) {
+        Ok(self.db.core().set_length(len)?)
+    }
+
+    #[verifier::external_body]
+    fn sync(&mut self) -> (r: Result<()>) {
+        Ok(self.db.core().sync()?)
     }
 }
 

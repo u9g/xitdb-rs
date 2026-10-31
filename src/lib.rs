@@ -56,6 +56,7 @@ mod bulk;
 mod btree_io;
 mod btree_join;
 mod collections;
+mod commit_store;
 mod compact;
 mod core;
 mod arith;
