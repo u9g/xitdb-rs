@@ -5,6 +5,7 @@ use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::store::DbStore;
 use vstd::prelude::*;
 
 /// A node pointer plus the element count of its subtree (the right sibling
@@ -96,6 +97,40 @@ fn child_for_rank(node: &BTreeNode, rank: i64, inclusive: bool) -> (r: (usize, i
         i += 1;
     }
     (i, rem)
+}
+
+proof fn lemma_cfr_range_inner(counts: Seq<i64>, num: int, i: int, rem: int, inclusive: bool)
+    requires
+        0 <= i < num,
+    ensures
+        i <= cfr(counts, num, i, rem, inclusive).0 < num,
+    decreases num - i,
+{
+    if i + 1 < num && (rem > counts[i] || (!inclusive && rem == counts[i])) {
+        lemma_cfr_range_inner(counts, num, i + 1, rem - counts[i], inclusive);
+    }
+}
+
+/// `child_for_rank` picks one of the node's children.
+pub proof fn lemma_cfr_range(counts: Seq<i64>, num: int, i: int, rem: int, inclusive: bool)
+    requires
+        0 <= i < num,
+    ensures
+        0 <= cfr(counts, num, i, rem, inclusive).0 < num,
+{
+    lemma_cfr_range_inner(counts, num, i, rem, inclusive);
+}
+
+/// `child_for_rank`, for the other verified modules.
+pub fn child_for_rank_pub(node: &BTreeNode, rank: i64, inclusive: bool) -> (r: (usize, i64))
+    requires
+        counts_ok(*node),
+        node.num >= 1,
+    ensures
+        r.0 < node.num,
+        (r.0 as int, r.1 as int) == cfr(node.counts@, node.num as int, 0, rank as int, inclusive),
+{
+    child_for_rank(node, rank, inclusive)
 }
 
 fn drop_child(branch: &mut BTreeNode, i: usize)
@@ -262,32 +297,11 @@ fn branch(children: &[Slot], counts: &[i64]) -> (r: BTreeNode)
 } // verus!
 
 impl<C: Core> Database<C> {
+    // verified in btree_io.rs
     pub(crate) fn read_btree_node(&self, ptr: i64) -> Result<BTreeNode> {
-        let mut header = [0u8; BTREE_NODE_HEADER_SIZE];
-        self.read_at(ptr, &mut header)?;
-        let (kind, num) = decode_node_header(&header)?;
-        let mut node = BTreeNode::empty(kind, num);
-        match kind {
-            BTreeNodeKind::Leaf => {
-                let mut body = [0u8; SLOT_LENGTH * BTREE_SLOT_COUNT];
-                self.read_bytes(&mut body)?;
-                node.values = decode_slots(&body)?;
-            }
-            BTreeNodeKind::Branch => {
-                let mut body = [0u8; (SLOT_LENGTH + 8) * BTREE_SLOT_COUNT];
-                self.read_bytes(&mut body)?;
-                node.children = decode_slots(&body)?;
-                node.counts = decode_counts(&body[SLOT_LENGTH * BTREE_SLOT_COUNT..])?;
-            }
-        }
-        Ok(node)
+        crate::btree_io::read_btree_node(&mut DbStore::new(self), ptr)
     }
 
-    // b-tree mutations are persistent: every node on the path from the root
-    // is rewritten, while untouched subtrees are shared by pointer.
-    fn write_btree_node_at(&self, node: &BTreeNode, ptr: i64) -> Result<()> {
-        self.write_at(ptr, &node.to_bytes())
-    }
 
     // appends the node as a fresh block and returns its position
     pub(crate) fn write_btree_node(&self, node: &BTreeNode) -> Result<i64> {
@@ -306,12 +320,10 @@ impl<C: Core> Database<C> {
 
     // write a new version of a node, reusing old_ptr's position in place if
     // that node belongs to this transaction, otherwise appending a copy
+    // verified in btree_io.rs
     pub(crate) fn btree_write_node(&self, node: &BTreeNode, old_ptr: i64, frozen_at: i64) -> Result<i64> {
-        if self.btree_reusable(old_ptr, frozen_at) {
-            self.write_btree_node_at(node, old_ptr)?;
-            return Ok(old_ptr);
-        }
-        self.write_btree_node(node)
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::btree_io::btree_write_node(&mut DbStore::new(self), node, old_ptr, limit)
     }
 
     pub(crate) fn btree_new_root(&self) -> Result<i64> {
@@ -320,19 +332,9 @@ impl<C: Core> Database<C> {
 
     // descend to the value slot at the given rank (0-based), returning a
     // pointer to it (its file position and current slot).
+    // verified in btree_io.rs
     pub(crate) fn read_btree_slot(&self, root_ptr: i64, rank: i64) -> Result<SlotPointer> {
-        let mut node_ptr = root_ptr;
-        let mut rem = rank;
-        loop {
-            let node = self.read_btree_node(node_ptr)?;
-            if node.kind == BTreeNodeKind::Leaf {
-                let rank = check_rank(rem, node.num, false)?;
-                return Ok(SlotPointer::new(Some(value_position(node_ptr, rank)), node.values[rank]));
-            }
-            let (i, next_rem) = child_for_rank(&node, rem, false);
-            rem = next_rem;
-            node_ptr = node.children[i].value;
-        }
+        crate::btree_io::read_btree_slot(&mut DbStore::new(self), root_ptr, rank)
     }
 
     // insert a placeholder slot at `rank` within the subtree at node_ptr,

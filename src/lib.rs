@@ -53,6 +53,7 @@ struct ReadmeDoctests;
 
 mod btree;
 mod bulk;
+mod btree_io;
 mod collections;
 mod compact;
 mod core;
