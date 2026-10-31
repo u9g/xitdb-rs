@@ -238,3 +238,57 @@ fn rewriting_same_value_counts_as_change() {
     assert!(committed);
     assert_eq!(history.count().unwrap(), 2);
 }
+
+#[test]
+fn rejects_moments_that_are_not_hash_maps() {
+    let db = new_db();
+    let mut list = WriteArrayList::new(&mut db.root_cursor()).unwrap();
+    list.append_context(None::<Slot>, |cursor| WriteCountedHashMap::new(cursor)?.put("foo", "foo")).unwrap();
+    assert!(matches!(History::new(&db), Err(Error::UnexpectedTag)));
+
+    // a counted map appended after opening is rejected by transact
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| moment.put("foo", "foo")).unwrap();
+    let mut list = WriteArrayList::new(&mut db.root_cursor()).unwrap();
+    list.append_context(None::<Slot>, |cursor| WriteCountedHashMap::new(cursor).map(|_| ())).unwrap();
+    let size = db.committed_size().unwrap();
+    let result = history.transact(|moment| moment.put("bar", "bar"));
+    assert!(matches!(result, Err(Error::UnexpectedTag)));
+    assert_eq!(db.committed_size().unwrap(), size);
+    assert_eq!(history.count().unwrap(), 2);
+}
+
+#[test]
+fn sees_commits_from_other_handles() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let open = || Database::new(CoreFile::new(tmp.as_file().try_clone().unwrap()), Hasher::sha1()).unwrap();
+    let (db1, db2) = (open(), open());
+    let (h1, h2) = (History::new(&db1).unwrap(), History::new(&db2).unwrap());
+
+    h1.transact(|moment| moment.put("a", "1")).unwrap();
+    h2.transact(|moment| moment.put("b", "2")).unwrap();
+    h1.transact(|moment| moment.put("c", "3")).unwrap();
+
+    let latest = h2.latest().unwrap();
+    assert_eq!(h2.count().unwrap(), 3);
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        assert_eq!(read(&latest, key).unwrap(), value.as_bytes());
+    }
+}
+
+#[test]
+fn values_from_transact_are_independent_of_the_moment() {
+    // the moment is discarded when nothing changes, so values that outlive
+    // the transaction must be owned (borrowing it doesn't compile, see the
+    // compile_fail doctest on History::transact)
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| moment.put("foo", "foo")).unwrap();
+    let (foo, committed) =
+        history.transact_with_status(|moment| moment.get_cursor("foo")?.unwrap().read_bytes(MAX_READ)).unwrap();
+    assert!(!committed);
+    history.transact(|moment| moment.put("foo", "changed-value!!")).unwrap();
+    assert_eq!(foo, b"foo");
+    assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"changed-value!!");
+}
