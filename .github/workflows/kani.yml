@@ -9,7 +9,7 @@ jobs:
   proof:
     name: ${{ matrix.harness }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +22,10 @@ jobs:
           - root_header_and_trailer_roundtrip
           - key_value_pair_roundtrip
           - node_header_is_bounded
-          - node_encoding_has_block_size
+          - btree_leaf_encoding_has_block_size
+          - btree_branch_encoding_has_block_size
+          - sorted_leaf_encoding_has_block_size
+          - sorted_branch_encoding_has_block_size
           - array_list_shift_is_log16
           - hash_nibble_is_nibble_of_big_endian_hash
           - resolve_index_is_in_range

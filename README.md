@@ -550,8 +550,8 @@ These hold for every input:
 * Slots, headers, trailers, key-value pairs and b-tree nodes encode and decode back to themselves, decoding any bytes never panics, and each value has exactly one encoding.
 * An array list's shift is the integer log16 of its last key, `hash_nibble` is the nibble of the hash read as a big-endian number, index and rank checks only accept in-range positions, and the table-driven CRC-64 equals the bitwise definition (for inputs of up to 4 bytes).
 
-These run real transactions on a `CoreMemory`, so they hold for every choice of keys, values, indexes and corruptions, but only up to the sizes they state:
+These run real transactions on a `CoreMemory`. Each builds a small database, then makes one change with symbolic inputs, so it holds for every choice of those inputs, but only for that database:
 
-* Any 3 puts and removes on a counted hash map agree with a model, as do array lists and linked array lists of up to 17 items (enough to grow a level) after slices, inserts and removes, and sorted maps after any 3 puts, which also iterate in ascending order.
-* A transaction never changes committed bytes, so a past moment reads the same after any change to a copy of it.
-* Opening any 64 bytes, or a hash map or sorted map database with any one byte changed, and then reading it, returns errors but never panics or hangs.
+* Putting or removing any key with any value on a two-level counted hash map, slicing a 17-item array list (two levels) to any size, inserting into a 16-item linked array list at any index (which splits its leaf) and removing at any index, and putting any key into a sorted map all agree with simple models. The sorted map also iterates in ascending order.
+* A transaction never changes committed bytes, so a past moment reads the same after any put or remove on a copy of it.
+* Opening any 64 bytes, or a two-level hash map or sorted map database with any one byte changed, and then reading it, returns errors but never panics or hangs.

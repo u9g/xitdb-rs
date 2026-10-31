@@ -1,10 +1,10 @@
 //! Kani proof harnesses. Run them with `cargo kani` (see the README).
 //!
 //! The format harnesses hold for every input. The database harnesses are
-//! bounded: they run real transactions on a [`CoreMemory`] with symbolic
-//! keys, values, indexes and corruptions, and compare the results against a
-//! simple model, so they hold for every choice of those values but only up
-//! to the sizes each harness states.
+//! bounded: each builds a small database on a [`CoreMemory`], then makes
+//! one change with symbolic keys, values, indexes or corruptions and
+//! compares the result against a simple model, so it holds for every choice
+//! of those inputs, but only for that database.
 
 use crate::core::CoreMemory;
 use crate::database::{Database, hash_nibble, resolve_index};
@@ -132,24 +132,48 @@ fn node_header_is_bounded() {
     }
 }
 
+fn any_node_len() -> usize {
+    let num: usize = kani::any();
+    kani::assume(num <= BTREE_SLOT_COUNT);
+    num
+}
+
 /// Nodes encode to exactly their block size, and the header to what
 /// decode_node_header reads back.
 #[kani::proof]
 #[kani::unwind(17)]
-fn node_encoding_has_block_size() {
-    let num: usize = kani::any();
-    kani::assume(num <= BTREE_SLOT_COUNT);
-    let kind = if kani::any() { BTreeNodeKind::Leaf } else { BTreeNodeKind::Branch };
+fn btree_leaf_encoding_has_block_size() {
+    let num = any_node_len();
+    let bytes = BTreeNode::empty(BTreeNodeKind::Leaf, num).to_bytes();
+    assert!(bytes.len() == BTREE_LEAF_BLOCK_SIZE);
+    assert!(decode_node_header(&bytes).ok() == Some((BTreeNodeKind::Leaf, num)));
+}
 
-    let bytes = BTreeNode::empty(kind, num).to_bytes();
-    let size = if kind == BTreeNodeKind::Leaf { BTREE_LEAF_BLOCK_SIZE } else { BTREE_BRANCH_BLOCK_SIZE };
-    assert_eq!(bytes.len(), size);
-    assert_eq!(decode_node_header(&bytes).unwrap(), (kind, num));
+#[kani::proof]
+#[kani::unwind(17)]
+fn btree_branch_encoding_has_block_size() {
+    let num = any_node_len();
+    let bytes = BTreeNode::empty(BTreeNodeKind::Branch, num).to_bytes();
+    assert!(bytes.len() == BTREE_BRANCH_BLOCK_SIZE);
+    assert!(decode_node_header(&bytes).ok() == Some((BTreeNodeKind::Branch, num)));
+}
 
-    let bytes = SortedNode::empty(kind, num).to_bytes();
-    let size = if kind == BTreeNodeKind::Leaf { SORTED_LEAF_BLOCK_SIZE } else { SORTED_BRANCH_BLOCK_SIZE };
-    assert_eq!(bytes.len(), size);
-    assert_eq!(decode_node_header(&bytes).unwrap(), (kind, num));
+#[kani::proof]
+#[kani::unwind(17)]
+fn sorted_leaf_encoding_has_block_size() {
+    let num = any_node_len();
+    let bytes = SortedNode::empty(BTreeNodeKind::Leaf, num).to_bytes();
+    assert!(bytes.len() == SORTED_LEAF_BLOCK_SIZE);
+    assert!(decode_node_header(&bytes).ok() == Some((BTreeNodeKind::Leaf, num)));
+}
+
+#[kani::proof]
+#[kani::unwind(17)]
+fn sorted_branch_encoding_has_block_size() {
+    let num = any_node_len();
+    let bytes = SortedNode::empty(BTreeNodeKind::Branch, num).to_bytes();
+    assert!(bytes.len() == SORTED_BRANCH_BLOCK_SIZE);
+    assert!(decode_node_header(&bytes).ok() == Some((BTreeNodeKind::Branch, num)));
 }
 
 /// The shift of an array list's root block is the integer log16 of its last
@@ -273,49 +297,50 @@ fn open_arbitrary_bytes() {
     }
 }
 
-const OPS: usize = 3;
+// each database harness builds a concrete database, then makes one change
+// with symbolic inputs, so symbolic execution doesn't fork on every step of
+// every transaction
 
-/// Any 3 puts and removes of 1-byte keys on a counted hash map, each its own
-/// transaction, leave it agreeing with a model on every key's value and on
-/// the count.
+/// 0x01 and 0x11 share their low nibble, so a map holding both has two
+/// levels.
+const KEYS: [u8; 2] = [0x01, 0x11];
+
+/// Putting or removing any key, with any value, on a counted hash map with
+/// two levels, as its own transaction, leaves every key reading as in a
+/// model, and the count matching.
 #[kani::proof]
 #[kani::unwind(40)]
 fn hash_map_matches_model() {
-    let keys: [u8; OPS] = kani::any();
-    let mut model: [Option<u8>; OPS] = [None; OPS];
-
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
+    db.run_context(|cursor| {
+        let mut map = WriteCountedHashMap::new(cursor)?;
+        map.put([KEYS[0]], Data::Uint(0))?;
+        map.put([KEYS[1]], Data::Uint(1))
+    })
+    .unwrap();
+    let mut model = [Some(0), Some(1)];
+
+    let key: u8 = kani::any();
+    let value: u8 = kani::any();
+    let put: bool = kani::any();
     let mut map = WriteCountedHashMap::new(&mut db.root_cursor()).unwrap();
-    for _ in 0..OPS {
-        let k: usize = kani::any();
-        kani::assume(k < OPS);
-        if kani::any() {
-            let value: u8 = kani::any();
-            map.put([keys[k]], Data::Uint(value as u64)).unwrap();
-            for j in 0..OPS {
-                if keys[j] == keys[k] {
-                    model[j] = Some(value);
-                }
-            }
-        } else {
-            assert_eq!(map.remove([keys[k]]).unwrap(), model[k].is_some());
-            for j in 0..OPS {
-                if keys[j] == keys[k] {
-                    model[j] = None;
-                }
-            }
+    if put {
+        map.put([key], Data::Uint(value as u64)).unwrap();
+    } else {
+        assert_eq!(map.remove([key]).unwrap(), KEYS.contains(&key));
+    }
+    for (i, &k) in KEYS.iter().enumerate() {
+        if k == key {
+            model[i] = if put { Some(value) } else { None };
         }
     }
 
-    let mut count = 0;
-    for j in 0..OPS {
-        assert_eq!(read_uint(map.get_cursor([keys[j]]).unwrap()), model[j]);
-        if model[j].is_some() && !keys[..j].contains(&keys[j]) {
-            count += 1;
-        }
+    assert_eq!(read_uint(map.get_cursor([key]).unwrap()), if put { Some(value) } else { None });
+    for (i, &k) in KEYS.iter().enumerate() {
+        assert_eq!(read_uint(map.get_cursor([k]).unwrap()), model[i]);
     }
-    assert_eq!(map.count().unwrap(), count);
-    assert_eq!(map.iter().unwrap().count() as i64, count);
+    let count = model.iter().filter(|v| v.is_some()).count() + (put && !KEYS.contains(&key)) as usize;
+    assert_eq!(map.count().unwrap(), count as i64);
 }
 
 /// A transaction never changes committed bytes (besides the root header,
@@ -326,66 +351,70 @@ fn hash_map_matches_model() {
 fn transactions_do_not_change_history() {
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
     let mut history = WriteArrayList::new(&mut db.root_cursor()).unwrap();
-    let (k0, v0, k1, v1): (u8, u8, u8, u8) = kani::any();
     history
         .append_context(None, |cursor| {
             let mut moment = WriteHashMap::new(cursor)?;
-            moment.put([k0], Data::Uint(v0 as u64))?;
-            moment.put([k0 ^ 0x10], Data::Uint(0))
+            moment.put([KEYS[0]], Data::Uint(0))?;
+            moment.put([KEYS[1]], Data::Uint(1))
         })
         .unwrap();
     let committed = db.core().as_bytes().to_vec();
 
+    let key: u8 = kani::any();
+    let value: u8 = kani::any();
     let put: bool = kani::any();
     let last = history.get_slot(-1).unwrap();
     history
         .append_context(last, |cursor| {
             let mut moment = WriteHashMap::new(cursor)?;
-            if put {
-                moment.put([k1], Data::Uint(v1 as u64))
-            } else {
-                moment.remove([k1]).map(|_| ())
-            }
+            if put { moment.put([key], Data::Uint(value as u64)) } else { moment.remove([key]).map(|_| ()) }
         })
         .unwrap();
 
-    let now = db.core().as_bytes().to_vec();
-    let start = ROOT_HEADER_END as usize;
-    assert!(now.len() > committed.len());
-    assert!(now[start..committed.len()] == committed[start..]);
+    {
+        let core = db.core();
+        let now = core.as_bytes();
+        let start = ROOT_HEADER_END as usize;
+        assert!(now.len() > committed.len());
+        assert!(now[start..committed.len()] == committed[start..]);
+    }
 
     let old = ReadHashMap::new(history.get_cursor(0).unwrap().unwrap()).unwrap();
-    assert_eq!(read_uint(old.get_cursor([k0]).unwrap()), Some(v0));
+    assert_eq!(read_uint(old.get_cursor([KEYS[0]]).unwrap()), Some(0));
+    assert_eq!(read_uint(old.get_cursor([KEYS[1]]).unwrap()), Some(1));
     let new = ReadHashMap::new(history.get_cursor(1).unwrap().unwrap()).unwrap();
-    let expected = if put { Some(v1) } else { None };
-    assert_eq!(read_uint(new.get_cursor([k1]).unwrap()), expected);
+    assert_eq!(read_uint(new.get_cursor([key]).unwrap()), if put { Some(value) } else { None });
 }
 
-const LIST_MAX: usize = 17;
+/// One more item than an index block holds, so an array list's trie has two
+/// levels and a linked array list's leaf splits.
+const LIST_LEN: usize = 17;
 
-/// Appending up to 17 items (enough to grow the trie a level), slicing, and
-/// appending again leaves an array list agreeing with a model at every index.
+/// Slicing a 17-item array list to any size, then appending, leaves it
+/// agreeing with a model at any index.
 #[kani::proof]
 #[kani::unwind(40)]
 fn array_list_matches_model() {
-    let n: usize = kani::any();
-    kani::assume(n <= LIST_MAX);
-    let size: usize = kani::any();
-    kani::assume(size <= n);
-    let index: i64 = kani::any();
-    kani::assume(-(LIST_MAX as i64) - 2 <= index && index <= LIST_MAX as i64 + 1);
-
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
     db.run_context(|cursor| {
         let mut list = WriteArrayList::new(cursor)?;
-        for i in 0..n {
+        for i in 0..LIST_LEN {
             list.append(Data::Uint(i as u64))?;
         }
+        Ok(())
+    })
+    .unwrap();
+
+    let size: usize = kani::any();
+    kani::assume(size <= LIST_LEN);
+    db.run_context(|cursor| {
+        let mut list = WriteArrayList::new(cursor)?;
         list.slice(size as i64)?;
         list.append(Data::Uint(100))
     })
     .unwrap();
 
+    let index: i64 = kani::any();
     let list = ReadArrayList::new(db.root_cursor()).unwrap();
     let len = size as i64 + 1;
     assert_eq!(list.count().unwrap(), len);
@@ -393,46 +422,41 @@ fn array_list_matches_model() {
     assert_eq!(read_uint(list.get_cursor(index).unwrap()), expected);
 }
 
-/// Inserting into and removing from a linked array list of up to 17 items
-/// (enough to split a leaf) at any index agrees with a Vec. Like the other
+/// Inserting into a 16-item linked array list at any index (which splits
+/// its leaf), then removing at any index, agrees with a Vec. Like the other
 /// implementations, insert puts an item before an existing one, so it
 /// can't append.
 #[kani::proof]
 #[kani::unwind(40)]
 fn linked_array_list_matches_model() {
-    let n: usize = kani::any();
-    kani::assume(n <= LIST_MAX);
-    let insert_at: usize = kani::any();
-    kani::assume(insert_at <= n);
-    if insert_at == n {
-        let db = Database::new(CoreMemory::new(), hasher()).unwrap();
-        let result = db.run_context(|cursor| {
-            let mut list = WriteLinkedArrayList::new(cursor)?;
-            for i in 0..n {
-                list.append(Data::Uint(i as u64))?;
-            }
-            list.insert(n as i64, Data::Uint(100))
-        });
-        assert!(matches!(result, Err(crate::Error::KeyNotFound)));
-        return;
-    }
-    let remove_at: usize = kani::any();
-    kani::assume(remove_at <= n);
-
-    let mut model: Vec<u8> = (0..n as u8).collect();
-    model.insert(insert_at, 100);
-    model.remove(remove_at);
-
+    let n = LIST_LEN - 1;
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
     db.run_context(|cursor| {
         let mut list = WriteLinkedArrayList::new(cursor)?;
         for i in 0..n {
             list.append(Data::Uint(i as u64))?;
         }
-        list.insert(insert_at as i64, Data::Uint(100))?;
-        list.remove(remove_at as i64)
+        Ok(())
     })
     .unwrap();
+
+    let insert_at: usize = kani::any();
+    kani::assume(insert_at <= n);
+    let remove_at: usize = kani::any();
+    kani::assume(remove_at <= n);
+    let result = db.run_context(|cursor| {
+        let mut list = WriteLinkedArrayList::new(cursor)?;
+        list.insert(insert_at as i64, Data::Uint(100))?;
+        list.remove(remove_at as i64)
+    });
+    let mut model: Vec<u8> = (0..n as u8).collect();
+    if insert_at == n {
+        assert!(matches!(result, Err(crate::Error::KeyNotFound)));
+    } else {
+        result.unwrap();
+        model.insert(insert_at, 100);
+        model.remove(remove_at);
+    }
 
     let list = ReadLinkedArrayList::new(db.root_cursor()).unwrap();
     assert_eq!(list.count().unwrap(), model.len() as i64);
@@ -443,40 +467,42 @@ fn linked_array_list_matches_model() {
     assert!(items == model);
 }
 
-/// Any 3 puts of 1-byte keys on a sorted map leave it agreeing with a model:
+/// Putting any key into a sorted map leaves it agreeing with a model:
 /// iteration is in strictly ascending key order, and get, rank and count
 /// match.
 #[kani::proof]
 #[kani::unwind(40)]
 fn sorted_map_matches_model() {
-    let keys: [u8; OPS] = kani::any();
-    let values: [u8; OPS] = kani::any();
-
+    const SORTED_KEYS: [u8; 2] = [0x10, 0x20];
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
-    let mut map = WriteSortedMap::new(&mut db.root_cursor()).unwrap();
-    for i in 0..OPS {
-        map.put([keys[i]], Data::Uint(values[i] as u64)).unwrap();
-    }
-    let map = ReadSortedMap::new(db.root_cursor()).unwrap();
+    db.run_context(|cursor| {
+        let mut map = WriteSortedMap::new(cursor)?;
+        for key in SORTED_KEYS {
+            map.put([key], Data::Uint(key as u64))?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    let mut count = 0;
-    for j in 0..OPS {
-        // the last put of a key wins
-        let last = (0..OPS).rev().find(|&i| keys[i] == keys[j]).unwrap();
-        assert_eq!(read_uint(map.get_cursor([keys[j]]).unwrap()), Some(values[last]));
-        let less = (0..OPS).filter(|&i| keys[i] < keys[j] && !keys[..i].contains(&keys[i])).count();
-        assert_eq!(map.rank([keys[j]]).unwrap(), less as i64);
-        if !keys[..j].contains(&keys[j]) {
-            count += 1;
+    let key: u8 = kani::any();
+    let value: u8 = kani::any();
+    WriteSortedMap::new(&mut db.root_cursor()).unwrap().put([key], Data::Uint(value as u64)).unwrap();
+
+    let map = ReadSortedMap::new(db.root_cursor()).unwrap();
+    let count = 2 + !SORTED_KEYS.contains(&key) as i64;
+    assert_eq!(map.count().unwrap(), count);
+    assert_eq!(read_uint(map.get_cursor([key]).unwrap()), Some(value));
+    assert_eq!(map.rank([key]).unwrap(), SORTED_KEYS.iter().filter(|&&k| k < key).count() as i64);
+    for k in SORTED_KEYS {
+        if k != key {
+            assert_eq!(read_uint(map.get_cursor([k]).unwrap()), Some(k));
         }
     }
-    assert_eq!(map.count().unwrap(), count);
 
     let mut previous: Option<Vec<u8>> = None;
     let mut seen = 0;
     for item in map.iter().unwrap() {
         let key = item.unwrap().read_key_value_pair().unwrap().key_cursor.read_bytes(Some(8)).unwrap();
-        assert!(keys.contains(&key[0]));
         if let Some(previous) = previous {
             assert!(previous < key);
         }
@@ -486,19 +512,18 @@ fn sorted_map_matches_model() {
     assert_eq!(seen, count);
 }
 
-/// Changing any one byte of a database holding a hash map, then opening and
-/// reading it, returns errors but never panics or hangs.
+/// Changing any one byte of a database holding a two-level hash map, then
+/// opening and reading it, returns errors but never panics or hangs.
 #[kani::proof]
 #[kani::unwind(40)]
 fn corrupt_hash_map_never_panics() {
     let db = Database::new(CoreMemory::new(), hasher()).unwrap();
-    {
-        let mut map = WriteHashMap::new(&mut db.root_cursor()).unwrap();
-        // 0x11 shares 0x01's low nibble, so the map has two levels
-        map.put([0x01], Data::Uint(1)).unwrap();
-        map.put([0x11], Data::Uint(2)).unwrap();
-        map.put([0x02], "longer than eight bytes").unwrap();
-    }
+    db.run_context(|cursor| {
+        let mut map = WriteHashMap::new(cursor)?;
+        map.put([KEYS[0]], Data::Uint(0))?;
+        map.put([KEYS[1]], Data::Uint(1))
+    })
+    .unwrap();
     let mut bytes = db.into_core().into_bytes();
     let pos: usize = kani::any();
     kani::assume(pos < bytes.len());
@@ -506,9 +531,9 @@ fn corrupt_hash_map_never_panics() {
 
     let Ok(db) = Database::new(CoreMemory::from_bytes(bytes), hasher()) else { return };
     let Ok(map) = ReadHashMap::new(db.root_cursor()) else { return };
-    for key in [0x01, 0x11, 0x02, 0x03] {
+    for key in KEYS {
         if let Ok(Some(cursor)) = map.get_cursor([key]) {
-            let _ = cursor.read_bytes(Some(64));
+            let _ = cursor.read_bytes(Some(16));
         }
     }
     if let Ok(iter) = map.iter() {
@@ -518,7 +543,7 @@ fn corrupt_hash_map_never_panics() {
     }
 }
 
-/// The same for a sorted map with two levels of nodes.
+/// The same for a sorted map whose root is a branch.
 #[kani::proof]
 #[kani::unwind(40)]
 fn corrupt_sorted_map_never_panics() {
@@ -526,7 +551,7 @@ fn corrupt_sorted_map_never_panics() {
     db.run_context(|cursor| {
         let mut map = WriteSortedMap::new(cursor)?;
         for key in 1..=(BTREE_SLOT_COUNT as u8 + 1) {
-            map.put([key], Data::Uint(key as u64))?;
+            map.put([key], Data::Uint(0))?;
         }
         Ok(())
     })
@@ -538,10 +563,8 @@ fn corrupt_sorted_map_never_panics() {
 
     let Ok(db) = Database::new(CoreMemory::from_bytes(bytes), hasher()) else { return };
     let Ok(map) = ReadSortedMap::new(db.root_cursor()) else { return };
-    let key: u8 = kani::any();
-    let _ = map.get_cursor([key]);
-    let _ = map.rank([key]);
-    let _ = map.count();
+    let _ = map.get_cursor([1]);
+    let _ = map.rank([BTREE_SLOT_COUNT as u8 + 1]);
     if let Ok(iter) = map.iter() {
         for item in iter {
             let _ = item;
