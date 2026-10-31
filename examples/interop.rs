@@ -19,8 +19,7 @@ fn open(path: &str, truncate: bool) -> Result<Db> {
 }
 
 fn string<C: Core>(cursor: Option<ReadCursor<'_, C>>) -> Result<String> {
-    let bytes = cursor.expect("missing value").read_bytes(None)?;
-    Ok(String::from_utf8(bytes).expect("utf-8"))
+    cursor.expect("missing value").read_string(None)
 }
 
 fn check(condition: bool, what: &str) {
@@ -104,8 +103,8 @@ fn check_rust_moment<C: Core>(moment: &ReadHashMap<'_, C>) -> Result<()> {
 
     let sorted_set = ReadSortedSet::new(moment.get_cursor("sorted-set")?.unwrap())?;
     let mut keys = Vec::new();
-    for kv in sorted_set.iter()? {
-        keys.push(string(Some(kv?.read_key_value_pair()?.key_cursor))?);
+    for key in sorted_set.keys()? {
+        keys.push(key?.read_string(None)?);
     }
     check(keys == ["alpha", "mid", "zeta"], "sorted set order");
     Ok(())

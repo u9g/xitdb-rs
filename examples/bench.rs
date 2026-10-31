@@ -63,8 +63,8 @@ fn main() -> Result<()> {
     let sorted = ReadSortedMap::new(moment.get_cursor("sorted")?.unwrap())?;
     assert_eq!(sorted.count()?, COUNT as i64);
     let mut previous = Vec::new();
-    for kv in sorted.iter()? {
-        let key = kv?.read_key_value_pair()?.key_cursor.read_bytes(None)?;
+    for kv in sorted.entries()? {
+        let key = kv?.key_cursor.read_bytes(None)?;
         assert!(key > previous);
         previous = key;
     }

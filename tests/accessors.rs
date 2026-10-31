@@ -88,22 +88,127 @@ fn put_map_on_wrong_tag() {
         moment.put("string", "hello")?;
         moment.put("int", 1i64)?;
         moment.put_list("list")?;
+        moment.put_map("map")?.put("a", 1u64)?;
+        moment.put_set("set")?.put("x")?;
+        WriteCountedHashMap::new(&mut moment.put_cursor("counted-map")?)?;
+        WriteCountedHashSet::new(&mut moment.put_cursor("counted-set")?)?;
         assert_unexpected_tag(moment.put_map("string"));
         assert_unexpected_tag(moment.put_set("int"));
         assert_unexpected_tag(moment.put_list("string"));
         assert_unexpected_tag(moment.put_map("list"));
+        // a map and a set aren't opened as each other, and counted
+        // collections aren't opened as plain ones
+        assert_unexpected_tag(moment.put_set("map"));
+        assert_unexpected_tag(moment.put_map("set"));
+        assert_unexpected_tag(moment.put_map("counted-map"));
+        assert_unexpected_tag(moment.put_set("counted-set"));
         Ok(())
     })
     .unwrap();
+
+    // nothing was changed by the failed calls
+    let moment = ReadHashMap::new(db.root_cursor()).unwrap();
+    assert_eq!(moment.get_slot("map").unwrap().unwrap().tag, Tag::HashMap);
+    assert_eq!(moment.get_map("map").unwrap().unwrap().get_uint("a").unwrap(), Some(1));
+    assert_eq!(moment.get_slot("set").unwrap().unwrap().tag, Tag::HashSet);
+    assert!(moment.get_set("set").unwrap().unwrap().contains("x").unwrap());
+    assert_eq!(moment.get_slot("counted-map").unwrap().unwrap().tag, Tag::CountedHashMap);
+    assert_eq!(moment.get_string("string", MAX_READ).unwrap().as_deref(), Some("hello"));
+
+    // counted collections are read with ReadCountedHashMap/Set, not get_map/get_set
+    assert_unexpected_tag(moment.get_map("counted-map"));
+    assert_unexpected_tag(moment.get_set("counted-set"));
+    assert!(ReadCountedHashMap::new(moment.get_cursor("counted-map").unwrap().unwrap()).is_ok());
 }
 
 #[test]
-fn put_map_on_top_level_map() {
-    // like put_cursor, put_map only works inside a transaction
+fn put_map_on_top_level_map_writes_nothing() {
+    // the returned map would belong to an already finished transaction, so
+    // put_map needs one to be running, and fails before writing anything
     let db = memory_db();
     let mut moment = WriteHashMap::new(&mut db.root_cursor()).unwrap();
-    let err = moment.put_map("inner").err().expect("expected an error");
-    assert!(matches!(err, Error::ExpiredTransaction), "unexpected error: {err:?}");
+    moment.put("foo", "bar").unwrap();
+    let size = db.core().length().unwrap();
+    for _ in 0..2 {
+        assert!(matches!(moment.put_map("inner"), Err(Error::ExpectedTxStart)));
+        assert!(matches!(moment.put_set("inner"), Err(Error::ExpectedTxStart)));
+        assert!(matches!(moment.put_list("inner"), Err(Error::ExpectedTxStart)));
+    }
+    assert_eq!(db.core().length().unwrap(), size);
+    assert!(moment.get_cursor("inner").unwrap().is_none());
+    assert!(moment.get_map("inner").unwrap().is_none());
+
+    // inside a transaction it works, in the same top-level map
+    db.run_context(|cursor| {
+        WriteHashMap::new(cursor)?.put_map("inner")?.put("a", 1u64)?;
+        Ok(())
+    })
+    .unwrap();
+    let inner = moment.get_map("inner").unwrap().unwrap();
+    assert_eq!(inner.get_uint("a").unwrap(), Some(1));
+}
+
+#[test]
+fn append_map_on_top_level_list_writes_nothing() {
+    let db = memory_db();
+    let mut list = WriteArrayList::new(&mut db.root_cursor()).unwrap();
+    list.append(Data::None).unwrap();
+    let size = db.core().length().unwrap();
+    for _ in 0..2 {
+        assert!(matches!(list.append_map(), Err(Error::ExpectedTxStart)));
+        assert!(matches!(list.append_set(), Err(Error::ExpectedTxStart)));
+        assert!(matches!(list.append_list(), Err(Error::ExpectedTxStart)));
+        assert!(matches!(list.put_map(0), Err(Error::ExpectedTxStart)));
+        assert!(matches!(list.put_set(0), Err(Error::ExpectedTxStart)));
+        assert!(matches!(list.put_list(0), Err(Error::ExpectedTxStart)));
+    }
+    assert_eq!(db.core().length().unwrap(), size);
+    assert_eq!(list.count().unwrap(), 1);
+    assert_eq!(list.get_slot(0).unwrap().unwrap().tag, Tag::None);
+
+    // inside a transaction (here, the usual history pattern) it works
+    list.append_context(None, |cursor| {
+        WriteHashMap::new(cursor)?.put_list("items")?.append_map()?.put("a", 1u64)?;
+        Ok(())
+    })
+    .unwrap();
+    let moment = ReadHashMap::new(list.get_cursor(-1).unwrap().unwrap()).unwrap();
+    let items = moment.get_list("items").unwrap().unwrap();
+    let item = ReadHashMap::new(items.get_cursor(0).unwrap().unwrap()).unwrap();
+    assert_eq!(item.get_uint("a").unwrap(), Some(1));
+}
+
+#[test]
+fn empty_values_read_as_absent() {
+    let db = memory_db();
+    db.run_context(|cursor| {
+        let mut moment = WriteHashMap::new(cursor)?;
+        moment.put("empty", Data::None)?;
+        moment.put("empty-map", Data::None)?;
+        Ok(())
+    })
+    .unwrap();
+
+    let moment = ReadHashMap::new(db.root_cursor()).unwrap();
+    // the key is there, with an empty value
+    assert_eq!(moment.get_slot("empty").unwrap().unwrap().tag, Tag::None);
+    assert!(moment.get_map("empty").unwrap().is_none());
+    assert!(moment.get_set("empty").unwrap().is_none());
+    assert!(moment.get_list("empty").unwrap().is_none());
+    assert_eq!(moment.get_bytes("empty", MAX_READ).unwrap(), None);
+    assert_eq!(moment.get_string("empty", MAX_READ).unwrap(), None);
+    assert_eq!(moment.get_int("empty").unwrap(), None);
+    assert_eq!(moment.get_uint("empty").unwrap(), None);
+    assert_eq!(moment.get_float("empty").unwrap(), None);
+
+    // put_map initializes an empty value
+    db.run_context(|cursor| {
+        WriteHashMap::new(cursor)?.put_map("empty-map")?.put("a", 1u64)?;
+        Ok(())
+    })
+    .unwrap();
+    let map = moment.get_map("empty-map").unwrap().unwrap();
+    assert_eq!(map.get_uint("a").unwrap(), Some(1));
 }
 
 #[test]
@@ -216,8 +321,8 @@ fn read_string_rejects_invalid_utf8() {
     }
     // the bytes are still readable as bytes
     assert_eq!(moment.get_bytes("short", MAX_READ).unwrap(), Some(vec![0xff, 0xfe]));
-    // an empty slot reads as an empty string, like read_bytes
-    assert_eq!(moment.get_string("empty", MAX_READ).unwrap().as_deref(), Some(""));
+    // read_string on an empty slot reads an empty string, like read_bytes
+    assert_eq!(moment.get_cursor("empty").unwrap().unwrap().read_string(MAX_READ).unwrap(), "");
 }
 
 #[test]

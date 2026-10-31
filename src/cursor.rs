@@ -710,6 +710,16 @@ impl<'a, C: Core> WriteCursor<'a, C> {
         self.read.db.check_frozen_slot(&self.read.slot_ptr)
     }
 
+    // a collection made by a write through the root cursor outside a
+    // transaction would belong to a transaction that has already ended, so
+    // it could never be written to
+    pub(crate) fn check_in_transaction(&self) -> Result<()> {
+        if is_root(&self.read.slot_ptr) && self.read.db.transaction.get().is_none() {
+            return Err(Error::ExpectedTxStart);
+        }
+        Ok(())
+    }
+
     // reload because an earlier write may have moved what the slot points to
     fn reload_slot(&mut self) -> Result<()> {
         if self.transaction.is_some()
