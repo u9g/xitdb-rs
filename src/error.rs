@@ -11,6 +11,26 @@ verus! {
 #[allow(dead_code)]
 pub struct ExIoError(io::Error);
 
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExPathBuf(PathBuf);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExUtf8Error(std::str::Utf8Error);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExSerializeError(SerializeError);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExDecodeError(DecodeError);
+
 /// Every error that xitdb can return.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -100,6 +120,15 @@ pub enum Error {
     Serialize(Box<SerializeError>),
 }
 
+
+
+
+
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+} // verus!
+
 /// The details of an [`Error::Serialize`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -110,18 +139,6 @@ pub struct SerializeError {
     /// What was wrong.
     pub message: String,
 }
-
-impl fmt::Display for SerializeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("couldn't serialize")?;
-        if let Some(field) = &self.field {
-            write!(f, " field {field:?}")?;
-        }
-        write!(f, ": {}", self.message)
-    }
-}
-
-impl std::error::Error for SerializeError {}
 
 /// The details of an [`Error::Decode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,36 +156,6 @@ pub struct DecodeError {
     /// What the codec found wrong.
     pub message: String,
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("couldn't decode")?;
-        if let Some(collection) = &self.collection {
-            write!(f, " {collection:?}")?;
-        }
-        if let Some(key) = &self.key {
-            write!(f, " at key {key}")?;
-        }
-        if let Some(field) = &self.field {
-            write!(f, " field {field:?}")?;
-        }
-        write!(f, ": {}", self.message)
-    }
-}
-
-impl std::error::Error for DecodeError {}
-
-impl Error {
-    /// An [`Error::Decode`] with just a message, as a codec returns it. The
-    /// typed collection that called the codec adds its name and the key.
-    pub fn decode(message: impl Into<String>) -> Error {
-        Error::Decode(Box::new(DecodeError { collection: None, key: None, field: None, message: message.into() }))
-    }
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-} // verus!
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -253,3 +240,40 @@ impl From<Error> for io::Error {
     }
 }
 
+impl fmt::Display for SerializeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("couldn't serialize")?;
+        if let Some(field) = &self.field {
+            write!(f, " field {field:?}")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for SerializeError {}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("couldn't decode")?;
+        if let Some(collection) = &self.collection {
+            write!(f, " {collection:?}")?;
+        }
+        if let Some(key) = &self.key {
+            write!(f, " at key {key}")?;
+        }
+        if let Some(field) = &self.field {
+            write!(f, " field {field:?}")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl Error {
+    /// An [`Error::Decode`] with just a message, as a codec returns it. The
+    /// typed collection that called the codec adds its name and the key.
+    pub fn decode(message: impl Into<String>) -> Error {
+        Error::Decode(Box::new(DecodeError { collection: None, key: None, field: None, message: message.into() }))
+    }
+}

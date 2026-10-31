@@ -196,6 +196,12 @@ but it can't change committed data.
   `read_int` / `read_float`, `write_path`, and frozen checks.
 - **The public wrappers** in `collections.rs` and the value types in
   `data.rs`, `hasher.rs` and `path.rs`.
+- **The higher-level layers built on them:** `History` and its migrations
+  (`history.rs`, `migrate.rs`), typed collections, records, indexes and bulk
+  operations (`typed.rs`, `record.rs`, `index.rs`, `bulk.rs`), serde values
+  (`structured.rs`, `replica_serde.rs`), and `compact_file`'s file handling.
+  Like the rest of the orchestration, they only write through the verified
+  functions.
 - **Crash consistency:** writes are treated as atomic.
 
 ## Found by verifying

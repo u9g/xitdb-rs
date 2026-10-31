@@ -251,6 +251,7 @@ impl<C: Core> Database<C> {
             hasher: self.hasher,
             header: self.header,
             tx_start: self.tx_start,
+            tx_floor: self.tx_floor,
             transaction: self.transaction,
             next_transaction_id: self.next_transaction_id,
         }

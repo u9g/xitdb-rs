@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::Core;
 use crate::database::Database;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::slot::Slot;
 use crate::store::DbStore;
 

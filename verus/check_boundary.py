@@ -40,7 +40,7 @@ for path in sorted(src.glob('*.rs')):
             if not line.lstrip().startswith('//'):
                 outside.append((path, i + 1, line))
             continue
-        m = re.match(r'impl(?:<[^>]*>)? (?:[\w:<>]+ for )?(\w+)', line)
+        m = re.match(r'(?:impl(?:<[^>]*>)? (?:[\w:<>]+ for )?|(?:pub )?trait )(\w+)', line)
         if m:
             impl = m.group(1)
             continue
@@ -51,7 +51,7 @@ for path in sorted(src.glob('*.rs')):
         if not m or m.group(1):
             continue
         j = i
-        while j < len(lines) and lines[j].strip() != '{' and not lines[j].rstrip().endswith(') {'):
+        while j < len(lines) and lines[j].strip() != '{' and not lines[j].rstrip().endswith((') {', ';')):
             j += 1
         has = bool(re.search(r'^\s*requires\b', '\n'.join(lines[i:j]), re.M))
         if line.startswith(' ') and impl:
