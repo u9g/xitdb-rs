@@ -155,7 +155,7 @@ The `Hash`-based data structures and the `ArrayList` use the hash array mapped t
 There are also scalar types you can store in the above-mentioned data structures. They are all variants of the `Data` enum, and most Rust values convert into it:
 
 * `Data::Bytes` is a byte array (from `&str`, `String`, `&[u8]` and `Vec<u8>`)
-* `Data::Uint` is an unsigned 64-bit int (from `u64`)
+* `Data::Uint` is an unsigned 64-bit int (from `u64`), up to `i64::MAX`
 * `Data::Int` is a signed 64-bit int (from `i64`)
 * `Data::Float` is a 64-bit float (from `f64`)
 
