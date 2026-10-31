@@ -108,3 +108,17 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// Any u64 can be written as a uint, so any u64 must read back. The Go
+/// implementation rejects uints above i64::MAX when reading them, though
+/// the Zig implementation reads them fine.
+#[test]
+fn uints_above_i64_max_read_back() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let mut list = WriteArrayList::new(&mut db.root_cursor())?;
+    for value in [i64::MAX as u64, 1 << 63, u64::MAX] {
+        list.append(value)?;
+        assert_eq!(list.get_cursor(-1)?.unwrap().read_uint()?, value);
+    }
+    Ok(())
+}
