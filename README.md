@@ -486,7 +486,7 @@ fn main() -> xitdb::Result<()> {
 
 ## Sorting and Paginating
 
-The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order. To show data in a sensible order one page at a time, you build and maintain your own index: a `SortedMap` whose keys sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data.
+The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order. To show data in a sensible order one page at a time, you build and maintain your own index: a `SortedMap` whose keys sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data. (To look entries up by a field rather than list them in order, an `Index` does this for you; see [Bulk Operations and Indexes](#bulk-operations-and-indexes).)
 
 A `SortedMap` orders its keys lexicographically by their raw bytes. It is a count-augmented B+tree, so it can seek straight to a rank (`iter_from_index`, for pagination) or to the first key greater than or equal to a given value (`iter_from`, for type-ahead search), both in O(log n).
 
@@ -727,6 +727,62 @@ fn main() -> xitdb::Result<()> {
 ```
 
 Values can't be typed collections themselves. To keep one collection per key, like the rooms above, open the nested map with `put_map` and `get_map` (or a `Map`'s `collection_mut` and `collection`) and use the definitions on it.
+
+## Bulk Operations and Indexes
+
+Typed maps have bulk operations, each a single call inside a transaction: `retain(parent, |key, value| keep)` removes every entry it doesn't keep, `remove_all(parent, keys)` removes many keys at once, and `update_where(parent, |key, value| matches, |value| change)` changes every value that matches. Each returns how many entries it removed or changed. `update_where` changes a copy of each value and only writes it back if it's no longer equal (`PartialEq`) to what was stored, so values need `Clone` and `PartialEq`. `keys_where` and `entries_where` read the entries that match. A `Set` has `retain` and `remove_all` too. They read everything first and write after, never create a missing collection, and write nothing when nothing matches, so a transaction that removes or changes nothing isn't committed.
+
+An `Index<K, V, I>` is a secondary index on a `Map<K, V>`: a function, which can't capture anything, derives an index key of type `I` from each value (or `None`, to leave it out), and `get` returns the primary keys of every entry with that index key, `entries` the entries themselves, and `keys` the distinct index keys. Indexes are one-to-many. An `IndexedMap` is a map with its indexes; its `put`, `remove`, `remove_all`, `retain` and `update_where` (the map's own bulk operations, which report each entry they remove or change) keep every index up to date in the same transaction. The changes are collected first, then each index is opened once and written only where an entry's index key changed.
+
+An index is stored as a plain hash map under its own name, in the same parent as the map, from each index key to a hash set of primary keys; a set is removed when its last entry is, and an empty one reads as missing. So the name can't be the map's or another index's: `Index::new` panics (a compile error in a `const`) on the map's name, and an `IndexedMap`'s writes panic on a shared one. Writes that bypass the `IndexedMap`, through the plain `Map` or untyped code, leave it stale, as does adding an index to a map that already has data. `rebuild` (on an `Index` or an `IndexedMap`) makes it match the map again, reading the map once for all of an `IndexedMap`'s indexes and writing only the differences, so it can run in a migration or on every start.
+
+```rust
+use xitdb::*;
+
+// merge URL -> status
+const STATUSES: Map<str, String> = Map::new("statuses");
+// merges by status, except drafts
+const BY_STATUS: Index<str, String, str> =
+    Index::new(STATUSES, "statuses-by-status", |status| (status != "draft").then(|| status.to_owned()));
+const INDEXED_STATUSES: IndexedMap<str, String> = IndexedMap::new(STATUSES, &[&BY_STATUS]);
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+    history.transact(|moment| {
+        INDEXED_STATUSES.put(moment, "pr/1", "open")?;
+        INDEXED_STATUSES.put(moment, "pr/2", "open")?;
+        INDEXED_STATUSES.put(moment, "pr/3", "draft")?;
+        INDEXED_STATUSES.put(moment, "pr/4", "merged")
+    })?;
+
+    let moment = history.latest()?;
+    let mut open = BY_STATUS.get(&moment, "open")?;
+    open.sort();
+    assert_eq!(open, ["pr/1", "pr/2"]);
+    assert!(BY_STATUS.get(&moment, "draft")?.is_empty());
+
+    // merge pr/2, and drop what's merged; the index follows both
+    history.transact(|moment| {
+        INDEXED_STATUSES.update_where(moment, |url, _| url == "pr/2", |status| *status = "merged".to_string())?;
+        INDEXED_STATUSES.retain(moment, |_, status| status != "merged")
+    })?;
+    let moment = history.latest()?;
+    assert_eq!(BY_STATUS.get(&moment, "open")?, ["pr/1"]);
+    assert!(BY_STATUS.get(&moment, "merged")?.is_empty());
+
+    // nothing matches, so nothing is written or committed
+    let (removed, committed) = history.transact_with_status(|moment| STATUSES.remove_all(moment, ["pr/9"]))?;
+    assert_eq!((removed, committed), (0, false));
+
+    // a write through the plain map skips the index, and rebuild catches it up
+    history.transact(|moment| STATUSES.put(moment, "pr/5", "open"))?;
+    assert_eq!(BY_STATUS.get(&history.latest()?, "open")?, ["pr/1"]);
+    assert!(history.transact(|moment| BY_STATUS.rebuild(moment))?);
+    assert_eq!(BY_STATUS.get(&history.latest()?, "open")?.len(), 2);
+    Ok(())
+}
+```
 
 ## Hashing
 
