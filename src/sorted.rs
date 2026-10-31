@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::format::*;
 use crate::path::SortedMapGetTarget;
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use vstd::prelude::*;
 
 /// The new right sibling produced when a node splits.
 #[derive(Debug, Clone, Copy)]
@@ -39,35 +40,111 @@ pub(crate) struct SortedSlot {
     pub position: i64,
 }
 
-fn index_slot(ptr: i64) -> Slot {
+verus! {
+
+fn index_slot(ptr: i64) -> (r: Slot)
+    ensures
+        r == (Slot { value: ptr, tag: Tag::Index, full: false }),
+{
     Slot::new(ptr, Tag::Index)
 }
+
+} // verus!
 
 fn entry_position(node_ptr: i64, i: usize) -> i64 {
     node_ptr + (BTREE_NODE_HEADER_SIZE + i * SLOT_LENGTH) as i64
 }
 
-fn leaf(entries: &[Slot]) -> SortedNode {
+verus! {
+
+fn leaf(entries: &[Slot]) -> (r: SortedNode)
+    requires
+        entries@.len() <= BTREE_SLOT_COUNT,
+    ensures
+        r.kind == BTreeNodeKind::Leaf,
+        r.num == entries@.len(),
+        r.entries@.subrange(0, r.num as int) == entries@,
+{
     let mut node = SortedNode::empty(BTreeNodeKind::Leaf, entries.len());
-    node.entries[..entries.len()].copy_from_slice(entries);
+    let mut j: usize = 0;
+    while j < entries.len()
+        invariant
+            entries@.len() <= BTREE_SLOT_COUNT,
+            j <= entries@.len(),
+            node.kind == BTreeNodeKind::Leaf,
+            node.num == entries@.len(),
+            forall|k: int| 0 <= k < j ==> #[trigger] node.entries@[k] == entries@[k],
+        decreases entries.len() - j,
+    {
+        node.entries[j] = entries[j];
+        j += 1;
+    }
+    assert(node.entries@.subrange(0, node.num as int) =~= entries@);
     node
 }
 
-fn branch(children: &[Slot], separators: &[Slot], counts: &[i64]) -> SortedNode {
+fn branch(children: &[Slot], separators: &[Slot], counts: &[i64]) -> (r: SortedNode)
+    requires
+        children@.len() <= BTREE_SLOT_COUNT,
+        separators@.len() == children@.len(),
+        counts@.len() == children@.len(),
+    ensures
+        r.kind == BTreeNodeKind::Branch,
+        r.num == children@.len(),
+        r.children@.subrange(0, r.num as int) == children@,
+        r.separators@.subrange(0, r.num as int) == separators@,
+        r.counts@.subrange(0, r.num as int) == counts@,
+{
     let mut node = SortedNode::empty(BTreeNodeKind::Branch, children.len());
-    node.children[..children.len()].copy_from_slice(children);
-    node.separators[..separators.len()].copy_from_slice(separators);
-    node.counts[..counts.len()].copy_from_slice(counts);
+    let mut j: usize = 0;
+    while j < children.len()
+        invariant
+            children@.len() <= BTREE_SLOT_COUNT,
+            separators@.len() == children@.len(),
+            counts@.len() == children@.len(),
+            j <= children@.len(),
+            node.kind == BTreeNodeKind::Branch,
+            node.num == children@.len(),
+            forall|k: int| 0 <= k < j ==> #[trigger] node.children@[k] == children@[k],
+            forall|k: int| 0 <= k < j ==> #[trigger] node.separators@[k] == separators@[k],
+            forall|k: int| 0 <= k < j ==> #[trigger] node.counts@[k] == counts@[k],
+        decreases children.len() - j,
+    {
+        node.children[j] = children[j];
+        node.separators[j] = separators[j];
+        node.counts[j] = counts[j];
+        j += 1;
+    }
+    assert(node.children@.subrange(0, node.num as int) =~= children@);
+    assert(node.separators@.subrange(0, node.num as int) =~= separators@);
+    assert(node.counts@.subrange(0, node.num as int) =~= counts@);
     node
 }
 
-/// Decodes a short bytes slot's inline value.
-pub(crate) fn short_bytes_value(slot: Slot) -> ([u8; 8], usize) {
-    let buf = slot.value.to_be_bytes();
-    let total = if slot.full { 6 } else { 8 };
-    let len = buf[..total].iter().position(|&b| b == 0).unwrap_or(total);
+/// Decodes a short bytes slot's inline value: its big-endian bytes, and
+/// the length up to the first zero byte.
+pub(crate) fn short_bytes_value(slot: Slot) -> (r: ([u8; 8], usize))
+    ensures
+        r.0@ == crate::bytes::u64_be_spec(crate::bytes::i2u(slot.value)),
+        r.1 <= (if slot.full { 6usize } else { 8usize }),
+        forall|i: int| 0 <= i < r.1 ==> #[trigger] r.0@[i] != 0,
+        r.1 < (if slot.full { 6usize } else { 8usize }) ==> r.0@[r.1 as int] == 0,
+{
+    let buf = crate::bytes::u64_to_be_bytes(slot.value as u64);
+    let total: usize = if slot.full { 6 } else { 8 };
+    let mut len: usize = 0;
+    while len < total && buf[len] != 0
+        invariant
+            len <= total <= 8,
+            forall|i: int| 0 <= i < len ==> #[trigger] buf@[i] != 0,
+        decreases total - len,
+    {
+        len += 1;
+    }
     (buf, len)
 }
+
+} // verus!
 
 impl<C: Core> Database<C> {
     pub(crate) fn read_sorted_node(&self, ptr: i64) -> Result<SortedNode> {
