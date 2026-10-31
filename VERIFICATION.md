@@ -38,13 +38,16 @@ they hold whatever it is.
 `src/snapshot.rs` proves what the write guarantee means for readers
 (`theorem_snapshots_unchanged`). After any write that keeps
 `tx_hdr_ok(f, g, limit)`, as every verified write does, any array list,
-hash map or linked array list read whose blocks all lie in committed data
+hash map, linked array list or sorted map (by rank) read whose blocks all
+lie in committed data
 (between the root header and `limit`) returns the same result as before,
 and its blocks still lie in committed data. So by induction the result
 holds after any sequence of writes. Committed data only points at
 committed data, so every read of a past moment is such a read.
 
-Sorted maps have no read specification yet, so they aren't covered.
+Sorted map reads by key compare keys stored as byte arrays, and have no
+read specification yet; reads by rank (`sorted_get_by_index`, specified by
+`sorted_read`) are covered.
 
 ## The boundary
 

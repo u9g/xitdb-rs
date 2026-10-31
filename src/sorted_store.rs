@@ -16,6 +16,8 @@ use crate::array_list_store::*;
 use crate::btree_io::*;
 #[allow(unused_imports)]
 use crate::btree_join::*;
+#[allow(unused_imports)]
+use crate::bytes::*;
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::slot::*;
@@ -122,11 +124,124 @@ fn is_less(o: Ordering) -> (r: bool)
 }
 
 /// `read_sorted_node`.
+/// `n` is the sorted node encoded at `ptr`, as far as the descent by rank
+/// reads it: the header, a leaf's entries, a branch's children and counts.
+pub open spec fn snode_at(f: Seq<u8>, ptr: int, n: SortedNode) -> bool {
+    &&& 0 <= ptr
+    &&& ptr + BTREE_NODE_HEADER_SIZE <= f.len()
+    &&& f[ptr] == kind_byte_spec(n.kind)
+    &&& f[ptr + 1] == n.num
+    &&& n.num <= BTREE_SLOT_COUNT
+    &&& match n.kind {
+        BTreeNodeKind::Leaf => forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] slot_at(f, ptr + 2 + 9 * i, n.entries[i]),
+        BTreeNodeKind::Branch => {
+            &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] slot_at(f, ptr + 2 + 9 * i, n.children[i])
+            &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] n.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i)))
+            &&& ptr + 290 + 128 <= f.len()
+            &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] n.counts[i] >= 0
+        },
+    }
+}
+
+/// The entry at `rank` under the node at `ptr`, descending at most
+/// `depth` levels, over the bytes: the position of its slot and the slot.
+pub open spec fn sorted_read(f: Seq<u8>, ptr: int, rank: int, depth: nat) -> Option<(int, Slot)>
+    decreases depth,
+{
+    if depth == 0 {
+        None
+    } else if exists|n: SortedNode| snode_at(f, ptr, n) {
+        let n = choose|n: SortedNode| snode_at(f, ptr, n);
+        match n.kind {
+            BTreeNodeKind::Leaf => if 0 <= rank < n.num {
+                Some((ptr + 2 + 9 * rank, n.entries[rank]))
+            } else {
+                None
+            },
+            BTreeNodeKind::Branch => if n.num >= 1 {
+                let (i, rem) = crate::btree::cfr(n.counts@, n.num as int, 0, rank, false);
+                sorted_read(f, n.children[i].value as int, rem, (depth - 1) as nat)
+            } else {
+                None
+            },
+        }
+    } else {
+        None
+    }
+}
+
+/// A node's encoding determines everything the descent reads.
+pub proof fn lemma_snode_unique(f: Seq<u8>, ptr: int, a: SortedNode, b: SortedNode)
+    requires
+        snode_at(f, ptr, a),
+        snode_at(f, ptr, b),
+    ensures
+        a.kind == b.kind,
+        a.num == b.num,
+        a.kind == BTreeNodeKind::Leaf ==> a.entries@ == b.entries@,
+        a.kind == BTreeNodeKind::Branch ==> a.children@ == b.children@ && a.counts@ == b.counts@,
+{
+    match (a.kind, b.kind) {
+        (BTreeNodeKind::Leaf, BTreeNodeKind::Leaf) => {
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies a.entries@[i] == b.entries@[i] by {
+                assert(slot_at(f, ptr + 2 + 9 * i, a.entries[i]));
+                assert(slot_at(f, ptr + 2 + 9 * i, b.entries[i]));
+                lemma_slot_encode_injective(a.entries[i], b.entries[i]);
+            }
+            assert(a.entries@ =~= b.entries@);
+        },
+        (BTreeNodeKind::Branch, BTreeNodeKind::Branch) => {
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies a.children@[i] == b.children@[i] by {
+                assert(slot_at(f, ptr + 2 + 9 * i, a.children[i]));
+                assert(slot_at(f, ptr + 2 + 9 * i, b.children[i]));
+                lemma_slot_encode_injective(a.children[i], b.children[i]);
+            }
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies a.counts@[i] == b.counts@[i] by {
+                assert(a.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
+                assert(b.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
+            }
+            assert(a.children@ =~= b.children@);
+            assert(a.counts@ =~= b.counts@);
+        },
+        _ => {},
+    }
+}
+
+/// One level of the descent, for the node the code read.
+proof fn lemma_sorted_read_step(f: Seq<u8>, ptr: int, rank: int, depth: nat, n: SortedNode)
+    requires
+        snode_at(f, ptr, n),
+        depth >= 1,
+    ensures
+        n.kind == BTreeNodeKind::Leaf ==> sorted_read(f, ptr, rank, depth) == if 0 <= rank < n.num {
+            Some((ptr + 2 + 9 * rank, n.entries[rank]))
+        } else {
+            None
+        },
+        (n.kind == BTreeNodeKind::Branch && n.num >= 1) ==> sorted_read(f, ptr, rank, depth) == {
+            let (i, rem) = crate::btree::cfr(n.counts@, n.num as int, 0, rank, false);
+            sorted_read(f, n.children[i].value as int, rem, (depth - 1) as nat)
+        },
+{
+    let c = choose|m: SortedNode| snode_at(f, ptr, m);
+    lemma_snode_unique(f, ptr, n, c);
+    if n.kind == BTreeNodeKind::Leaf && 0 <= rank < n.num {
+        assert(c.entries@[rank] == n.entries@[rank]);
+    }
+    if n.kind == BTreeNodeKind::Branch && n.num >= 1 {
+        let (i, rem) = crate::btree::cfr(n.counts@, n.num as int, 0, rank, false);
+        assert(crate::btree::cfr(c.counts@, c.num as int, 0, rank, false) == (i, rem));
+        crate::btree::lemma_cfr_range(n.counts@, n.num as int, 0, rank, false);
+        assert(c.children@[i] == n.children@[i]);
+    }
+}
+
 pub fn read_sorted_node<S: Store>(s: &mut S, ptr: i64) -> (r: Result<SortedNode>)
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> r.unwrap().num <= BTREE_SLOT_COUNT,
         r is Ok ==> forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] r.unwrap().counts[i] >= 0,
+        r is Ok ==> snode_at(old(s).file(), ptr as int, r.unwrap()),
 {
     let mut header = [0u8; BTREE_NODE_HEADER_SIZE];
     s.read_at(ptr, &mut header)?;
@@ -136,11 +251,17 @@ pub fn read_sorted_node<S: Store>(s: &mut S, ptr: i64) -> (r: Result<SortedNode>
         Some(p) => p,
         None => return Err(Error::InvalidOffset),
     };
+    let ghost f = s.file();
     match kind {
         BTreeNodeKind::Leaf => {
             let mut body = [0u8; SLOT_LENGTH * BTREE_SLOT_COUNT];
             s.read_at(body_pos, &mut body)?;
             node.entries = decode_slots(&body)?;
+            proof {
+                assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(f, ptr + 2 + 9 * i, node.entries[i]) by {
+                    assert(f.subrange(ptr + 2 + 9 * i, ptr + 2 + 9 * i + 9) =~= body@.subrange(i * 9, i * 9 + 9));
+                }
+            }
         },
         BTreeNodeKind::Branch => {
             let mut body = [0u8; (SLOT_LENGTH * 2 + 8) * BTREE_SLOT_COUNT];
@@ -150,7 +271,19 @@ pub fn read_sorted_node<S: Store>(s: &mut S, ptr: i64) -> (r: Result<SortedNode>
             node.children = decode_slots(&body)?;
             node.separators = decode_slots(slice_subrange(body.as_slice(), separators_offset, counts_offset))?;
             node.counts = decode_counts(slice_subrange(body.as_slice(), counts_offset, (SLOT_LENGTH * 2 + 8) * BTREE_SLOT_COUNT))?;
+            proof {
+                assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(f, ptr + 2 + 9 * i, node.children[i]) by {
+                    assert(f.subrange(ptr + 2 + 9 * i, ptr + 2 + 9 * i + 9) =~= body@.subrange(i * 9, i * 9 + 9));
+                }
+                let cb = body@.subrange(288, 416);
+                assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] node.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))) by {
+                    assert(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i) =~= cb.subrange(i * 8, i * 8 + 8));
+                }
+            }
         },
+    }
+    proof {
+        assert(header@[0] == f[ptr as int] && header@[1] == f[ptr + 1]);
     }
     Ok(node)
 }
@@ -335,6 +468,7 @@ pub fn child_for_rank(node: &SortedNode, rank: i64) -> (r: (usize, i64))
         forall|j: int| 0 <= j < BTREE_SLOT_COUNT ==> #[trigger] node.counts[j] >= 0,
     ensures
         r.0 < node.num || (node.num == 0 && r.0 == 0),
+        node.num >= 1 ==> (r.0 as int, r.1 as int) == crate::btree::cfr(node.counts@, node.num as int, 0, rank as int, false),
 {
     let mut i: usize = 0;
     let mut rem = rank;
@@ -343,6 +477,8 @@ pub fn child_for_rank(node: &SortedNode, rank: i64) -> (r: (usize, i64))
             i < node.num || (node.num == 0 && i == 0),
             node.num <= BTREE_SLOT_COUNT,
             forall|j: int| 0 <= j < BTREE_SLOT_COUNT ==> #[trigger] node.counts[j] >= 0,
+            node.num >= 1 ==> crate::btree::cfr(node.counts@, node.num as int, i as int, rem as int, false)
+                == crate::btree::cfr(node.counts@, node.num as int, 0, rank as int, false),
         decreases node.num - i,
     {
         rem -= node.counts[i];
@@ -416,13 +552,20 @@ pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usi
 pub fn sorted_get_by_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r: Result<SortedSlot>)
     ensures
         final(s).file() == old(s).file(),
+        r is Ok ==> exists|d: nat| #[trigger] sorted_read(old(s).file(), root_ptr as int, rank as int, d)
+            == Some((r.unwrap().position as int, r.unwrap().slot)),
 {
     let mut node_ptr = root_ptr;
     let mut rem = rank;
     let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
+    let ghost f = s.file();
+    let ghost mut k: nat = 0;
     loop
         invariant
-            s.file() == old(s).file(),
+            s.file() == f,
+            f == old(s).file(),
+            forall|d: nat| #[trigger] sorted_read(f, node_ptr as int, rem as int, d) is Some ==> sorted_read(f, root_ptr as int, rank as int, d + k)
+                == sorted_read(f, node_ptr as int, rem as int, d),
         decreases fuel,
     {
         if fuel == 0 {
@@ -433,11 +576,29 @@ pub fn sorted_get_by_index<S: Store>(s: &mut S, root_ptr: i64, rank: i64) -> (r:
         if matches!(node.kind, BTreeNodeKind::Leaf) {
             let i = check_rank(rem, node.num, false)?;
             let position = entry_position(node_ptr, i)?;
+            proof {
+                lemma_sorted_read_step(f, node_ptr as int, rem as int, 1, node);
+                assert(sorted_read(f, root_ptr as int, rank as int, 1 + k) == Some((position as int, node.entries[i as int])));
+            }
             return Ok(SortedSlot { slot: node.entries[i], position });
         }
+        // a branch without children is corrupt
+        if node.num == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
         let (i, next_rem) = child_for_rank(&node, rem);
+        let ghost old_ptr = node_ptr;
+        let ghost old_rem = rem;
         rem = next_rem;
         node_ptr = node.children[i].value;
+        proof {
+            assert forall|d: nat| #[trigger] sorted_read(f, node_ptr as int, rem as int, d) is Some implies sorted_read(f, root_ptr as int, rank as int, d + k + 1)
+                == sorted_read(f, node_ptr as int, rem as int, d) by {
+                lemma_sorted_read_step(f, old_ptr as int, old_rem as int, d + 1, node);
+                assert(((d + 1) - 1) as nat == d);
+            }
+            k = k + 1;
+        }
     }
 }
 

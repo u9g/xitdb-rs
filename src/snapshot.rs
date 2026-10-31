@@ -3,9 +3,9 @@
 //! Every verified write keeps `tx_hdr_ok(f, g, limit)`: nothing before
 //! `limit`, where the transaction started, changes apart from the root
 //! header. This module proves what that means for readers. A read of an
-//! array list, hash map or linked array list whose blocks all lie in
-//! committed data (between the root header and `limit`) gives the same
-//! result after the write as before it. Committed data only points at
+//! array list, hash map, linked array list or sorted map (by rank) whose
+//! blocks all lie in committed data (between the root header and `limit`)
+//! gives the same result after the write as before it. Committed data only points at
 //! committed data, so this holds for every read of a past moment, and by
 //! induction for any sequence of writes.
 
@@ -19,6 +19,7 @@ use crate::format::*;
 use crate::map_store::*;
 use crate::path_store::*;
 use crate::slot::*;
+use crate::sorted_store::*;
 use vstd::prelude::*;
 
 verus! {
@@ -390,13 +391,133 @@ pub proof fn lemma_btree_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, rank
     }
 }
 
+// sorted maps
+
+/// The bytes a sorted node at `ptr` takes, by the kind byte there.
+pub open spec fn snode_size(f: Seq<u8>, ptr: int) -> int {
+    if f[ptr] == kind_byte_spec(BTreeNodeKind::Leaf) { SORTED_LEAF_BLOCK_SIZE as int } else { SORTED_BRANCH_BLOCK_SIZE as int }
+}
+
+/// Every node the sorted map descent by rank reads lies in committed data.
+pub open spec fn sorted_fits(f: Seq<u8>, upto: int, ptr: int, rank: int, depth: nat) -> bool
+    decreases depth,
+{
+    if depth == 0 {
+        true
+    } else {
+        &&& fits(ptr, BTREE_NODE_HEADER_SIZE as int, upto)
+        &&& fits(ptr, snode_size(f, ptr), upto)
+        &&& (exists|n: SortedNode| snode_at(f, ptr, n)) ==> {
+            let n = choose|n: SortedNode| snode_at(f, ptr, n);
+            match n.kind {
+                BTreeNodeKind::Leaf => true,
+                BTreeNodeKind::Branch => n.num >= 1 ==> {
+                    let (i, rem) = crate::btree::cfr(n.counts@, n.num as int, 0, rank, false);
+                    sorted_fits(f, upto, n.children[i].value as int, rem, (depth - 1) as nat)
+                },
+            }
+        }
+    }
+}
+
+/// A sorted node in committed data decodes the same in `g`.
+proof fn lemma_snode_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, n: SortedNode)
+    requires
+        agree(f, g, upto),
+        snode_at(f, ptr, n),
+        fits(ptr, if n.kind == BTreeNodeKind::Leaf { SORTED_LEAF_BLOCK_SIZE as int } else { SORTED_BRANCH_BLOCK_SIZE as int }, upto),
+    ensures
+        snode_at(g, ptr, n),
+{
+    assert(g[ptr] == f[ptr]);
+    assert(g[ptr + 1] == f[ptr + 1]);
+    match n.kind {
+        BTreeNodeKind::Leaf => {
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(g, ptr + 2 + 9 * i, n.entries[i]) by {
+                assert(slot_at(f, ptr + 2 + 9 * i, n.entries[i]));
+                lemma_agree_range(f, g, upto, ptr + 2 + 9 * i, SLOT_LENGTH as int);
+            }
+        },
+        BTreeNodeKind::Branch => {
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(g, ptr + 2 + 9 * i, n.children[i]) by {
+                assert(slot_at(f, ptr + 2 + 9 * i, n.children[i]));
+                lemma_agree_range(f, g, upto, ptr + 2 + 9 * i, SLOT_LENGTH as int);
+            }
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] n.counts[i] == u2i(be_u64_spec(g.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))) by {
+                assert(n.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
+                lemma_agree_range(f, g, upto, ptr + 290 + 8 * i, 8);
+                assert(ptr + 298 + 8 * i == ptr + 290 + 8 * i + 8);
+            }
+        },
+    }
+}
+
+/// A sorted map read by rank in committed data gives the same result.
+pub proof fn lemma_sorted_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, rank: int, depth: nat)
+    requires
+        agree(f, g, upto),
+        sorted_fits(f, upto, ptr, rank, depth),
+    ensures
+        sorted_read(g, ptr, rank, depth) == sorted_read(f, ptr, rank, depth),
+        sorted_fits(g, upto, ptr, rank, depth),
+    decreases depth,
+{
+    if depth > 0 {
+        assert(g[ptr] == f[ptr]);
+        assert(snode_size(g, ptr) == snode_size(f, ptr));
+        lemma_agree_symm(f, g, upto);
+        let ef = exists|n: SortedNode| snode_at(f, ptr, n);
+        let eg = exists|n: SortedNode| snode_at(g, ptr, n);
+        if ef {
+            let a = choose|n: SortedNode| snode_at(f, ptr, n);
+            assert(a.kind == BTreeNodeKind::Leaf <==> f[ptr] == kind_byte_spec(BTreeNodeKind::Leaf)) by {
+                if a.kind != BTreeNodeKind::Leaf {
+                    assert(kind_byte_spec(a.kind) != kind_byte_spec(BTreeNodeKind::Leaf));
+                }
+            }
+            lemma_snode_frame(f, g, upto, ptr, a);
+            assert(eg);
+            let b = choose|n: SortedNode| snode_at(g, ptr, n);
+            assert(b.kind == a.kind) by {
+                lemma_kind_byte(a.kind, b.kind);
+            }
+            lemma_snode_frame(g, f, upto, ptr, b);
+            lemma_snode_unique(f, ptr, a, b);
+            match a.kind {
+                BTreeNodeKind::Leaf => {
+                    if 0 <= rank < a.num {
+                        assert(a.entries[rank] == a.entries@[rank]);
+                        assert(b.entries[rank] == b.entries@[rank]);
+                    }
+                },
+                BTreeNodeKind::Branch => {
+                    if a.num >= 1 {
+                        let (i, rem) = crate::btree::cfr(a.counts@, a.num as int, 0, rank, false);
+                        assert(a.children[i] == a.children@[i]);
+                        assert(b.children[i] == b.children@[i]);
+                        lemma_sorted_frame(f, g, upto, a.children[i].value as int, rem, (depth - 1) as nat);
+                    }
+                },
+            }
+        } else if eg {
+            let b = choose|n: SortedNode| snode_at(g, ptr, n);
+            assert(b.kind == BTreeNodeKind::Leaf <==> g[ptr] == kind_byte_spec(BTreeNodeKind::Leaf)) by {
+                if b.kind != BTreeNodeKind::Leaf {
+                    assert(kind_byte_spec(b.kind) != kind_byte_spec(BTreeNodeKind::Leaf));
+                }
+            }
+            lemma_snode_frame(g, f, upto, ptr, b);
+        }
+    }
+}
+
 // the theorem
 
 /// Old snapshots never change. After a write that keeps
 /// `tx_hdr_ok(f, g, limit)`, as every verified write does, any array list,
-/// hash map or linked array list read whose blocks lie in committed data
-/// gives the same result, and still lies in committed data, so this
-/// extends to any sequence of writes.
+/// hash map, linked array list or sorted map read whose blocks lie in
+/// committed data gives the same result, and still lies in committed data,
+/// so this extends to any sequence of writes.
 pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
     requires
         tx_hdr_ok(f, g, limit),
@@ -410,6 +531,8 @@ pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
                 && map_fits(g, limit, index_pos, hash, offset, hash_size),
         forall|ptr: int, rank: int, depth: nat| #[trigger] btree_fits(f, limit, ptr, rank, depth)
             ==> btree_read(g, ptr, rank, depth) == btree_read(f, ptr, rank, depth) && btree_fits(g, limit, ptr, rank, depth),
+        forall|ptr: int, rank: int, depth: nat| #[trigger] sorted_fits(f, limit, ptr, rank, depth)
+            ==> sorted_read(g, ptr, rank, depth) == sorted_read(f, ptr, rank, depth) && sorted_fits(g, limit, ptr, rank, depth),
 {
     lemma_tx_agree(f, g, limit);
     assert forall|index_pos: int, key: int, shift: nat| #[trigger] al_fits(f, limit, index_pos, key, shift)
@@ -425,6 +548,10 @@ pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
     assert forall|ptr: int, rank: int, depth: nat| #[trigger] btree_fits(f, limit, ptr, rank, depth)
         implies btree_read(g, ptr, rank, depth) == btree_read(f, ptr, rank, depth) && btree_fits(g, limit, ptr, rank, depth) by {
         lemma_btree_frame(f, g, limit, ptr, rank, depth);
+    }
+    assert forall|ptr: int, rank: int, depth: nat| #[trigger] sorted_fits(f, limit, ptr, rank, depth)
+        implies sorted_read(g, ptr, rank, depth) == sorted_read(f, ptr, rank, depth) && sorted_fits(g, limit, ptr, rank, depth) by {
+        lemma_sorted_frame(f, g, limit, ptr, rank, depth);
     }
 }
 
