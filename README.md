@@ -783,6 +783,7 @@ fn main() -> xitdb::Result<()> {
     assert_eq!(BY_STATUS.get(&history.latest()?, "open")?.len(), 2);
     Ok(())
 }
+```
 
 ## Records
 
