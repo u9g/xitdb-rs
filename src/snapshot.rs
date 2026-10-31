@@ -17,7 +17,7 @@ use crate::btree_io::*;
 use crate::bytes::*;
 use crate::format::*;
 use crate::map_store::*;
-use crate::path_store::tx_hdr_ok;
+use crate::path_store::*;
 use crate::slot::*;
 use vstd::prelude::*;
 
