@@ -379,12 +379,17 @@ pub(crate) fn decode_slots(buf: &[u8]) -> Result<[Slot; SLOT_COUNT]> {
     Ok(slots)
 }
 
-pub(crate) fn decode_counts(buf: &[u8]) -> [i64; SLOT_COUNT] {
+/// Decodes 16 counts. A negative count can only come from a corrupt file,
+/// and is rejected as [`Error::InvalidBTreeNode`].
+pub(crate) fn decode_counts(buf: &[u8]) -> Result<[i64; SLOT_COUNT]> {
     let mut counts = [0i64; SLOT_COUNT];
     for (i, count) in counts.iter_mut().enumerate() {
         *count = read_i64(&buf[i * 8..i * 8 + 8]);
+        if *count < 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
     }
-    counts
+    Ok(counts)
 }
 
 pub(crate) fn encode_slots(buf: &mut Vec<u8>, slots: &[Slot]) {
