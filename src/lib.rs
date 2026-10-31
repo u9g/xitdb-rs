@@ -73,7 +73,7 @@ pub use crate::collections::{
     WriteHashSet, WriteLinkedArrayList, WriteSortedMap, WriteSortedSet,
 };
 pub use crate::compact::{MemoryOffsetMap, OffsetMap};
-pub use crate::core::{Core, CoreBufferedFile, CoreFile, CoreMemory, DEFAULT_BUFFER_SIZE};
+pub use crate::core::{Core, CoreBufferedFile, CoreFile, CoreMemory, DEFAULT_BUFFER_SIZE, DynCore};
 pub use crate::cursor::{
     CursorIterator, CursorReader, CursorWriter, ReadCursor, ReadKvPairCursor, WriteCursor, WriteKvPairCursor,
 };

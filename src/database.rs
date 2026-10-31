@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::io;
 
 use crate::compact::{Compactor, OffsetMap};
-use crate::core::Core;
+use crate::core::{Core, DynCore};
+#[cfg(feature = "sha1")]
+use crate::core::{CoreBufferedFile, CoreMemory};
 use crate::cursor::WriteCursor;
 use crate::data::Data;
 use crate::error::{Error, Result};
@@ -102,6 +104,41 @@ fn random_u64() -> Result<u64> {
     getrandom::u64().map_err(|err| Error::Io(io::Error::other(err.to_string())))
 }
 
+#[cfg(feature = "sha1")]
+impl Database<CoreBufferedFile> {
+    /// Opens the database file at `path` with [`CoreBufferedFile::open`] and
+    /// [`Hasher::sha1`], creating and initializing it if it doesn't exist.
+    ///
+    /// The file isn't locked. When writing from multiple processes, hold an
+    /// exclusive lock on a separate lock file before calling this, since it
+    /// may initialize the file; see [`CoreBufferedFile::open`]. For another
+    /// hasher, use `Database::new(CoreBufferedFile::open(path)?, hasher)`.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Database<CoreBufferedFile>> {
+        Database::new(CoreBufferedFile::open(path)?, Hasher::sha1())
+    }
+
+    /// Opens the existing database file at `path` for reading only, with
+    /// [`CoreBufferedFile::open_read_only`] and [`Hasher::sha1`]. This is
+    /// how to read a database that another process is writing to, and it
+    /// needs no lock. It never initializes the file, so an empty file fails
+    /// with [`Error::InvalidDatabase`]. Writes fail with [`Error::Io`].
+    pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Database<CoreBufferedFile>> {
+        let mut core = CoreBufferedFile::open_read_only(path)?;
+        if core.length()? == 0 {
+            return Err(Error::InvalidDatabase);
+        }
+        Database::new(core, Hasher::sha1())
+    }
+}
+
+#[cfg(feature = "sha1")]
+impl Database<CoreMemory> {
+    /// Creates an empty in-memory database with [`Hasher::sha1`].
+    pub fn in_memory() -> Result<Database<CoreMemory>> {
+        Database::new(CoreMemory::new(), Hasher::sha1())
+    }
+}
+
 impl<C: Core> Database<C> {
     /// Opens the database in `core`, initializing it if the core is empty.
     pub fn new(core: C, hasher: Hasher) -> Result<Database<C>> {
@@ -173,6 +210,46 @@ impl<C: Core> Database<C> {
 
     pub fn into_core(self) -> C {
         self.core.into_inner()
+    }
+
+    /// Consumes the database and calls [`Core::finish`] on its core,
+    /// returning any error from writing out buffered data. Dropping a
+    /// [`CoreBufferedFile`](crate::CoreBufferedFile) also writes out its
+    /// buffer, but ignores errors.
+    pub fn close(self) -> Result<()> {
+        Ok(self.into_core().finish()?)
+    }
+
+    /// Boxes the core, so databases with different cores have the same
+    /// type, such as a file in production and memory in tests:
+    ///
+    /// ```
+    /// use xitdb::*;
+    ///
+    /// # fn main() -> xitdb::Result<()> {
+    /// # let path = std::env::temp_dir().join("xitdb-into-dyn-doctest.db");
+    /// # let in_production = false;
+    /// let db: Database<DynCore> = if in_production {
+    ///     Database::open(&path)?.into_dyn()
+    /// } else {
+    ///     Database::in_memory()?.into_dyn()
+    /// };
+    /// db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_dyn(self) -> Database<DynCore>
+    where
+        C: Send + 'static,
+    {
+        Database {
+            core: RefCell::new(Box::new(self.core.into_inner())),
+            hasher: self.hasher,
+            header: self.header,
+            tx_start: self.tx_start,
+            transaction: self.transaction,
+            next_transaction_id: self.next_transaction_id,
+        }
     }
 
     // i/o helpers. each borrows the core only for the duration of the call,

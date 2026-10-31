@@ -46,8 +46,8 @@ fn main() -> xitdb::Result<()> {
     let path = std::env::temp_dir().join("xitdb-readme-example.db");
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
 
-    // when writing from multiple processes, take an exclusive lock on the
-    // file first, for example with File::lock (Rust 1.89+)
+    // when writing from multiple processes, take an exclusive lock on a
+    // separate lock file first (see "Initializing a Database")
 
     // init the db
     let db = Database::new(CoreBufferedFile::new(file), Hasher::sha1())?;
@@ -130,6 +130,41 @@ A `Database` is initialized with an implementation of the `Core` trait, which de
 * `CoreMemory` databases work completely in memory. Initialize with `CoreMemory::new()`.
 
 The database owns its core. Get it back with `Database::into_core`, or borrow it with `Database::core`. `CoreBufferedFile` flushes its buffer when dropped; call `CoreBufferedFile::close` if you want to see errors from that flush.
+
+With the default `sha1` feature, there are shortcuts that use `Hasher::sha1()`: `Database::open(path)` opens a `CoreBufferedFile` database for reading and writing, creating it if it doesn't exist; `Database::open_read_only(path)` opens an existing one for reading only, which is how another process reads a database while it's being written to (writes through it fail); and `Database::in_memory()` creates a `CoreMemory` database. For another hasher, pass `CoreBufferedFile::open(path)?` to `Database::new`.
+
+None of these lock the file. Only one process may write at a time, so when writing from multiple processes, hold an exclusive lock on a separate lock file, such as `<path>.lock`, from before opening the database (which may initialize a new file) until you're done writing, for example with `File::lock` (Rust 1.89+). Don't lock the database file itself: on some platforms, such as Windows, file locks are mandatory, so that would block readers. Readers need no lock.
+
+To choose the core at runtime, such as a file in production and memory in tests, use `Database<DynCore>`, where `DynCore` is a `Box<dyn Core + Send>`. `Database::into_dyn` boxes the core of any database. `Database::close` writes out the core's buffer and returns any error from it, even when the core is boxed; it calls `Core::finish`, which by default calls `Core::flush`.
+
+```rust
+use xitdb::*;
+
+fn open_db(path: Option<&std::path::Path>) -> xitdb::Result<Database<DynCore>> {
+    Ok(match path {
+        Some(path) => Database::open(path)?.into_dyn(),
+        None => Database::in_memory()?.into_dyn(),
+    })
+}
+
+fn main() -> xitdb::Result<()> {
+    let path = std::env::temp_dir().join("xitdb-readme-dyn-core.db");
+    // start from a new file each time this example runs
+    let _ = std::fs::remove_file(&path);
+    for path in [Some(path.as_path()), None] {
+        let db = open_db(path)?;
+        let mut history = WriteArrayList::new(&mut db.root_cursor())?;
+        history.append("hello")?;
+        db.close()?;
+    }
+
+    // the file still has the data, and other processes can read it
+    let db = Database::open_read_only(&path)?;
+    let history = ReadArrayList::new(db.root_cursor())?;
+    assert_eq!(history.get_cursor(-1)?.unwrap().read_bytes(Some(1024))?, b"hello");
+    Ok(())
+}
+```
 
 Since xitdb is an append-only database, the data you are writing is invisible to any reader until the very last step, when a small header at the start of the file is updated to point at it. This is how it supports transactions, despite not having any rollback journal or write-ahead log: if a transaction fails, the data it appended is simply discarded.
 
@@ -527,7 +562,7 @@ Only change a replica with `apply_replicated`. If you write to it directly, it n
 
 ## Thread Safety
 
-It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance (a `Database` is `Send` but not `Sync`), each with its own file handle. Also, keep in mind that writes still need to come from one thread at a time; across processes, take an exclusive lock on the file before writing.
+It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance (a `Database` is `Send` but not `Sync`), each with its own file handle. Also, keep in mind that writes still need to come from one thread at a time; across processes, take an exclusive lock on a separate lock file before writing (see [Initializing a Database](#initializing-a-database)).
 
 ## Compatibility
 
