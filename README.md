@@ -235,6 +235,68 @@ fn main() -> Result<(), AppError> {
 
 The function can't return anything that borrows the moment, since an unchanged moment is discarded; read what you need into owned values. A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, so read and compare first if you rewrite values that rarely change.
 
+## Migrations
+
+When the layout of the moment changes, such as a renamed key or a value with a new shape, existing data has to be converted. `Migrations` is an ordered list of `Migration`s, each a version, a name and a function that changes the moment, and `History::migrate` brings the latest moment up to date: it reads the layout version recorded in the moment, runs each newer migration in order, and records the newest version, all in one transaction. If a migration returns an error, nothing is committed, so the data is never partly migrated. If there's nothing to run, nothing is committed either, so calling it on every start is cheap.
+
+The version is stored as a `Uint` under the key `LAYOUT_VERSION_KEY` (`"xitdb/layout-version"`); `Migrations::with_key` picks another. A moment without it, such as on a new database, is at version 0, so the first `migrate` runs everything. `Migrations::new` returns `Error::MigrationOutOfOrder` unless the versions start above 0 and strictly increase. If the recorded version is newer than the newest migration, the data was written by newer code, and `migrate` returns `Error::LayoutTooNew` without changing anything, so an old binary doesn't run against data it doesn't understand.
+
+```rust
+use xitdb::*;
+
+// version 1 stored each proposal's status as a string
+fn add_proposals<C: Core>(moment: &mut WriteHashMap<'_, C>) -> xitdb::Result<()> {
+    moment.put_map("proposals")?.put("https://example.com/pr/1", "open")?;
+    Ok(())
+}
+
+// version 2 renames "proposals" to "merges", and makes each value a map
+fn proposals_to_merges<C: Core>(moment: &mut WriteHashMap<'_, C>) -> xitdb::Result<()> {
+    let mut entries = Vec::new();
+    if let Some(proposals) = moment.get_map("proposals")? {
+        for kv in proposals.entries()? {
+            let kv = kv?;
+            entries.push((kv.key_cursor.read_string(Some(1024))?, kv.value_cursor.read_string(Some(1024))?));
+        }
+    }
+    moment.remove("proposals")?;
+    let mut merges = moment.put_map("merges")?;
+    for (url, status) in entries {
+        merges.put_map(url)?.put("status", status)?;
+    }
+    Ok(())
+}
+
+fn migrations<C: Core>() -> xitdb::Result<Migrations<C>> {
+    Migrations::new([
+        Migration { version: 1, name: "add proposals", run: add_proposals },
+        Migration { version: 2, name: "proposals to merges", run: proposals_to_merges },
+    ])
+}
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+    assert_eq!(history.version()?, 0);
+
+    let migrated = history.migrate(&migrations()?)?;
+    assert_eq!(migrated.ran, ["add proposals", "proposals to merges"]);
+    assert_eq!((migrated.from, migrated.to), (0, 2));
+    assert_eq!(history.version()?, 2);
+
+    // the next start has nothing to do
+    assert!(history.migrate(&migrations()?)?.ran.is_empty());
+
+    let merge = history.latest()?.get_map("merges")?.unwrap().get_map("https://example.com/pr/1")?.unwrap();
+    assert_eq!(merge.get_string("status", Some(1024))?.as_deref(), Some("open"));
+    Ok(())
+}
+```
+
+Migrations can fail with the application's own error type, like `History::transact`: `Migration<C, E>` takes functions returning `Result<(), E>`, and `migrate` returns `E`.
+
+A writer should open the database, take the write lock, `migrate`, and only then start serving. A reader, such as another process with `Database::open_read_only`, shouldn't migrate: `History::check_version` takes the same `Migrations` and, without writing, returns the version if it's the newest one, `Error::LayoutTooNew` if the data was written by newer code, and `Error::LayoutTooOld` if the writer hasn't migrated it yet. Check it on startup, and again after the writer may have restarted with new code, since a reader's `Database` sees new commits as they happen. `History::version` returns the recorded version on its own.
+
 ## Types
 
 In xitdb there are a variety of immutable data structures that you can nest arbitrarily:
