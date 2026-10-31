@@ -33,6 +33,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Replication](#replication)
 * [Thread Safety](#thread-safety)
 * [Compatibility](#compatibility)
+* [Proofs](#proofs)
 
 ## Example
 
@@ -539,3 +540,18 @@ The API follows the Go implementation's, adapted to Rust:
 * Go's string, `Bytes` and hash variants of map methods (`Put`, `PutBytes`, `PutByHash`) become methods taking `impl AsRef<[u8]>` keys, plus `_bytes` variants for keys with a format tag and `_by_hash` variants.
 * `All()` and `AllFrom()` become `iter()` and `iter_from()`, returning standard iterators.
 * In the low-level path API, a context function is not a path part; use `WriteCursor::write_path_context`, which runs it at the end of the path.
+
+## Proofs
+
+`src/proofs.rs` has [Kani](https://github.com/model-checking/kani) proof harnesses, which CI checks on every push. Install Kani with `cargo install --locked kani-verifier && cargo kani setup` (on Linux or macOS), then run them all with `cargo kani`, or one with `cargo kani --harness proofs::slot_roundtrip --exact`.
+
+These hold for every input:
+
+* Slots, headers, trailers, key-value pairs and b-tree nodes encode and decode back to themselves, decoding any bytes never panics, and each value has exactly one encoding.
+* An array list's shift is the integer log16 of its last key, `hash_nibble` is the nibble of the hash read as a big-endian number, index and rank checks only accept in-range positions, and the table-driven CRC-64 equals the bitwise definition (for inputs of up to 4 bytes).
+
+These run real transactions on a `CoreMemory`, so they hold for every choice of keys, values, indexes and corruptions, but only up to the sizes they state:
+
+* Any 3 puts and removes on a counted hash map agree with a model, as do array lists and linked array lists of up to 17 items (enough to grow a level) after slices, inserts and removes, and sorted maps after any 3 puts, which also iterate in ascending order.
+* A transaction never changes committed bytes, so a past moment reads the same after any change to a copy of it.
+* Opening any 64 bytes, or a hash map or sorted map database with any one byte changed, and then reading it, returns errors but never panics or hangs.

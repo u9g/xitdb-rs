@@ -105,6 +105,10 @@ impl Core for CoreMemory {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let end = self.pos + buf.len();
         if end > self.buf.len() {
+            // kani: an error without a message, so proofs don't explore formatting
+            #[cfg(kani)]
+            return Err(io::ErrorKind::UnexpectedEof.into());
+            #[cfg(not(kani))]
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(

@@ -87,7 +87,12 @@ impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::Io(err) => err,
+            #[cfg(not(kani))]
             other => io::Error::other(other),
+            // an io::Error that can hold an Error makes the type recursive,
+            // which kani would unwind on every drop of an Error
+            #[cfg(kani)]
+            other => io::Error::other(other.to_string()),
         }
     }
 }
