@@ -741,8 +741,10 @@ impl<C: Core> Database<C> {
                 let start = slot_ptr.slot.value;
                 let orig_header = self.read_array_list_header(start)?;
                 let (header, appended) = self.read_array_list_slot_append(orig_header, write_mode, frozen_at)?;
-                // update the header before callbacks can freeze it
-                self.write_at(start, &header.to_bytes())?;
+                // update the header before callbacks can freeze it. verified
+                // in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_array_list_header(&mut DbStore::new(self), start, header, limit)?;
                 // the appended moment becomes the transaction's root, so it
                 // stays writable after freezing. the top-level history is the
                 // list held by the copy of the root slot.
@@ -766,8 +768,10 @@ impl<C: Core> Database<C> {
                 let start = slot_ptr.slot.value;
                 let orig_header = self.read_array_list_header(start)?;
                 let slice_header = self.read_array_list_slice(orig_header, size, frozen_at)?;
-                // update the header before callbacks can freeze it
-                self.write_at(start, &slice_header.to_bytes())?;
+                // update the header before callbacks can freeze it. verified
+                // in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_array_list_header(&mut DbStore::new(self), start, slice_header, limit)?;
                 next(slot_ptr, ctx)
             }
 

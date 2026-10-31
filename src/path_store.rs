@@ -705,4 +705,17 @@ pub fn write_data_slot<S: Store>(s: &mut S, position: i64, slot: Slot, limit: i6
     write_slot_tx(s, position, slot, limit)
 }
 
+/// An array list's header, written after an append or a slice. The list
+/// belongs to this transaction (it was copied if not), so its header is
+/// from `limit` on.
+pub fn write_array_list_header<S: Store>(s: &mut S, start: i64, header: ArrayListHeader, limit: i64) -> (r: Result<()>)
+    requires
+        0 <= limit <= start,
+        limit <= old(s).file().len(),
+    ensures
+        r is Ok ==> tx_hdr_ok(old(s).file(), final(s).file(), limit as int),
+{
+    write_tx(s, start, &header.to_bytes(), limit)
+}
+
 } // verus!
