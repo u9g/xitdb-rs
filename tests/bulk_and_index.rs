@@ -538,3 +538,60 @@ fn an_index_of_another_map_panics() {
     let history = History::new(&db).unwrap();
     let _ = history.transact(|moment| WRONG.put(moment, "a", "alice"));
 }
+
+#[test]
+fn removing_every_entry_of_an_index_key_removes_its_set() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    put_merges(&history);
+
+    // both entries of t1 in one call, so its set is emptied in one write
+    let (removed, _) = transact(&history, |moment| INDEXED_MERGES.remove_all(moment, ["pr/1", "pr/2"]));
+    assert_eq!(removed, 2);
+    let moment = history.latest().unwrap();
+    assert_eq!(BY_THREAD.keys(&moment).unwrap(), ["t2"]);
+    assert!(moment.get_map("merges-by-thread").unwrap().unwrap().get_cursor("t1").unwrap().is_none());
+    assert!(!history.transact(|moment| INDEXED_MERGES.rebuild(moment)).unwrap());
+}
+
+#[test]
+fn empty_index_sets_read_as_missing_and_rebuild_removes_them() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    put_merges(&history);
+    // an empty set, as untyped code could leave one
+    history
+        .transact(|moment| {
+            moment.put_map("merges-by-thread")?.put_set("t9")?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+    let moment = history.latest().unwrap();
+    assert!(BY_THREAD.get(&moment, "t9").unwrap().is_empty());
+    assert_eq!(sorted(BY_THREAD.keys(&moment).unwrap()), ["t1", "t2"]);
+
+    let (changed, committed) = transact(&history, |moment| BY_THREAD.rebuild(moment));
+    assert!(changed && committed);
+    let moment = history.latest().unwrap();
+    assert!(moment.get_map("merges-by-thread").unwrap().unwrap().get_cursor("t9").unwrap().is_none());
+    let (changed, committed) = transact(&history, |moment| BY_THREAD.rebuild(moment));
+    assert!(!changed && !committed);
+}
+
+#[test]
+#[should_panic(expected = "an index can't be stored under the name of the map it indexes")]
+fn an_index_under_its_maps_name_panics() {
+    let _ = Index::<str, Merge, str>::new(MERGES, "merges", |merge| merge.thread_id.clone());
+}
+
+#[test]
+#[should_panic(expected = "two indexes of \"merges\" are stored under \"merges-by-thread\"")]
+fn two_indexes_under_one_name_panic() {
+    const BY_THREAD_AGAIN: Index<str, Merge, str> =
+        Index::new(MERGES, "merges-by-thread", |merge| Some(merge.status.clone()));
+    const WRONG: IndexedMap<str, Merge> = IndexedMap::new(MERGES, &[&BY_THREAD, &BY_THREAD_AGAIN]);
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    let _ = history.transact(|moment| WRONG.put(moment, "pr/1", &merge("open", None)));
+}
