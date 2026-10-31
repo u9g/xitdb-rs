@@ -4,6 +4,7 @@ use crate::core::Core;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::format::*;
+#[allow(unused_imports)]
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 use crate::store::DbStore;
 use vstd::prelude::*;
