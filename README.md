@@ -28,6 +28,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Sorting and Paginating](#sorting-and-paginating)
 * [Large Byte Arrays](#large-byte-arrays)
 * [Iterators](#iterators)
+* [Accessors](#accessors)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
 * [Replication](#replication)
@@ -202,15 +203,15 @@ fn main() -> Result<(), AppError> {
 
     // transactions can return a value, and read their own writes
     let balance = history.transact(|moment| {
-        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        let balance = moment.get_uint("balance")?.unwrap();
         moment.put("balance", balance - 30)?;
-        Ok::<_, AppError>(moment.get_cursor("balance")?.unwrap().read_uint()?)
+        Ok::<_, AppError>(moment.get_uint("balance")?.unwrap())
     })?;
     assert_eq!(balance, 70);
 
     // an error aborts the transaction
     let result = history.transact(|moment| {
-        let balance = moment.get_cursor("balance")?.unwrap().read_uint()?;
+        let balance = moment.get_uint("balance")?.unwrap();
         if balance < 500 {
             return Err(AppError::Overdrawn);
         }
@@ -227,7 +228,7 @@ fn main() -> Result<(), AppError> {
 
     assert_eq!(history.count()?, 2);
     let first = history.moment(0)?.unwrap();
-    assert_eq!(first.get_cursor("balance")?.unwrap().read_uint()?, 100);
+    assert_eq!(first.get_uint("balance")?.unwrap(), 100);
     Ok(())
 }
 ```
@@ -398,11 +399,11 @@ fn main() -> xitdb::Result<()> {
     history.append_context(None, |cursor| {
         let mut moment = WriteHashMap::new(cursor)?;
         // the primary store: a HashMap from user id to the user's fields
-        let mut id_to_user = WriteHashMap::new(&mut moment.put_cursor("id->user")?)?;
+        let mut id_to_user = moment.put_map("id->user")?;
         // the secondary index: a SortedMap ordered by username
         let mut username_to_id = WriteSortedMap::new(&mut moment.put_cursor("username->id")?)?;
         for (id, username, name) in users {
-            let mut user = WriteHashMap::new(&mut id_to_user.put_cursor(id)?)?;
+            let mut user = id_to_user.put_map(id)?;
             user.put("username", username)?;
             user.put("name", name)?;
             username_to_id.put(username, id)?;
@@ -411,26 +412,26 @@ fn main() -> xitdb::Result<()> {
     })?;
 
     let moment = ReadHashMap::new(history.get_cursor(-1)?.unwrap())?;
-    let id_to_user = ReadHashMap::new(moment.get_cursor("id->user")?.unwrap())?;
+    let id_to_user = moment.get_map("id->user")?.unwrap();
     let username_to_id = ReadSortedMap::new(moment.get_cursor("username->id")?.unwrap())?;
 
     // the equivalent of `ORDER BY username LIMIT 2 OFFSET 2`
     let mut page = Vec::new();
     for entry in username_to_id.iter_from_index(2)?.take(2) {
         let id = entry?.read_key_value_pair()?.value_cursor.read_bytes(Some(1024))?;
-        let user = ReadHashMap::new(id_to_user.get_cursor(&id)?.unwrap())?;
-        page.push(String::from_utf8(user.get_cursor("name")?.unwrap().read_bytes(Some(1024))?).unwrap());
+        let user = id_to_user.get_map(&id)?.unwrap();
+        page.push(user.get_string("name", Some(1024))?.unwrap());
     }
     assert_eq!(page, ["Carol White", "Dan Brown"]);
 
     // type-ahead search: everyone whose username starts with "da"
     let mut matches = Vec::new();
     for entry in username_to_id.iter_from("da")? {
-        let username = entry?.read_key_value_pair()?.key_cursor.read_bytes(Some(1024))?;
-        if !username.starts_with(b"da") {
+        let username = entry?.read_key_value_pair()?.key_cursor.read_string(Some(1024))?;
+        if !username.starts_with("da") {
             break;
         }
-        matches.push(String::from_utf8(username).unwrap());
+        matches.push(username);
     }
     assert_eq!(matches, ["dan", "dave"]);
     Ok(())
@@ -507,6 +508,50 @@ fn main() -> xitdb::Result<()> {
 ```
 
 `ArrayList` and `LinkedArrayList` also have an `iter_from` method, which starts the iterator from the given index. `SortedMap` and `SortedSet` have `iter_from` and `iter_from_index` to start the iterator from a key or index respectively.
+
+## Accessors
+
+The cursor methods above can do anything, but nesting and reading typed values take a few steps each. The collections have shorthands for the common cases:
+
+* `WriteHashMap::put_map`, `put_set` and `put_list` return the collection at a key, storing the key and initializing the collection in one write if it's missing. An existing collection of that kind keeps its contents; any other value (including the other kind of hash collection, or a counted one) is an `Error::UnexpectedTag`, and nothing is written. `WriteArrayList` has the same methods taking an index, plus `append_map`, `append_set` and `append_list`. The returned collection belongs to the current transaction, so these must run inside one; on a top-level collection outside a transaction they return `Error::ExpectedTxStart` without writing anything.
+* `ReadHashMap::get_map`, `get_set` and `get_list`, and the typed getters `get_bytes`, `get_string`, `get_int`, `get_uint` and `get_float`, return `Result<Option<_>>`. They return `None` if the key is missing or its value is empty (`Data::None`), and `Error::UnexpectedTag` if the value is a different type. Counted maps and sets aren't returned by `get_map` and `get_set`; use `ReadCountedHashMap::new` on `get_cursor`.
+* `ReadCursor::read_string` reads a byte array as a `String`. Invalid UTF-8 is an `Error::InvalidUtf8` rather than being replaced; for lossy decoding, use `String::from_utf8_lossy` on `read_bytes`.
+* `entries()` on hash and sorted maps yields a `ReadKvPairCursor` (a key cursor and a value cursor) for each pair, and `keys()` on hash and sorted sets yields key cursors. `iter()` still yields the raw cursors that need `read_key_value_pair`.
+
+```rust
+use xitdb::*;
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::in_memory()?;
+    db.run_context(|cursor| {
+        let mut moment = WriteHashMap::new(cursor)?;
+        moment.put("started-at", 1700000000i64)?;
+        let mut merge = moment.put_map("merges")?.put_map("https://example.com/pr/1")?;
+        merge.put("status", "merged")?;
+        moment.put_set("tags")?.put("urgent")?;
+        Ok(())
+    })?;
+
+    let moment = ReadHashMap::new(db.root_cursor())?;
+    assert_eq!(moment.get_int("started-at")?, Some(1700000000));
+    assert_eq!(moment.get_int("finished-at")?, None);
+
+    if let Some(merges) = moment.get_map("merges")? {
+        for kv in merges.entries()? {
+            let kv = kv?;
+            let url = kv.key_cursor.read_string(Some(1024))?;
+            let status = ReadHashMap::new(kv.value_cursor)?.get_string("status", Some(1024))?;
+            assert_eq!((url.as_str(), status.as_deref()), ("https://example.com/pr/1", Some("merged")));
+        }
+    }
+
+    let tags = moment.get_set("tags")?.unwrap();
+    for key in tags.keys()? {
+        assert_eq!(key?.read_string(Some(1024))?, "urgent");
+    }
+    Ok(())
+}
+```
 
 ## Hashing
 

@@ -113,6 +113,14 @@ impl<'a, C: Core> ReadCursor<'a, C> {
         Ok(self.read_bytes_object(max_size)?.value.into_owned())
     }
 
+    /// Reads a byte array as a UTF-8 string, like
+    /// [`ReadCursor::read_bytes`]. Invalid UTF-8 is an
+    /// [`Error::InvalidUtf8`] rather than being replaced, so a byte array
+    /// that isn't a string can't be silently misread as one.
+    pub fn read_string(&self, max_size: Option<u64>) -> Result<String> {
+        String::from_utf8(self.read_bytes(max_size)?).map_err(|err| Error::InvalidUtf8(err.utf8_error()))
+    }
+
     /// Reads a byte array along with its format tag.
     pub fn read_bytes_object(&self, max_size: Option<u64>) -> Result<Bytes<'static>> {
         let slot_ptr = self.resolved()?;
@@ -700,6 +708,16 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             return Err(Error::ExpectedTxStart);
         }
         self.read.db.check_frozen_slot(&self.read.slot_ptr)
+    }
+
+    // a collection made by a write through the root cursor outside a
+    // transaction would belong to a transaction that has already ended, so
+    // it could never be written to
+    pub(crate) fn check_in_transaction(&self) -> Result<()> {
+        if is_root(&self.read.slot_ptr) && self.read.db.transaction.get().is_none() {
+            return Err(Error::ExpectedTxStart);
+        }
+        Ok(())
     }
 
     // reload because an earlier write may have moved what the slot points to

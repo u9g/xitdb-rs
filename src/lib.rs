@@ -68,6 +68,7 @@ mod path;
 mod slot;
 mod sorted;
 
+pub use crate::collections::{KeyIterator, KvPairIterator};
 pub use crate::collections::{
     ReadArrayList, ReadCountedHashMap, ReadCountedHashSet, ReadHashMap, ReadHashSet, ReadLinkedArrayList,
     ReadSortedMap, ReadSortedSet, WriteArrayList, WriteCountedHashMap, WriteCountedHashSet, WriteHashMap,
