@@ -83,6 +83,7 @@ mod record;
 mod replica_serde;
 mod path_store;
 mod slot;
+mod snapshot;
 mod store;
 #[cfg(test)]
 mod termination_tests;

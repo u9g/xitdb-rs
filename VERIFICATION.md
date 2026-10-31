@@ -33,6 +33,19 @@ concatenation move `copy_at` forward so that shared data gets copied. The
 proofs need nothing from `copy_at` except that it is at least `limit`, so
 they hold whatever it is.
 
+## Old snapshots never change
+
+`src/snapshot.rs` proves what the write guarantee means for readers
+(`theorem_snapshots_unchanged`). After any write that keeps
+`tx_hdr_ok(f, g, limit)`, as every verified write does, any array list,
+hash map or linked array list read whose blocks all lie in committed data
+(between the root header and `limit`) returns the same result as before,
+and its blocks still lie in committed data. So by induction the result
+holds after any sequence of writes. Committed data only points at
+committed data, so every read of a past moment is such a read.
+
+Sorted maps have no read specification yet, so they aren't covered.
+
 ## The boundary
 
 Verus checks verified code against its specification, but code outside

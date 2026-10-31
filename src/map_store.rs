@@ -77,7 +77,7 @@ pub open spec fn kv_spec(f: Seq<u8>, pos: int, hash_size: int) -> Option<(Seq<u8
     }
 }
 
-proof fn lemma_kv_spec(f: Seq<u8>, pos: int, hash_size: int, kv: (Seq<u8>, Slot, Slot))
+pub proof fn lemma_kv_spec(f: Seq<u8>, pos: int, hash_size: int, kv: (Seq<u8>, Slot, Slot))
     requires
         kv_at(f, pos, hash_size, kv),
     ensures
