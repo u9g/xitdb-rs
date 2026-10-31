@@ -15,10 +15,15 @@ members = ["derive"]
 
 [dependencies]
 getrandom = "0.3"
+# specs and proofs checked by Verus (`cargo verus verify`); erased by a normal build
+vstd = "=0.0.0-2026-10-25-0158"
 sha1 = { version = "0.10", optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 xitdb-derive = { version = "0.1.0", path = "derive", optional = true }
+
+[package.metadata.verus]
+verify = true
 
 [features]
 default = ["sha1"]
