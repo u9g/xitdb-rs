@@ -495,7 +495,33 @@ fn main() -> xitdb::Result<()> {
 }
 ```
 
-The compacted database is written to a separate core. If you want to replace the original database file with it, you'll need to do that yourself. The target must be a new or empty database, so compaction returns `Error::TargetNotEmpty` if it already has data.
+The compacted database is written to a separate core. The target must be a new or empty database, so compaction returns `Error::TargetNotEmpty` if it already has data.
+
+To compact a database file in place, use `Database::compact_file`. It writes the compacted copy to `<path>.compacting`, syncs it, closes the original, and renames the copy over it, so the file at the path is always either the original or the complete compacted database. The database you call it on becomes the compacted one, and can keep writing. The last argument wraps a file in a core; it is how `compact_file` opens the new file, and reopens the original if the rename fails:
+
+```rust
+use std::fs::OpenOptions;
+use xitdb::*;
+
+fn main() -> xitdb::Result<()> {
+    let path = std::env::temp_dir().join("xitdb-readme-compact-file.db");
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+    let mut db = Database::new(CoreBufferedFile::new(file), Hasher::sha1())?;
+    let mut history = WriteArrayList::new(&mut db.root_cursor())?;
+    for i in 0..10u64 {
+        history.append(i)?;
+    }
+
+    db.compact_file(&path, &mut MemoryOffsetMap::new(), CoreBufferedFile::new)?;
+    let mut history = WriteArrayList::new(&mut db.root_cursor())?;
+    assert_eq!(history.count()?, 1);
+    history.append(10u64)?;
+    assert_eq!(history.count()?, 2);
+    Ok(())
+}
+```
+
+If the database is a `Database<Box<dyn Core + Send>>`, pass `|file| Box::new(CoreBufferedFile::new(file)) as Box<dyn Core + Send>`. Since it takes `&mut self`, it also works on a database behind a `Mutex`. If compaction fails, the original stays open and unchanged, and the temporary file is removed. If the rename fails, the original is reopened. On Unix, the directory is synced after the rename, so the rename is durable.
 
 The offset map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. The in-memory `MemoryOffsetMap` grows with the number of live objects copied. To avoid holding that in memory, use a `FileOffsetMap`, which keeps the offsets in a scratch xitdb database. Run the compaction inside a single transaction on it, so the offsets aren't each committed separately:
 
@@ -563,6 +589,10 @@ Only change a replica with `apply_replicated`. If you write to it directly, it n
 ## Thread Safety
 
 It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance (a `Database` is `Send` but not `Sync`), each with its own file handle. Also, keep in mind that writes still need to come from one thread at a time; across processes, take an exclusive lock on a separate lock file before writing (see [Initializing a Database](#initializing-a-database)).
+
+A reader in another thread or process can keep its `Database` open: the root is read again on each operation, so it sees new commits as they happen. But when the writer replaces the file, as `compact_file` does, the reader's handle still points at the old file, and it won't see anything written afterwards. Such a reader should either open the database for each read, or check whether the file was replaced and reopen it. The compacted file has a new file ID, so compare `Header::read(&mut CoreFile::new(File::open(&path)?))?.file_id` with the reader's `db.header().file_id`.
+
+On Unix, a file can be renamed over while other processes have it open. On Windows, that only works if every handle to it was opened with `FILE_SHARE_DELETE`. Rust's `std::fs::File` opens files that way, so readers using it don't block `compact_file`, but a handle opened without it (by another program, for example) makes the rename fail.
 
 ## Compatibility
 

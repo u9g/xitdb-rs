@@ -2,6 +2,9 @@
 //! new database.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use crate::core::Core;
 use crate::database::Database;
@@ -42,6 +45,103 @@ impl OffsetMap for HashMap<i64, i64> {
         self.insert(source_offset, target_offset);
         Ok(())
     }
+}
+
+impl<C: Core> Database<C> {
+    /// Compacts the database file at `path` in place, and makes `self` the
+    /// compacted database.
+    ///
+    /// `self` must be the database opened from `path`. The compacted copy is
+    /// written to `<path>.compacting`, synced, and renamed over `path`, so
+    /// `path` holds either the original or the complete compacted database,
+    /// even after a crash. `open` wraps a file in a core (for example,
+    /// `CoreBufferedFile::new`); it is called for the new file, and for the
+    /// original again if the rename fails. `offset_map` is used as in
+    /// [`Database::compact`].
+    ///
+    /// The original file is never lost:
+    ///
+    /// * If compaction fails, the temporary file is removed and `self` is
+    ///   unchanged.
+    /// * If the rename fails, the original file is reopened as `self` and
+    ///   the temporary file is removed. If that reopen fails too, `self` is
+    ///   left on the compacted copy at `<path>.compacting`.
+    /// * On Unix, the parent directory is synced after the rename. If that
+    ///   fails, the error is returned, but `path` and `self` are already the
+    ///   compacted database.
+    ///
+    /// The original file handle is closed before the rename. Handles that
+    /// other `Database`s hold on the original keep reading the old file, so
+    /// they must reopen `path` to see the compacted one.
+    pub fn compact_file(
+        &mut self,
+        path: impl AsRef<Path>,
+        offset_map: &mut dyn OffsetMap,
+        mut open: impl FnMut(File) -> C,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let temp_path = compacting_path(path);
+
+        let compacted = (|| {
+            let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&temp_path)?;
+            // keep the original's permissions, such as a read-only group
+            fs::set_permissions(&temp_path, fs::metadata(path)?.permissions())?;
+            let compacted = self.compact(open(file), offset_map)?;
+            compacted.core().sync()?;
+            Ok(compacted)
+        })();
+        let compacted = match compacted {
+            Ok(compacted) => compacted,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        };
+
+        // close the original before replacing it. the compacted copy stays
+        // open, and its handle follows the file through the rename.
+        drop(std::mem::replace(self, compacted));
+
+        if let Err(err) = fs::rename(&temp_path, path) {
+            let reopened = (|| {
+                let file = OpenOptions::new().read(true).write(true).open(path)?;
+                Database::new(open(file), self.hasher().clone())
+            })();
+            // if the original can't be reopened, self stays on the copy
+            if let Ok(reopened) = reopened {
+                drop(std::mem::replace(self, reopened));
+                let _ = fs::remove_file(&temp_path);
+            }
+            return Err(err.into());
+        }
+
+        sync_parent_dir(path)
+    }
+}
+
+/// `<path>.compacting`, the temporary file used by [`Database::compact_file`].
+fn compacting_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".compacting");
+    PathBuf::from(name)
+}
+
+/// Makes a rename in `path`'s directory durable. On Unix, a rename is only
+/// durable once its directory is synced; std can't sync a directory on
+/// other platforms.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) struct Compactor<'s, 't, 'm, S: Core, T: Core> {
