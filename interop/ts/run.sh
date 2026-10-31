@@ -22,4 +22,4 @@ if command -v pnpm >/dev/null 2>&1; then
 else
     npm install --silent --no-package-lock
 fi
-cargo run --quiet --example ts_replication -- node client.ts
+cargo run --quiet --features serde --example ts_replication -- node client.ts

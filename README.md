@@ -1006,10 +1006,11 @@ Replicas don't have to use this crate. Replication to and from the TypeScript im
 
 * A new replica gets a full copy of a history with every data type, then a delta for each transaction, and reads every value back.
 * The replica sends its `ReplicaState`, and `replication_start` returns its committed size, so it only gets what it missed.
+* The replica rejects a delta that skips a transaction or comes from another file, and syncs again.
 * After the source is compacted into a new database, `replication_start` returns 0, and the replica gets a full copy.
 * Both compute the same trailer checksums, and a database written in TypeScript replicates to this crate.
 
-The test sends a `ReplicaState` as JSON, with the checksum as a decimal string, because it is a u64 and a JSON number can only hold integers up to 2^53:
+With the `serde` feature, `ReplicaState` implements `Serialize` and `Deserialize`, and the test uses them to send it as JSON. The checksum is a decimal string, because it is a u64 and a JavaScript number can only hold integers up to 2^53 exactly:
 
 ```json
 {"committedSize":137438,"checksum":"11364480133251437419"}

@@ -6,15 +6,20 @@
 //! `interop/ts`) and talks to it over its stdin and stdout, one JSON object
 //! per line. `interop/ts/client.ts` documents the requests.
 //!
-//! A replica's `ReplicaState` is sent as
-//! `{"committedSize":123,"checksum":"456"}`, with the u64 checksum as a
-//! decimal string, because JSON numbers can't hold every u64.
+//! A replica's `ReplicaState` is sent in its JSON form from the `serde`
+//! feature: `{"committedSize":123,"checksum":"456"}`, with the u64 checksum
+//! as a decimal string, because JSON numbers can't hold every u64.
 
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::Duration;
 
+use serde_json::{Value, json};
 use xitdb::*;
+
+/// How long to wait for each reply from client.ts.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // --- the data written to each moment ---
 
@@ -137,163 +142,32 @@ fn change_moment<C: Core>(moment: &mut WriteHashMap<'_, C>, n: u64) -> Result<()
     Ok(())
 }
 
-// --- a minimal JSON reader, for the replies of client.ts (which hold no arrays) ---
+// --- reading the replies of client.ts ---
 
-#[derive(Debug, Clone)]
-enum Json {
-    Null,
-    Bool(bool),
-    Number(String),
-    String(String),
-    Object(BTreeMap<String, Json>),
+fn field<'v>(value: &'v Value, key: &str) -> &'v Value {
+    value.get(key).unwrap_or_else(|| panic!("no {key} in {value}"))
 }
 
-impl Json {
-    fn parse(text: &str) -> Json {
-        let mut parser = JsonParser { bytes: text.as_bytes(), pos: 0 };
-        let value = parser.value();
-        parser.skip_whitespace();
-        assert_eq!(parser.pos, text.len(), "trailing characters in {text}");
-        value
-    }
-
-    fn get(&self, key: &str) -> &Json {
-        match self {
-            Json::Object(map) => map.get(key).unwrap_or_else(|| panic!("no {key} in {self:?}")),
-            _ => panic!("not an object: {self:?}"),
-        }
-    }
-
-    fn has(&self, key: &str) -> bool {
-        matches!(self, Json::Object(map) if map.contains_key(key))
-    }
-
-    fn i64(&self) -> i64 {
-        match self {
-            Json::Number(n) => n.parse().unwrap_or_else(|_| panic!("not an i64: {n}")),
-            _ => panic!("not a number: {self:?}"),
-        }
-    }
-
-    fn str(&self) -> &str {
-        match self {
-            Json::String(s) => s,
-            _ => panic!("not a string: {self:?}"),
-        }
-    }
-
-    fn u64_string(&self) -> u64 {
-        self.str().parse().unwrap_or_else(|_| panic!("not a decimal u64: {self:?}"))
-    }
-
-    fn bool(&self) -> bool {
-        match self {
-            Json::Bool(b) => *b,
-            _ => panic!("not a bool: {self:?}"),
-        }
-    }
+fn i64_field(value: &Value, key: &str) -> i64 {
+    field(value, key).as_i64().unwrap_or_else(|| panic!("{key} isn't an i64 in {value}"))
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+fn str_field<'v>(value: &'v Value, key: &str) -> &'v str {
+    field(value, key).as_str().unwrap_or_else(|| panic!("{key} isn't a string in {value}"))
 }
 
-impl JsonParser<'_> {
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
-        }
-    }
-
-    fn eat(&mut self, byte: u8) -> bool {
-        self.skip_whitespace();
-        let found = self.bytes.get(self.pos) == Some(&byte);
-        if found {
-            self.pos += 1;
-        }
-        found
-    }
-
-    fn expect(&mut self, byte: u8) {
-        assert!(self.eat(byte), "expected {:?} at {}", byte as char, self.pos);
-    }
-
-    fn literal(&mut self, word: &str, value: Json) -> Json {
-        assert!(self.bytes[self.pos..].starts_with(word.as_bytes()), "bad literal at {}", self.pos);
-        self.pos += word.len();
-        value
-    }
-
-    fn value(&mut self) -> Json {
-        self.skip_whitespace();
-        match self.bytes[self.pos] {
-            b'n' => self.literal("null", Json::Null),
-            b't' => self.literal("true", Json::Bool(true)),
-            b'f' => self.literal("false", Json::Bool(false)),
-            b'"' => Json::String(self.string()),
-            b'{' => {
-                self.pos += 1;
-                let mut map = BTreeMap::new();
-                if !self.eat(b'}') {
-                    loop {
-                        self.skip_whitespace();
-                        let key = self.string();
-                        self.expect(b':');
-                        map.insert(key, self.value());
-                        if self.eat(b'}') {
-                            break;
-                        }
-                        self.expect(b',');
-                    }
-                }
-                Json::Object(map)
-            }
-            _ => {
-                let start = self.pos;
-                while self.pos < self.bytes.len() && b"-+.eE0123456789".contains(&self.bytes[self.pos]) {
-                    self.pos += 1;
-                }
-                assert!(self.pos > start, "unexpected character at {start}");
-                Json::Number(String::from_utf8(self.bytes[start..self.pos].to_vec()).unwrap())
-            }
-        }
-    }
-
-    fn string(&mut self) -> String {
-        assert_eq!(self.bytes[self.pos], b'"', "expected a string at {}", self.pos);
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            let rest = std::str::from_utf8(&self.bytes[self.pos..]).unwrap();
-            let c = rest.chars().next().expect("unterminated string");
-            self.pos += c.len_utf8();
-            match c {
-                '"' => return out,
-                '\\' => {
-                    let escape = self.bytes[self.pos];
-                    self.pos += 1;
-                    match escape {
-                        b'n' => out.push('\n'),
-                        b't' => out.push('\t'),
-                        b'r' => out.push('\r'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'u' => {
-                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4]).unwrap();
-                            self.pos += 4;
-                            out.push(char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap_or('?'));
-                        }
-                        other => out.push(other as char),
-                    }
-                }
-                c => out.push(c),
-            }
-        }
-    }
+fn bool_field(value: &Value, key: &str) -> bool {
+    field(value, key).as_bool().unwrap_or_else(|| panic!("{key} isn't a bool in {value}"))
 }
 
-// --- hex, and the ReplicaState wire form ---
+// a u64 sent as a decimal string, like a ReplicaState's checksum
+fn u64_field(value: &Value, key: &str) -> u64 {
+    str_field(value, key).parse().unwrap_or_else(|_| panic!("{key} isn't a decimal u64 in {value}"))
+}
+
+fn state_field(value: &Value) -> ReplicaState {
+    serde_json::from_value(field(value, "state").clone()).unwrap_or_else(|err| panic!("bad state in {value}: {err}"))
+}
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -303,20 +177,15 @@ fn from_hex(hex: &str) -> Vec<u8> {
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
 }
 
-fn state_to_json(state: ReplicaState) -> String {
-    format!(r#"{{"committedSize":{},"checksum":"{}"}}"#, state.committed_size, state.checksum)
-}
-
-fn state_from_json(json: &Json) -> ReplicaState {
-    ReplicaState { committed_size: json.get("committedSize").i64(), checksum: json.get("checksum").u64_string() }
-}
-
 // --- the TypeScript client ---
 
+/// The running client.ts. It is killed when this is dropped, including when
+/// a check panics, so a failed run doesn't leave it behind.
 struct Client {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Option<ChildStdin>,
+    // lines from its stdout, read on another thread, so waiting for one can time out
+    lines: Receiver<std::io::Result<String>>,
 }
 
 impl Client {
@@ -327,35 +196,63 @@ impl Client {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap_or_else(|err| panic!("can't run {command:?}: {err}"));
-        let stdin = child.stdin.take().unwrap();
+        let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Client { child, stdin, stdout }
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Client { child, stdin, lines }
     }
 
-    fn request(&mut self, request: &str) -> Json {
-        writeln!(self.stdin, "{request}").unwrap();
-        self.stdin.flush().unwrap();
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        assert!(!line.is_empty(), "client.ts exited after {request:.200}");
-        let reply = Json::parse(&line);
-        if reply.has("fatal") {
-            panic!("client.ts failed on {request:.200}:\n{}", reply.get("fatal").str());
+    fn request(&mut self, request: Value) -> Value {
+        let text = request.to_string();
+        let what = &text[..text.len().min(200)];
+        let stdin = self.stdin.as_mut().expect("client.ts's stdin is closed");
+        writeln!(stdin, "{text}").and_then(|_| stdin.flush()).unwrap_or_else(|err| {
+            panic!("can't send {what} to client.ts: {err}");
+        });
+        let line = match self.lines.recv_timeout(REPLY_TIMEOUT) {
+            Ok(line) => line.unwrap_or_else(|err| panic!("can't read the reply to {what}: {err}")),
+            Err(RecvTimeoutError::Timeout) => panic!("no reply to {what} from client.ts in {REPLY_TIMEOUT:?}"),
+            Err(RecvTimeoutError::Disconnected) => panic!("client.ts exited without replying to {what}"),
+        };
+        let reply: Value = serde_json::from_str(&line).unwrap_or_else(|err| panic!("bad reply {line:.200}: {err}"));
+        if let Some(fatal) = reply.get("fatal") {
+            panic!("client.ts failed on {what}:\n{}", fatal.as_str().unwrap_or_default());
         }
         reply
     }
 
-    fn state(&mut self) -> Json {
-        self.request(r#"{"type":"state"}"#)
+    fn state(&mut self) -> Value {
+        self.request(json!({"type": "state"}))
     }
 
-    fn sync(&mut self, start: i64, end: i64, bytes: &[u8]) -> Json {
-        self.request(&format!(r#"{{"type":"sync","start":{start},"end":{end},"bytes":"{}"}}"#, to_hex(bytes)))
+    fn sync(&mut self, start: i64, end: i64, bytes: &[u8]) -> Value {
+        self.request(json!({"type": "sync", "start": start, "end": end, "bytes": to_hex(bytes)}))
     }
 
     fn check(&mut self, moments: &[u64]) {
-        let list: Vec<String> = moments.iter().map(u64::to_string).collect();
-        self.request(&format!(r#"{{"type":"check","moments":[{}]}}"#, list.join(",")));
+        self.request(json!({"type": "check", "moments": moments}));
+    }
+
+    /// Closes client.ts's stdin, which ends it, and checks that it exited cleanly.
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        let status = self.child.wait().expect("can't wait for client.ts");
+        assert!(status.success(), "client.ts exited with {status}");
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // after finish, it has already exited, and this does nothing
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -366,40 +263,42 @@ fn read_committed<C: Core>(db: &Database<C>, start: i64, end: i64) -> Result<Vec
 }
 
 /// Checks a reply carrying the client's replica state against `db`, which
-/// it must now be a replica of, and checks the trailer checksum both ways:
-/// the one xitdb-ts computed for the replica's last trailer must equal the
-/// stored one and the one this crate computes for the same fields.
-fn check_replica_of<C: Core>(reply: &Json, db: &Database<C>) -> Result<ReplicaState> {
-    let state = state_from_json(reply.get("state"));
+/// it must now be a replica of, and checks the trailer checksum both ways
+/// (see `check_trailer`).
+fn check_replica_of<C: Core>(reply: &Value, db: &Database<C>) -> Result<()> {
+    let state = state_field(reply);
     assert_eq!(state, db.replica_state()?, "the client's replica state matches the source");
-    check_trailer(reply.get("trailer"), state)?;
-    assert_eq!(reply.get("trailer").get("fileId").u64_string(), db.header().file_id, "file id");
-    Ok(state)
+    check_trailer(field(reply, "trailer"), state)?;
+    assert_eq!(u64_field(field(reply, "trailer"), "fileId"), db.header().file_id, "file id");
+    Ok(())
 }
 
-fn check_trailer(trailer: &Json, state: ReplicaState) -> Result<()> {
-    let file_id = trailer.get("fileId").u64_string();
-    let position = trailer.get("position").i64();
-    let root = Slot::from_bytes(&from_hex(trailer.get("root").str()))?;
-    let commit_id = trailer.get("commitId").u64_string();
+/// Checks the trailer that ends a replica in `state`, as client.ts read it:
+/// the checksum xitdb-ts computed for it must equal the stored one and the
+/// one this crate computes for the same fields.
+fn check_trailer(trailer: &Value, state: ReplicaState) -> Result<()> {
+    let file_id = u64_field(trailer, "fileId");
+    let position = i64_field(trailer, "position");
+    let root = Slot::from_bytes(&from_hex(str_field(trailer, "root")))?;
+    let commit_id = u64_field(trailer, "commitId");
     let rust = root_trailer_checksum(file_id, position, root, commit_id);
     assert_eq!(position + consts::ROOT_TRAILER_LENGTH as i64, state.committed_size, "trailer position");
-    assert_eq!(trailer.get("stored").u64_string(), state.checksum, "stored checksum is the state's");
-    assert_eq!(trailer.get("computed").u64_string(), rust, "xitdb-ts computes the checksum this crate does");
+    assert_eq!(u64_field(trailer, "stored"), state.checksum, "stored checksum is the state's");
+    assert_eq!(u64_field(trailer, "computed"), rust, "xitdb-ts computes the checksum this crate does");
     assert_eq!(rust, state.checksum, "this crate's checksum of the client's trailer");
     Ok(())
 }
 
 /// Sends the committed bytes `[start, end)` of `db` to the client.
-fn send<C: Core>(client: &mut Client, db: &Database<C>, start: i64, end: i64) -> Result<Json> {
+fn send<C: Core>(client: &mut Client, db: &Database<C>, start: i64, end: i64) -> Result<Value> {
     let bytes = read_committed(db, start, end)?;
     Ok(client.sync(start, end, &bytes))
 }
 
 /// Sends the bytes and checks they were applied.
-fn send_applied<C: Core>(client: &mut Client, db: &Database<C>, start: i64, end: i64) -> Result<ReplicaState> {
+fn send_applied<C: Core>(client: &mut Client, db: &Database<C>, start: i64, end: i64) -> Result<()> {
     let reply = send(client, db, start, end)?;
-    assert!(reply.get("applied").bool(), "sync [{start}, {end}) applied: {reply:?}");
+    assert!(bool_field(&reply, "applied"), "sync [{start}, {end}) applied: {reply}");
     check_replica_of(&reply, db)
 }
 
@@ -413,6 +312,15 @@ fn commit_and_broadcast<C: Core>(client: &mut Client, db: &Database<C>, n: u64) 
     Ok(())
 }
 
+/// Checks that client.ts rejected a sync with `error`, leaving its replica
+/// unchanged, still at the committed size `at`.
+fn check_rejected(reply: &Value, error: &str, at: i64) {
+    assert!(!bool_field(reply, "applied"), "the sync is rejected: {reply}");
+    assert_eq!(str_field(reply, "error"), error);
+    assert!(bool_field(reply, "unchanged"), "the replica is unchanged: {reply}");
+    assert_eq!(state_field(reply).committed_size, at);
+}
+
 fn main() -> Result<()> {
     let command: Vec<String> = std::env::args().skip(1).collect();
     if command.is_empty() {
@@ -421,29 +329,29 @@ fn main() -> Result<()> {
     }
     let mut client = Client::spawn(&command);
 
-    // (a) a history with every data type, and a full sync to a new replica.
+    // 1. a history with every data type, and a full sync to a new replica.
     // the replica has its own file ID, so replication_start returns 0.
     let server = Database::new(CoreMemory::new(), Hasher::sha1())?;
     write_moment(&server, 0)?;
     write_moment(&server, 1)?;
     let fresh = client.state();
-    check_trailer(fresh.get("trailer"), state_from_json(fresh.get("state")))?;
-    let start = server.replication_start(state_from_json(fresh.get("state")))?;
+    check_trailer(field(&fresh, "trailer"), state_field(&fresh))?;
+    let start = server.replication_start(state_field(&fresh))?;
     assert_eq!(start, 0, "a new replica gets a full copy");
     let end = server.committed_size()?;
     send_applied(&mut client, &server, 0, end)?;
     client.check(&[0, 1]);
     println!("rust: full sync of {end} bytes to a new ts replica; ts read moments 0 and 1");
 
-    // (b) deltas, one per transaction
+    // 2. deltas, one per transaction
     for n in 2..=4 {
         commit_and_broadcast(&mut client, &server, n)?;
         client.check(&(0..=n).collect::<Vec<_>>());
     }
     println!("rust: ts applied and read deltas for moments 2 to 4");
 
-    // (c) the client reconnects and sends its state; it missed moment 5
-    let before = state_from_json(client.state().get("state"));
+    // 3. the client reconnects and sends its state; it missed moment 5
+    let before = state_field(&client.state());
     write_moment(&server, 5)?;
     let start = server.replication_start(before)?;
     assert_eq!(start, before.committed_size, "a replica that is a prefix continues where it is");
@@ -451,32 +359,28 @@ fn main() -> Result<()> {
     send_applied(&mut client, &server, start, end)?;
     client.check(&[0, 1, 2, 3, 4, 5]);
     // reconnecting with nothing new sends nothing
-    let state = state_from_json(client.state().get("state"));
-    assert_eq!(server.replication_start(state)?, end);
+    assert_eq!(server.replication_start(state_field(&client.state()))?, end);
     send_applied(&mut client, &server, end, end)?;
     println!("rust: ts sent its state, replication_start returned its committed size {start}, the delta applied");
 
-    // (e) a delta that doesn't start at the replica's committed size: the
-    // client missed moment 6's broadcast, and gets moment 7's
+    // 4. rejected deltas. first, one that doesn't start at the replica's
+    // committed size: the client missed moment 6's broadcast, and gets moment 7's
     let at5 = server.committed_size()?;
     write_moment(&server, 6)?;
     let at6 = server.committed_size()?;
     write_moment(&server, 7)?;
     let at7 = server.committed_size()?;
     let reply = send(&mut client, &server, at6, at7)?;
-    assert!(!reply.get("applied").bool(), "a delta past the replica's end is rejected");
-    assert_eq!(reply.get("error").str(), "InvalidRangeException");
-    assert!(reply.get("unchanged").bool());
-    assert_eq!(state_from_json(reply.get("state")).committed_size, at5);
+    check_rejected(&reply, "InvalidRangeException", at5);
     client.check(&[0, 1, 2, 3, 4, 5]);
     // so it re-syncs
-    let start = server.replication_start(state_from_json(reply.get("state")))?;
+    let start = server.replication_start(state_field(&reply))?;
     assert_eq!(start, at5);
     send_applied(&mut client, &server, start, at7)?;
     client.check(&[0, 1, 2, 3, 4, 5, 6, 7]);
     println!("rust: ts rejected a delta starting at {at6} (it had {at5}) and re-synced");
 
-    // (e) bytes that start at the replica's committed size but come from
+    // then bytes that start at the replica's committed size but come from
     // another file, like a stale broadcast: their trailer's checksum covers
     // the other file's ID and position, so close() rejects them
     let other = Database::new(CoreMemory::new(), Hasher::sha1())?;
@@ -485,9 +389,7 @@ fn main() -> Result<()> {
     write_moment(&other, 1)?;
     let foreign = read_committed(&other, other_start, other.committed_size()?)?;
     let reply = client.sync(at7, at7 + foreign.len() as i64, &foreign);
-    assert!(!reply.get("applied").bool(), "bytes from another file are rejected");
-    assert_eq!(reply.get("error").str(), "InvalidDatabaseException");
-    assert!(reply.get("unchanged").bool());
+    check_rejected(&reply, "InvalidDatabaseException", at7);
     check_replica_of(&reply, &server)?;
     client.check(&[0, 1, 2, 3, 4, 5, 6, 7]);
     // the next delta discards them
@@ -495,13 +397,13 @@ fn main() -> Result<()> {
     client.check(&(0..=8).collect::<Vec<_>>());
     println!("rust: ts rejected {} bytes from another file at its committed size", foreign.len());
 
-    // (d) the server compacts its view into a new in-memory database. it has
+    // 5. the server compacts its view into a new in-memory database. it has
     // a new file ID, so replication_start returns 0 and the client gets a
     // full copy.
     let uncompacted_size = server.committed_size()?;
     let server = server.compact(CoreMemory::new(), &mut MemoryOffsetMap::new())?;
-    let state = state_from_json(client.state().get("state"));
-    assert_eq!(server.replication_start(state)?, 0, "a replica of the uncompacted file gets a full copy");
+    let start = server.replication_start(state_field(&client.state()))?;
+    assert_eq!(start, 0, "a replica of the old file gets a full copy");
     let end = server.committed_size()?;
     send_applied(&mut client, &server, 0, end)?;
     client.check(&[8]);
@@ -509,7 +411,8 @@ fn main() -> Result<()> {
     client.check(&[8, 9]);
     println!("rust: compacted {uncompacted_size} bytes into {end}; ts got a full copy, then a delta");
 
-    // (f) trailer checksums of arbitrary fields, computed by both
+    // 6. trailer checksums: every sync above compared them, and these are of
+    // arbitrary fields
     let slots = [
         Slot::default(),
         Slot::new(1, Tag::ArrayList),
@@ -523,29 +426,29 @@ fn main() -> Result<()> {
         let file_id = if i == 0 { u64::MAX } else { seed };
         let position = (seed >> 20) as i64 % (1 << 40);
         let commit_id = seed.rotate_left(17);
-        let reply = client.request(&format!(
-            r#"{{"type":"checksum","fileId":"{file_id}","position":{position},"root":"{}","commitId":"{commit_id}"}}"#,
-            to_hex(&slot.to_bytes())
-        ));
+        let reply = client.request(json!({
+            "type": "checksum",
+            "fileId": file_id.to_string(),
+            "position": position,
+            "root": to_hex(&slot.to_bytes()),
+            "commitId": commit_id.to_string(),
+        }));
         let expected = root_trailer_checksum(file_id, position, *slot, commit_id);
-        assert_eq!(reply.get("checksum").u64_string(), expected, "checksum of {file_id} {position} {slot:?}");
+        assert_eq!(u64_field(&reply, "checksum"), expected, "checksum of {file_id} {position} {slot:?}");
     }
     println!("rust: ts and rust compute the same checksum for every trailer, and 50 arbitrary ones");
 
-    // the other way: a database written by xitdb-ts, replicated to this crate
+    // 7. the other way: a database written by xitdb-ts, replicated to this crate
     let replica = Database::new(CoreMemory::new(), Hasher::sha1())?;
     for n in 0..3u64 {
-        let written = client.request(&format!(r#"{{"type":"source-write","n":{n}}}"#));
-        let reply = client.request(&format!(
-            r#"{{"type":"source-sync","state":{}}}"#,
-            state_to_json(replica.replica_state()?)
-        ));
-        let (start, end) = (reply.get("start").i64(), reply.get("end").i64());
+        let written = client.request(json!({"type": "source-write", "n": n}));
+        let reply = client.request(json!({"type": "source-sync", "state": replica.replica_state()?}));
+        let (start, end) = (i64_field(&reply, "start"), i64_field(&reply, "end"));
         assert_eq!(start, if n == 0 { 0 } else { replica.committed_size()? });
-        let bytes = from_hex(reply.get("bytes").str());
+        let bytes = from_hex(str_field(&reply, "bytes"));
         replica.apply_replicated(start, &mut bytes.as_slice(), end - start)?;
-        assert_eq!(replica.replica_state()?, state_from_json(written.get("state")));
-        assert_eq!(replica.replica_state()?, state_from_json(reply.get("state")));
+        assert_eq!(replica.replica_state()?, state_field(&written));
+        assert_eq!(replica.replica_state()?, state_field(&reply));
         let history = ReadArrayList::new(replica.root_cursor())?;
         assert_eq!(history.count()?, n as i64 + 1);
         for i in 0..=n {
@@ -563,9 +466,7 @@ fn main() -> Result<()> {
     }
     println!("rust: replicated a database written by ts (a full copy, then 2 deltas) and read it");
 
-    drop(client.stdin);
-    let status = client.child.wait()?;
-    assert!(status.success(), "client.ts exited with {status}");
+    client.finish();
     println!("ts-replication: ok");
     Ok(())
 }

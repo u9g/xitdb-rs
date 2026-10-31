@@ -31,6 +31,12 @@ derive = ["dep:xitdb-derive"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 tempfile = "3"
+
+# replicates to the TypeScript implementation (see interop/ts/run.sh)
+[[example]]
+name = "ts_replication"
+required-features = ["serde"]

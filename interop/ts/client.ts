@@ -11,11 +11,14 @@
 //     applies the committed bytes [S, E) of the source, like a client applies
 //     a full copy (S = 0) or a broadcast delta.
 //     -> {"applied":true,"state":STATE,"trailer":TRAILER}, or
-//        {"applied":false,"error":NAME,"state":STATE,...} if it was rejected,
-//        in which case the replica is unchanged and must re-sync.
+//        {"applied":false,"error":NAME,"state":STATE,...} if xitdb-ts
+//        rejected it with InvalidRangeException or InvalidDatabaseException,
+//        in which case the replica is unchanged and must re-sync. Any other
+//        exception is fatal.
 // * {"type":"check","moments":[N, ...]}
 //     checks that the replica's history holds exactly the moments numbered N
-//     (see momentOf in the Rust example). -> {"ok":true}
+//     (see write_moment, write_first_moment and change_moment in the Rust
+//     example). -> {"ok":true}
 // * {"type":"checksum","fileId":DEC,"position":P,"root":HEX,"commitId":DEC}
 //     -> {"checksum":DEC}, computed by xitdb-ts.
 // * {"type":"source-write","n":N} writes moment N into a database owned by
@@ -36,6 +39,8 @@ import {
   Bytes,
   CoreMemory,
   Database,
+  InvalidDatabaseException,
+  InvalidRangeException,
   Hasher,
   ReadArrayList,
   ReadCountedHashMap,
@@ -86,10 +91,17 @@ function readCommitted(db: Database, start: number, end: number): Buffer {
   return Buffer.concat(chunks);
 }
 
+// reads the bytes at position without moving the core's position, so the
+// replica is left exactly as a real client's would be
 function readRaw(db: Database, position: number, length: number): Uint8Array {
   const bytes = new Uint8Array(length);
-  db.core.seek(position);
-  db.core.reader().readFully(bytes);
+  const saved = db.core.position();
+  try {
+    db.core.seek(position);
+    db.core.reader().readFully(bytes);
+  } finally {
+    db.core.seek(saved);
+  }
   return bytes;
 }
 
@@ -145,7 +157,8 @@ const int64 = (cursor: ReadCursor): bigint => {
   return cursor.slot().value;
 };
 
-// these mirror the data written by momentOf in examples/ts_replication.rs
+// these mirror the data written by write_moment, write_first_moment and
+// change_moment in examples/ts_replication.rs
 function longBytes(length: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(length);
   for (let i = 0; i < length; i++) bytes[i] = (i * 31 + seed) % 251;
@@ -307,10 +320,15 @@ function handle(request: Json): Json {
         for (let i = 0; i < bytes.length; i += 1000) writer.write(bytes.subarray(i, i + 1000));
         writer.close();
       } catch (e) {
+        // only these mean xitdb-ts rejected the bytes. anything else is a bug.
+        let error: string;
+        if (e instanceof InvalidRangeException) error = 'InvalidRangeException';
+        else if (e instanceof InvalidDatabaseException) error = 'InvalidDatabaseException';
+        else throw e;
         const after = replica.replicaState();
         return {
           applied: false,
-          error: (e as Error).constructor.name,
+          error,
           unchanged: after.committedSize === before.committedSize && after.checksum === before.checksum,
           state: stateToJson(after),
           trailer: trailerOf(replica),
@@ -363,10 +381,15 @@ function handle(request: Json): Json {
 
 for await (const line of createInterface({ input: process.stdin })) {
   if (line.trim() === '') continue;
+  let reply: string;
   try {
-    console.log(JSON.stringify(handle(JSON.parse(line) as Json)));
+    reply = JSON.stringify(handle(JSON.parse(line) as Json));
   } catch (e) {
-    console.log(JSON.stringify({ fatal: (e as Error).stack ?? String(e) }));
-    process.exit(1);
+    // the stack starts with the message
+    const fatal = e instanceof Error ? (e.stack ?? e.message) : String(e);
+    // exit only once the reply is written, because stdout can be asynchronous
+    process.stdout.write(JSON.stringify({ fatal }) + '\n', () => process.exit(1));
+    break;
   }
+  process.stdout.write(reply + '\n');
 }
