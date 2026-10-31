@@ -8,42 +8,42 @@ use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 use crate::store::DbStore;
 use vstd::prelude::*;
 
+verus! {
+
 /// A node pointer plus the element count of its subtree (the right sibling
 /// of a split).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct NodeRef {
+pub struct NodeRef {
     pub node_ptr: i64,
     pub count: i64,
 }
 
 /// A written node, plus its new right sibling if it overflowed.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct JoinResult {
+pub struct JoinResult {
     pub node_ptr: i64,
     pub count: i64,
     pub split: Option<NodeRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct InsertResult {
+pub struct InsertResult {
     pub join: JoinResult,
     pub value_position: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WriteSlot {
+pub struct WriteSlot {
     pub node_ptr: i64,
     pub value_position: i64,
     pub slot: Slot,
 }
 
-fn value_position(node_ptr: i64, rank: usize) -> i64 {
-    node_ptr + (BTREE_NODE_HEADER_SIZE + rank * SLOT_LENGTH) as i64
-}
+} // verus!
 
 verus! {
 
-fn index_slot(ptr: i64) -> (r: Slot)
+pub(crate) fn index_slot(ptr: i64) -> (r: Slot)
     ensures
         r == (Slot { value: ptr, tag: Tag::Index, full: false }),
 {
@@ -133,7 +133,7 @@ pub fn child_for_rank_pub(node: &BTreeNode, rank: i64, inclusive: bool) -> (r: (
     child_for_rank(node, rank, inclusive)
 }
 
-fn drop_child(branch: &mut BTreeNode, i: usize)
+pub(crate) fn drop_child(branch: &mut BTreeNode, i: usize)
     requires
         old(branch).num <= BTREE_SLOT_COUNT,
         i < old(branch).num,
@@ -183,7 +183,7 @@ pub open spec fn entries(node: BTreeNode) -> Seq<Slot> {
 }
 
 // two nodes of the same kind whose entries fit in one node, a before b
-fn concat_nodes(a: &BTreeNode, b: &BTreeNode) -> (r: BTreeNode)
+pub(crate) fn concat_nodes(a: &BTreeNode, b: &BTreeNode) -> (r: BTreeNode)
     requires
         a.kind == b.kind,
         a.num + b.num <= BTREE_SLOT_COUNT,
@@ -236,7 +236,7 @@ fn concat_nodes(a: &BTreeNode, b: &BTreeNode) -> (r: BTreeNode)
     node
 }
 
-fn leaf(values: &[Slot]) -> (r: BTreeNode)
+pub(crate) fn leaf(values: &[Slot]) -> (r: BTreeNode)
     requires
         values@.len() <= BTREE_SLOT_COUNT,
     ensures
@@ -262,7 +262,7 @@ fn leaf(values: &[Slot]) -> (r: BTreeNode)
     node
 }
 
-fn branch(children: &[Slot], counts: &[i64]) -> (r: BTreeNode)
+pub(crate) fn branch(children: &[Slot], counts: &[i64]) -> (r: BTreeNode)
     requires
         children@.len() <= BTREE_SLOT_COUNT,
         counts@.len() == children@.len(),
@@ -341,87 +341,8 @@ impl<C: Core> Database<C> {
     // writing new nodes along the path. the caller fills in the value at the
     // returned value_position.
     pub(crate) fn btree_insert(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<InsertResult> {
-        let node = self.read_btree_node(node_ptr)?;
-        match node.kind {
-            BTreeNodeKind::Leaf => {
-                // build the entries with a placeholder spliced in at `rank`. the
-                // placeholder is a NONE slot marked full so that, if the caller
-                // never writes a value (e.g. append_cursor), iteration still
-                // counts it as an element rather than skipping it as padding.
-                let r = check_rank(rank, node.num, true)?;
-                let mut vals = Vec::with_capacity(BTREE_SLOT_COUNT + 1);
-                vals.extend_from_slice(&node.values[..r]);
-                vals.push(Slot::default().with_full(true));
-                vals.extend_from_slice(&node.values[r..node.num]);
-                let total = vals.len();
-
-                if total <= BTREE_SLOT_COUNT {
-                    let ptr = self.btree_write_node(&leaf(&vals), node_ptr, frozen_at)?;
-                    return Ok(InsertResult {
-                        join: JoinResult { node_ptr: ptr, count: total as i64, split: None },
-                        value_position: value_position(ptr, r),
-                    });
-                }
-
-                // overflow: split into two leaves (reuse this node for the left half)
-                let left_n = BTREE_SPLIT_COUNT;
-                let left_ptr = self.btree_write_node(&leaf(&vals[..left_n]), node_ptr, frozen_at)?;
-                let right_ptr = self.write_btree_node(&leaf(&vals[left_n..]))?;
-                let value_position = if r < left_n {
-                    value_position(left_ptr, r)
-                } else {
-                    value_position(right_ptr, r - left_n)
-                };
-                Ok(InsertResult {
-                    join: JoinResult {
-                        node_ptr: left_ptr,
-                        count: left_n as i64,
-                        split: Some(NodeRef { node_ptr: right_ptr, count: (total - left_n) as i64 }),
-                    },
-                    value_position,
-                })
-            }
-            BTreeNodeKind::Branch => {
-                // pick the child that contains `rank`
-                let (i, rem) = child_for_rank(&node, rank, true);
-                let child = self.btree_insert(node.children[i].value, rem, frozen_at)?;
-
-                // rebuild this branch with the (possibly split) child
-                let mut children = node.children[..node.num].to_vec();
-                let mut counts = node.counts[..node.num].to_vec();
-                children[i] = index_slot(child.join.node_ptr);
-                counts[i] = child.join.count;
-                if let Some(split) = child.join.split {
-                    children.insert(i + 1, index_slot(split.node_ptr));
-                    counts.insert(i + 1, split.count);
-                }
-                let total = children.len();
-
-                if total <= BTREE_SLOT_COUNT {
-                    let node = branch(&children, &counts);
-                    let ptr = self.btree_write_node(&node, node_ptr, frozen_at)?;
-                    return Ok(InsertResult {
-                        join: JoinResult { node_ptr: ptr, count: node.subtree_count(), split: None },
-                        value_position: child.value_position,
-                    });
-                }
-
-                // overflow: split into two branches (reuse this node for the left half)
-                let left_n = BTREE_SPLIT_COUNT;
-                let left = branch(&children[..left_n], &counts[..left_n]);
-                let right = branch(&children[left_n..], &counts[left_n..]);
-                let left_ptr = self.btree_write_node(&left, node_ptr, frozen_at)?;
-                let right_ptr = self.write_btree_node(&right)?;
-                Ok(InsertResult {
-                    join: JoinResult {
-                        node_ptr: left_ptr,
-                        count: left.subtree_count(),
-                        split: Some(NodeRef { node_ptr: right_ptr, count: right.subtree_count() }),
-                    },
-                    value_position: child.value_position,
-                })
-            }
-        }
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::btree_io::btree_insert(&mut DbStore::new(self), node_ptr, rank, limit)
     }
 
     // descend to the value slot at `rank` for writing, copy-on-writing only
@@ -429,29 +350,8 @@ impl<C: Core> Database<C> {
     // unchanged, so when the whole path is already this-transaction nothing
     // is rewritten and the caller writes straight into the existing leaf.
     pub(crate) fn btree_get_for_write(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<WriteSlot> {
-        let mut node = self.read_btree_node(node_ptr)?;
-        if node.kind == BTreeNodeKind::Leaf {
-            let rank = check_rank(rank, node.num, false)?;
-            let mut new_ptr = node_ptr;
-            if !self.btree_reusable(node_ptr, frozen_at) {
-                new_ptr = self.write_btree_node(&node)?;
-            }
-            return Ok(WriteSlot {
-                node_ptr: new_ptr,
-                value_position: value_position(new_ptr, rank),
-                slot: node.values[rank],
-            });
-        }
-        let (i, rem) = child_for_rank(&node, rank, false);
-        let child_ptr = node.children[i].value;
-        let child = self.btree_get_for_write(child_ptr, rem, frozen_at)?;
-        // if the child stayed put, this branch is unchanged too
-        if child.node_ptr == child_ptr {
-            return Ok(WriteSlot { node_ptr, ..child });
-        }
-        node.children[i] = index_slot(child.node_ptr);
-        let new_ptr = self.btree_write_node(&node, node_ptr, frozen_at)?;
-        Ok(WriteSlot { node_ptr: new_ptr, ..child })
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::btree_io::btree_get_for_write(&mut DbStore::new(self), node_ptr, rank, limit)
     }
 
     // remove the element at `rank` within the subtree at node_ptr, returning
@@ -459,42 +359,8 @@ impl<C: Core> Database<C> {
     // dropped and a child left under half full is merged with a neighbor it
     // fits with, so every leaf stays at the same depth.
     pub(crate) fn btree_remove(&self, node_ptr: i64, rank: i64, frozen_at: i64) -> Result<BTreeNode> {
-        let mut node = self.read_btree_node(node_ptr)?;
-        match node.kind {
-            BTreeNodeKind::Leaf => {
-                let r = check_rank(rank, node.num, false)?;
-                node.values.copy_within(r + 1..node.num, r);
-                node.num -= 1;
-                node.values[node.num] = Slot::default();
-            }
-            BTreeNodeKind::Branch => {
-                let (mut i, rem) = child_for_rank(&node, rank, false);
-                let child_ptr = node.children[i].value;
-                let mut child = self.btree_remove(child_ptr, rem, frozen_at)?;
-                if child.num == 0 {
-                    drop_child(&mut node, i);
-                    return Ok(node);
-                }
-                if child.num < BTREE_SPLIT_COUNT && node.num > 1 {
-                    // the pair is i and its right neighbor, or its left one if it is last
-                    let (first, neighbor_i) = if i + 1 >= node.num { (i - 1, i - 1) } else { (i, i + 1) };
-                    let neighbor = self.read_btree_node(node.children[neighbor_i].value)?;
-                    if child.num + neighbor.num <= BTREE_SLOT_COUNT {
-                        child = if first == i {
-                            concat_nodes(&child, &neighbor)
-                        } else {
-                            concat_nodes(&neighbor, &child)
-                        };
-                        drop_child(&mut node, first + 1);
-                        i = first;
-                    }
-                }
-                let ptr = self.btree_write_node(&child, child_ptr, frozen_at)?;
-                node.children[i] = index_slot(ptr);
-                node.counts[i] = child.subtree_count();
-            }
-        }
-        Ok(node)
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::btree_io::btree_remove(&mut DbStore::new(self), node_ptr, rank, limit)
     }
 
     // height of a tree = number of branch levels above the leaves
