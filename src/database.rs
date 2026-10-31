@@ -89,8 +89,7 @@ fn resolve_index(index: i64, size: i64) -> Result<i64> {
 
 /// The nibble of the big-endian hash at `offset` nibbles from its least
 /// significant end.
-fn hash_nibble(hash: &[u8], offset: u8) -> usize {
-    let offset = offset as usize;
+fn hash_nibble(hash: &[u8], offset: usize) -> usize {
     if offset / 2 >= hash.len() {
         return 0;
     }
@@ -1291,13 +1290,13 @@ impl<C: Core> Database<C> {
         &self,
         index_pos: i64,
         key_hash: &[u8],
-        key_offset: u8,
+        key_offset: usize,
         write_mode: WriteMode,
         target: HashMapGetTarget<'_>,
         frozen_at: i64,
     ) -> Result<HashMapGetResult> {
         let max_offset = self.hash_size() * 8 / BIT_COUNT as usize;
-        if key_offset as usize > max_offset {
+        if key_offset > max_offset {
             return Err(Error::KeyOffsetExceeded);
         }
 
@@ -1370,7 +1369,7 @@ impl<C: Core> Database<C> {
                 match write_mode {
                     WriteMode::ReadOnly => Err(Error::KeyNotFound),
                     WriteMode::ReadWrite => {
-                        if key_offset as usize + 1 >= max_offset {
+                        if key_offset + 1 >= max_offset {
                             return Err(Error::KeyOffsetExceeded);
                         }
                         let next_i = hash_nibble(&kv.hash, key_offset + 1);
@@ -1387,8 +1386,8 @@ impl<C: Core> Database<C> {
         }
     }
 
-    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: u8, frozen_at: i64) -> Result<Slot> {
-        if key_offset as usize > self.hash_size() * 8 / BIT_COUNT as usize {
+    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: usize, frozen_at: i64) -> Result<Slot> {
+        if key_offset > self.hash_size() * 8 / BIT_COUNT as usize {
             return Err(Error::KeyOffsetExceeded);
         }
 
