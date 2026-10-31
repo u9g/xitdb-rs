@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::slot::Slot;
+use crate::slot::{Slot, Tag};
 
 /// A byte array, optionally with a 2-byte format tag that tells readers
 /// how to interpret it (for example `b"bi"` for a big integer).
@@ -61,6 +61,29 @@ impl<'a> Data<'a> {
 
     pub fn tagged_string(value: &'a str, format_tag: [u8; 2]) -> Data<'a> {
         Data::Bytes(Bytes::tagged(value.as_bytes(), format_tag))
+    }
+
+    /// The slot that writing this stores, or `None` for a byte array too
+    /// long to fit in one, which is stored elsewhere. An empty slot is
+    /// marked as written, so it isn't treated as empty.
+    pub(crate) fn inline_slot(&self) -> Option<Slot> {
+        let slot = match self {
+            Data::None => Slot::default(),
+            Data::Slot(slot) => *slot,
+            Data::Uint(value) => Slot::new(*value as i64, Tag::Uint),
+            Data::Int(value) => Slot::new(*value, Tag::Int),
+            Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
+            Data::Bytes(bytes) if bytes.is_short() => {
+                let mut buf = [0u8; 8];
+                buf[..bytes.value.len()].copy_from_slice(&bytes.value);
+                if let Some(format_tag) = bytes.format_tag {
+                    buf[6..].copy_from_slice(&format_tag);
+                }
+                Slot::new(i64::from_be_bytes(buf), Tag::ShortBytes).with_full(bytes.format_tag.is_some())
+            }
+            Data::Bytes(_) => return None,
+        };
+        Some(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
     }
 }
 

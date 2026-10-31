@@ -193,6 +193,61 @@ impl<'a, C: Core> ReadCursor<'a, C> {
         }
     }
 
+    /// Whether writing `data` here would leave the slot as it is. Anything
+    /// that fits in a slot, which is everything but a byte array too long
+    /// to (see [`Bytes::is_short`]), is compared by the slot alone: the
+    /// type, the value, and any format tag must all be the same. So
+    /// [`Data::Int`] 1 isn't [`Data::Uint`] 1, floats are compared by their
+    /// bits (`-0.0` isn't `0.0`, and a NaN equals the same NaN), and
+    /// [`Data::Slot`] equals only that exact slot, so a copy of a
+    /// collection at another position isn't equal to it.
+    ///
+    /// [`Data::None`] equals only a slot it was written to, not one that
+    /// was never written. An empty byte array is short bytes, so it equals
+    /// neither. A long byte array equals stored bytes with the same length
+    /// and format tag, and then the same contents, which are read in
+    /// chunks rather than all at once. Bytes stored as a long byte array
+    /// (as [`WriteCursor::writer`] does) don't equal short data, even with
+    /// the same contents, because writing it would store it differently.
+    pub fn equals<'d>(&self, data: impl Into<Data<'d>>) -> Result<bool> {
+        self.equals_data(&data.into())
+    }
+
+    pub(crate) fn equals_data(&self, data: &Data<'_>) -> Result<bool> {
+        let slot = self.slot()?;
+        let bytes = match (data.inline_slot(), data) {
+            (Some(inline), _) => return Ok(slot == inline),
+            (None, Data::Bytes(bytes)) => bytes,
+            (None, _) => unreachable!("only long byte arrays aren't inline"),
+        };
+        if slot.tag != Tag::Bytes || slot.full != bytes.format_tag.is_some() {
+            return Ok(false);
+        }
+        let len = bytes.value.len() as i64;
+        if self.db.read_i64_at(slot.value)? != len {
+            return Ok(false);
+        }
+        let start = slot.value + 8;
+        if let Some(format_tag) = bytes.format_tag {
+            let mut stored = [0u8; 2];
+            self.db.read_at(start + len, &mut stored)?;
+            if stored != format_tag {
+                return Ok(false);
+            }
+        }
+        let mut buf = [0u8; 4096];
+        let mut position = start;
+        for chunk in bytes.value.chunks(buf.len()) {
+            let stored = &mut buf[..chunk.len()];
+            self.db.read_at(position, stored)?;
+            if stored != chunk {
+                return Ok(false);
+            }
+            position += chunk.len() as i64;
+        }
+        Ok(true)
+    }
+
     /// The number of items in a collection, or bytes in a byte array.
     pub fn count(&self) -> Result<i64> {
         let slot = self.slot()?;
@@ -697,7 +752,7 @@ impl<'a, C: Core> WriteCursor<'a, C> {
     }
 
     // require the active transaction and a writable slot
-    fn check_writable(&self) -> Result<()> {
+    pub(crate) fn check_writable(&self) -> Result<()> {
         if let Some(transaction) = self.transaction
             && Some(transaction) != self.read.db.transaction_id()
         {
@@ -721,7 +776,7 @@ impl<'a, C: Core> WriteCursor<'a, C> {
     }
 
     // reload because an earlier write may have moved what the slot points to
-    fn reload_slot(&mut self) -> Result<()> {
+    pub(crate) fn reload_slot(&mut self) -> Result<()> {
         if self.transaction.is_some()
             && let Some(position) = self.read.slot_ptr.position
         {
@@ -808,6 +863,20 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             return self.write(data);
         }
         Ok(())
+    }
+
+    /// Writes `data` only if it differs from what the slot holds (see
+    /// [`ReadCursor::equals`]), and returns whether it wrote. If it's the
+    /// same, nothing at all is written.
+    pub fn write_if_changed<'d>(&mut self, data: impl Into<Data<'d>>) -> Result<bool> {
+        let data = data.into();
+        self.check_writable()?;
+        self.reload_slot()?;
+        if self.read.equals_data(&data)? {
+            return Ok(false);
+        }
+        self.write(data)?;
+        Ok(true)
     }
 
     /// For a cursor to a key-value pair, writable cursors to the key and

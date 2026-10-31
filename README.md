@@ -234,7 +234,47 @@ fn main() -> Result<(), AppError> {
 }
 ```
 
-The function can't return anything that borrows the moment, since an unchanged moment is discarded; read what you need into owned values. A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, so read and compare first if you rewrite values that rarely change.
+The function can't return anything that borrows the moment, since an unchanged moment is discarded; read what you need into owned values. A moment counts as unchanged when its top-level index block ends up byte-for-byte the same as the previous moment's, which is cheap to check. That's always the case if the function made no writes, but a write usually counts as a change even when it stores the value that was already there, because writes copy what they write to.
+
+### Writing only what changed
+
+To refresh values that rarely change, such as state polled on a timer, write them with `put_if_changed`. It compares first and writes nothing at all if the value is the same, so the moment stays unchanged and isn't committed. For a value in nested maps, use `put_path_if_changed` with the keys leading to it: getting a nested map with `put_map` already copies the path to it, which counts as a change, so it reads along the path first and only gets the maps for writing if the value differs. Both return whether they wrote:
+
+```rust
+use xitdb::*;
+
+fn main() -> xitdb::Result<()> {
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+    let url = "https://example.com/pr/1";
+
+    history.transact(|moment| {
+        moment.put("status", "idle")?;
+        moment.put_map("merges")?.put_map(url)?.put("question", 3u64)
+    })?;
+
+    // the same values: nothing is written, and nothing is committed
+    let (wrote, committed) = history.transact_with_status(|moment| {
+        let status = moment.put_if_changed("status", "idle")?;
+        let question = moment.put_path_if_changed(&["merges", url, "question"], 3u64)?;
+        Ok::<_, xitdb::Error>(status || question)
+    })?;
+    assert!(!wrote && !committed);
+    assert_eq!(history.count()?, 1);
+
+    // one changed value commits a moment
+    let (wrote, committed) = history.transact_with_status(|moment| {
+        let status = moment.put_if_changed("status", "idle")?;
+        let question = moment.put_path_if_changed(&["merges", url, "question"], 4u64)?;
+        Ok::<_, xitdb::Error>(status || question)
+    })?;
+    assert!(wrote && committed);
+    assert_eq!(history.count()?, 2);
+    Ok(())
+}
+```
+
+Values compare exactly, as they would be stored: the type, value and format tag must match, so `Int` 1 isn't `Uint` 1, and floats compare by their bits. A missing key always counts as changed, even when writing `Data::None`, and `Data::None` and empty bytes are different values. A `Data::Slot` equals only that exact slot. Long byte arrays compare their length and format tag first, then their contents, which are read in chunks. `WriteArrayList`, `WriteLinkedArrayList` and `WriteSortedMap` have `put_if_changed` too, `WriteCursor` has `write_if_changed`, and `ReadCursor::equals` does the comparison without writing.
 
 ## Migrations
 
