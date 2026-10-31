@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      xitdb:
+        specifier: 0.26.0
+        version: 0.26.0
+
+packages:
+
+  xitdb@0.26.0:
+    resolution: {integrity: sha512-+2M1KLKo7MS8V8Qhuh9aYe1jiQdoEflkPWG1qx5VWZSX0yloqx8kzendFqWK0WbSlx6LkB/KO+9eEZIY2tb1cA==}
+
+snapshots:
+
+  xitdb@0.26.0: {}

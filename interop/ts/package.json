@@ -1,0 +1,12 @@
+{
+  "name": "xitdb-rs-interop-ts",
+  "private": true,
+  "description": "Replicates databases between xitdb-rs and xitdb-ts (see run.sh)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "xitdb": "0.26.0"
+  }
+}
