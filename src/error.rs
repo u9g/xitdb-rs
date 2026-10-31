@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 
 /// Every error that xitdb can return.
 #[derive(Debug)]
@@ -31,12 +32,31 @@ pub enum Error {
     MaxShiftExceeded,
     InvalidBTreeNode,
     InvalidBTreeNodeKind,
+    /// [`Database::compact_file`](crate::Database::compact_file) couldn't
+    /// rename the compacted copy over the original, and then couldn't
+    /// reopen the original. The database is now the compacted copy at
+    /// `temp_path`, so don't delete that file. The original is unchanged.
+    CompactFileReopenFailed {
+        /// Where the compacted copy, which the database now uses, lives.
+        temp_path: PathBuf,
+        /// Why the rename failed.
+        rename_error: io::Error,
+        /// Why reopening the original failed.
+        reopen_error: Box<Error>,
+    },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             Error::Io(err) => return write!(f, "io error: {err}"),
+            Error::CompactFileReopenFailed { temp_path, rename_error, reopen_error } => {
+                return write!(
+                    f,
+                    "renaming the compacted file failed ({rename_error}), and reopening the original failed                      ({reopen_error}); the database is now at {}",
+                    temp_path.display()
+                );
+            }
             Error::NestedTopLevelWrite => "nested top-level writes are not allowed",
             Error::FrozenSlot => {
                 "writer points into frozen data; reacquire it from the transaction root"
@@ -72,6 +92,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(err) => Some(err),
+            Error::CompactFileReopenFailed { rename_error, .. } => Some(rename_error),
             _ => None,
         }
     }
