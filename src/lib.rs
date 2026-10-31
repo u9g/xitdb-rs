@@ -66,6 +66,7 @@ mod database;
 mod error;
 mod file_offset_map;
 mod format;
+mod map_store;
 mod hasher;
 mod history;
 mod index;

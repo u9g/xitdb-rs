@@ -37,7 +37,7 @@ pub open spec fn kept_below(f: Seq<u8>, g: Seq<u8>, limit: int) -> bool {
     limit <= f.len() ==> limit <= g.len() && g.subrange(0, limit) == f.subrange(0, limit)
 }
 
-proof fn lemma_slot_spec(f: Seq<u8>, pos: int, s: Slot)
+pub proof fn lemma_slot_spec(f: Seq<u8>, pos: int, s: Slot)
     requires
         slot_at(f, pos, s),
     ensures
@@ -47,7 +47,7 @@ proof fn lemma_slot_spec(f: Seq<u8>, pos: int, s: Slot)
     lemma_slot_encode_injective(s, t);
 }
 
-proof fn lemma_overwrite_keeps(f: Seq<u8>, pos: int, data: Seq<u8>, limit: int)
+pub proof fn lemma_overwrite_keeps(f: Seq<u8>, pos: int, data: Seq<u8>, limit: int)
     requires
         0 <= limit <= pos,
     ensures
@@ -60,7 +60,7 @@ proof fn lemma_overwrite_keeps(f: Seq<u8>, pos: int, data: Seq<u8>, limit: int)
     }
 }
 
-proof fn lemma_kept_trans(f: Seq<u8>, g: Seq<u8>, h: Seq<u8>, limit: int)
+pub proof fn lemma_kept_trans(f: Seq<u8>, g: Seq<u8>, h: Seq<u8>, limit: int)
     requires
         kept_below(f, g, limit),
         kept_below(g, h, limit),

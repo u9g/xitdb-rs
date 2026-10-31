@@ -13,6 +13,7 @@ use crate::format::*;
 use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::map_store::MapTarget;
 use crate::store::DbStore;
 
 /// A function run inside a write, with a cursor to the slot the path led to.
@@ -97,39 +98,6 @@ fn resolve_index(index: i64, size: i64) -> (r: Result<i64>)
         return Err(Error::KeyNotFound);
     }
     Ok(if index < 0 { size + index } else { index })
-}
-
-/// Nibble `offset` of the big-endian hash `h`, counting from its least
-/// significant end, or 0 past the end of the hash.
-pub open spec fn nibble(h: Seq<u8>, offset: int) -> int {
-    if offset < 0 || offset / 2 >= h.len() {
-        0
-    } else {
-        let byte = h[h.len() - 1 - offset / 2];
-        if offset % 2 == 0 {
-            (byte & 0xfu8) as int
-        } else {
-            (byte >> 4u8) as int
-        }
-    }
-}
-
-/// The nibble of the big-endian hash at `offset` nibbles from its least
-/// significant end.
-fn hash_nibble(hash: &[u8], offset: u8) -> (r: usize)
-    ensures
-        r == nibble(hash@, offset as int),
-        r < 16,
-{
-    let offset = offset as usize;
-    if offset / 2 >= hash.len() {
-        return 0;
-    }
-    let byte = hash[hash.len() - 1 - offset / 2];
-    proof {
-        assert(byte & 0xf < 16 && byte >> 4 < 16) by (bit_vector);
-    }
-    (if offset % 2 == 0 { byte & 0xf } else { byte >> 4 }) as usize
 }
 
 } // verus!
@@ -730,15 +698,6 @@ impl<C: Core> Database<C> {
         Ok(ptr < tx_start.max(frozen_at))
     }
 
-    // copies an index block to the end unless it was made in this transaction
-    fn copy_index_block_if_old(&self, ptr: i64, frozen_at: i64) -> Result<i64> {
-        if !self.is_old(ptr, frozen_at)? {
-            return Ok(ptr);
-        }
-        let mut block = [0u8; INDEX_BLOCK_SIZE];
-        self.read_at(ptr, &mut block)?;
-        self.append(&block)
-    }
 
     fn check_hash<'h>(&self, hash: &'h [u8]) -> Result<&'h [u8]> {
         if hash.len() != self.hash_size() {
@@ -1383,165 +1342,40 @@ impl<C: Core> Database<C> {
 
     // hash map
 
+    // verified in map_store.rs
     fn read_map_slot(
         &self,
         index_pos: i64,
         key_hash: &[u8],
-        key_offset: u8,
+        key_offset: usize,
         write_mode: WriteMode,
         target: HashMapGetTarget<'_>,
         frozen_at: i64,
     ) -> Result<HashMapGetResult> {
-        let max_offset = self.hash_size() * 8 / BIT_COUNT as usize;
-        if key_offset as usize > max_offset {
-            return Err(Error::KeyOffsetExceeded);
-        }
-
-        let i = hash_nibble(key_hash, key_offset);
-        let slot_pos = index_pos + (SLOT_LENGTH * i) as i64;
-        let slot = self.read_slot_at(slot_pos)?;
-        let ptr = slot.value;
-
-        // the slot pointer that the target asks for, given the entry's
-        // slot and where its kv pair is
-        let target_slot_ptr = |slot: Slot, kv_pos: i64, kv: &KeyValuePair| {
-            let key_slot_pos = kv_pos + self.hash_size() as i64;
-            let value_slot_pos = key_slot_pos + SLOT_LENGTH as i64;
-            match target {
-                HashMapGetTarget::KvPair(_) => SlotPointer::new(Some(slot_pos), slot),
-                HashMapGetTarget::Key(_) => SlotPointer::new(Some(key_slot_pos), kv.key_slot),
-                HashMapGetTarget::Value(_) => SlotPointer::new(Some(value_slot_pos), kv.value_slot),
-            }
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        let target = match target {
+            HashMapGetTarget::KvPair(_) => MapTarget::KvPair,
+            HashMapGetTarget::Key(_) => MapTarget::Key,
+            HashMapGetTarget::Value(_) => MapTarget::Value,
         };
-
-        match slot.tag {
-            Tag::None => match write_mode {
-                WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                WriteMode::ReadWrite => {
-                    // write hash and key/val slots
-                    let kv = KeyValuePair {
-                        value_slot: Slot::default(),
-                        key_slot: Slot::default(),
-                        hash: key_hash.to_vec(),
-                    };
-                    let hash_pos = self.append(&kv.to_bytes())?;
-                    // point slot to hash pos
-                    let next_slot = Slot::new(hash_pos, Tag::KvPair);
-                    self.write_slot_at(slot_pos, next_slot)?;
-                    Ok(HashMapGetResult { slot_ptr: target_slot_ptr(next_slot, hash_pos, &kv), is_empty: true })
-                }
-            },
-
-            Tag::Index => {
-                let mut next_ptr = ptr;
-                if write_mode == WriteMode::ReadWrite {
-                    next_ptr = self.copy_index_block_if_old(ptr, frozen_at)?;
-                    if next_ptr != ptr {
-                        // make slot point to the copied block
-                        self.write_slot_at(slot_pos, Slot::new(next_ptr, Tag::Index))?;
-                    }
-                }
-                self.read_map_slot(next_ptr, key_hash, key_offset + 1, write_mode, target, frozen_at)
-            }
-
-            Tag::KvPair => {
-                let mut buf = vec![0u8; key_value_pair_length(self.hash_size())];
-                self.read_at(ptr, &mut buf)?;
-                let kv = KeyValuePair::from_bytes(&buf, self.hash_size())?;
-
-                if kv.hash == key_hash {
-                    if write_mode == WriteMode::ReadWrite && self.is_old(ptr, frozen_at)? {
-                        let hash_pos = self.append(&kv.to_bytes())?;
-                        let next_slot = Slot::new(hash_pos, Tag::KvPair);
-                        self.write_slot_at(slot_pos, next_slot)?;
-                        return Ok(HashMapGetResult {
-                            slot_ptr: target_slot_ptr(next_slot, hash_pos, &kv),
-                            is_empty: false,
-                        });
-                    }
-                    return Ok(HashMapGetResult { slot_ptr: target_slot_ptr(slot, ptr, &kv), is_empty: false });
-                }
-
-                // hash collision - different keys
-                match write_mode {
-                    WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                    WriteMode::ReadWrite => {
-                        if key_offset as usize + 1 >= max_offset {
-                            return Err(Error::KeyOffsetExceeded);
-                        }
-                        let next_i = hash_nibble(&kv.hash, key_offset + 1);
-                        let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-                        self.write_slot_at(next_index_pos + (SLOT_LENGTH * next_i) as i64, slot)?;
-                        let res = self.read_map_slot(next_index_pos, key_hash, key_offset + 1, write_mode, target, frozen_at)?;
-                        self.write_slot_at(slot_pos, Slot::new(next_index_pos, Tag::Index))?;
-                        Ok(res)
-                    }
-                }
-            }
-
-            _ => Err(Error::UnexpectedTag),
-        }
+        let write = write_mode == WriteMode::ReadWrite;
+        let res = crate::map_store::read_map_slot(
+            &mut DbStore::new(self),
+            index_pos,
+            key_hash,
+            key_offset,
+            write,
+            target,
+            limit,
+            self.hash_size(),
+        )?;
+        Ok(HashMapGetResult { slot_ptr: res.slot_ptr, is_empty: res.is_empty })
     }
 
-    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: u8, frozen_at: i64) -> Result<Slot> {
-        if key_offset as usize > self.hash_size() * 8 / BIT_COUNT as usize {
-            return Err(Error::KeyOffsetExceeded);
-        }
-
-        // read block
-        let mut slot_block = self.read_index_block(index_pos)?;
-        let i = hash_nibble(key_hash, key_offset);
-        let slot_pos = index_pos + (SLOT_LENGTH * i) as i64;
-        let slot = slot_block[i];
-
-        let next_slot = match slot.tag {
-            Tag::None => return Err(Error::KeyNotFound),
-            Tag::Index => self.remove_map_slot(slot.value, key_hash, key_offset + 1, frozen_at)?,
-            Tag::KvPair => {
-                let mut buf = vec![0u8; key_value_pair_length(self.hash_size())];
-                self.read_at(slot.value, &mut buf)?;
-                let kv = KeyValuePair::from_bytes(&buf, self.hash_size())?;
-                if kv.hash != key_hash {
-                    return Err(Error::KeyNotFound);
-                }
-                Slot::default()
-            }
-            _ => return Err(Error::UnexpectedTag),
-        };
-
-        // if we're the root node, just write the new slot and finish
-        if key_offset == 0 {
-            self.write_slot_at(slot_pos, next_slot)?;
-            return Ok(Slot::new(index_pos, Tag::Index));
-        }
-
-        // get slot to return if there is only one used slot in this index block
-        slot_block[i] = next_slot;
-        let mut slot_to_return = Some(Slot::default());
-        for block_slot in slot_block {
-            if block_slot.tag == Tag::None {
-                continue;
-            }
-            if let Some(existing) = slot_to_return
-                && existing.tag != Tag::None
-            {
-                slot_to_return = None;
-                break;
-            }
-            slot_to_return = Some(block_slot);
-        }
-        if let Some(slot_to_return) = slot_to_return
-            && matches!(slot_to_return.tag, Tag::None | Tag::KvPair)
-        {
-            return Ok(slot_to_return);
-        }
-
-        // there was more than one used slot, or a single INDEX slot,
-        // so we must keep this index block. update the slot in it,
-        // copying the block first unless it belongs to this transaction.
-        let next_index_pos = self.copy_index_block_if_old(index_pos, frozen_at)?;
-        self.write_slot_at(next_index_pos + (SLOT_LENGTH * i) as i64, next_slot)?;
-        Ok(Slot::new(next_index_pos, Tag::Index))
+    // verified in map_store.rs
+    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: usize, frozen_at: i64) -> Result<Slot> {
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::map_store::remove_map_slot(&mut DbStore::new(self), index_pos, key_hash, key_offset, limit, self.hash_size())
     }
 
     // array list
