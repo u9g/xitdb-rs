@@ -76,6 +76,7 @@ mod hasher;
 mod history;
 mod index;
 mod migrate;
+mod iter_store;
 mod path;
 mod record;
 #[cfg(feature = "serde")]

@@ -292,12 +292,6 @@ impl<C: Core> Database<C> {
         Slot::from_bytes(&buf)
     }
 
-    pub(crate) fn read_index_block(&self, pos: i64) -> Result<[Slot; SLOT_COUNT]> {
-        let mut buf = [0u8; INDEX_BLOCK_SIZE];
-        self.read_at(pos, &mut buf)?;
-        decode_slots(&buf)
-    }
-
     pub(crate) fn read_array_list_header(&self, pos: i64) -> Result<ArrayListHeader> {
         let mut buf = [0u8; ARRAY_LIST_HEADER_LENGTH];
         self.read_at(pos, &mut buf)?;

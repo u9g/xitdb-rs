@@ -7,8 +7,9 @@ use crate::database::{ContextFn, Database, is_root};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode};
+use crate::iter_store::{self, IterKind, IterLevel, IterState};
 use crate::store::DbStore;
-use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::slot::{Slot, SlotPointer, Tag};
 use crate::sorted::short_bytes_value;
 
 /// A read-only pointer to a slot in the database.
@@ -343,107 +344,24 @@ impl<C: Core> io::Seek for CursorReader<'_, C> {
     }
 }
 
-// CursorIterator - stack-based tree traversal
-
-#[derive(Clone, Copy)]
-struct IterLevel {
-    position: i64,
-    block: [Slot; SLOT_COUNT],
-    index: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IterKind {
-    Empty,
-    // a fixed number of items in an array list or b-tree
-    Counted,
-    // hash maps and sets, which are walked until the stack is empty
-    Map,
-}
+// CursorIterator - stack-based tree traversal, verified in iter_store.rs
 
 /// Iterates over the items of a collection, yielding read-only cursors.
 pub struct CursorIterator<'a, C: Core> {
     db: &'a Database<C>,
-    kind: IterKind,
-    size: i64,
-    index: i64,
-    stack: Vec<IterLevel>,
-    // skips a b-tree node's kind+num header, or 0 for the radix trie
-    node_offset: i64,
-    // for array lists, the stack depth of the leaf blocks. every slot in them
-    // is an item, even an empty one, so they are counted even when empty.
-    // otherwise, empty slots past the end of a list that was sliced and then
-    // appended to without being written would be followed by stale items.
-    leaf_depth: Option<usize>,
-    done: bool,
-}
-
-/// Resolves a possibly-negative start index against `size` to a 0-based
-/// rank. Negatives count from the end (-1 is the last entry); anything out
-/// of range returns `None` (yield nothing).
-fn resolve_start_index(index: i64, size: i64) -> Option<i64> {
-    let resolved = if index < 0 { index + size } else { index };
-    (0..size).contains(&resolved).then_some(resolved)
+    state: IterState,
 }
 
 impl<'a, C: Core> CursorIterator<'a, C> {
     fn empty(db: &'a Database<C>) -> CursorIterator<'a, C> {
-        CursorIterator {
-            db,
-            kind: IterKind::Empty,
-            size: 0,
-            index: 0,
-            stack: Vec::new(),
-            node_offset: 0,
-            leaf_depth: None,
-            done: true,
-        }
-    }
-
-    fn level(&self, position: i64) -> Result<IterLevel> {
-        Ok(IterLevel { position, block: self.db.read_index_block(position)?, index: 0 })
+        CursorIterator { db, state: iter_store::empty_state() }
     }
 
     pub(crate) fn new(cursor: &ReadCursor<'a, C>) -> Result<CursorIterator<'a, C>> {
         let cursor = cursor.resolved_cursor()?;
         let db = cursor.db;
-        let slot = cursor.slot_ptr.slot;
-        let mut it = CursorIterator::empty(db);
-        match slot.tag {
-            Tag::None => {}
-            Tag::ArrayList => {
-                let header = db.read_array_list_header(slot.value)?;
-                it.kind = IterKind::Counted;
-                it.size = header.size;
-                it.stack = vec![it.level(header.ptr)?];
-                it.leaf_depth = Some(array_list_shift(header.size - 1) as usize + 1);
-            }
-            Tag::LinkedArrayList | Tag::SortedMap | Tag::SortedSet => {
-                // backed by a b-tree: read the header, then walk from the root
-                // node's value/child slots (skipping its kind+num header)
-                let header = db.read_btree_header(slot.value)?;
-                it.kind = IterKind::Counted;
-                it.size = header.size;
-                it.node_offset = BTREE_NODE_HEADER_SIZE as i64;
-                it.stack = vec![it.level(header.root_ptr + BTREE_NODE_HEADER_SIZE as i64)?];
-            }
-            Tag::HashMap | Tag::HashSet => {
-                it.kind = IterKind::Map;
-                it.stack = vec![it.level(slot.value)?];
-            }
-            Tag::CountedHashMap | Tag::CountedHashSet => {
-                it.kind = IterKind::Map;
-                it.stack = vec![it.level(slot.value + 8)?];
-            }
-            _ => return Err(Error::UnexpectedTag),
-        }
-        it.done = it.kind == IterKind::Empty;
-        Ok(it)
-    }
-
-    // starts a counted iterator at `index` with a stack from a seek
-    fn seeked(db: &'a Database<C>, size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> Self {
-        CursorIterator { db, kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false }
+        let state = iter_store::new_state(&mut DbStore::new(db), cursor.slot_ptr.slot)?;
+        Ok(CursorIterator { db, state })
     }
 
     /// An array list iterator that starts at `start_index`, descending the
@@ -459,30 +377,14 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             _ => return Err(Error::UnexpectedTag),
         }
         let header = db.read_array_list_header(slot.value)?;
-        let Some(idx) = resolve_start_index(start_index, header.size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, header.size) else {
             return Ok(CursorIterator::empty(db));
         };
-        let mut shift = array_list_shift(header.size - 1);
-        // descend the radix trie, pushing one level per tier with its index
-        // set to that tier's child slot
-        let mut stack = Vec::new();
-        let mut pos = header.ptr;
-        loop {
-            let block = db.read_index_block(pos)?;
-            let i = ((idx >> (shift as u32 * BIT_COUNT)) & MASK) as usize;
-            stack.push(IterLevel { position: pos, block, index: i });
-            if shift == 0 {
-                break;
-            }
-            // every tier above the leaf is a populated index slot for any
-            // index < size, so this child always exists
-            pos = block[i].value;
-            shift -= 1;
-        }
+        let stack = iter_store::array_list_seek(&mut DbStore::new(db), header, idx)?;
         let leaf_depth = stack.len();
-        let mut it = CursorIterator::seeked(db, header.size, idx, 0, stack);
-        it.leaf_depth = Some(leaf_depth);
-        Ok(it)
+        let mut state = iter_store::seeked_state(header.size, idx, 0, stack);
+        state.leaf_depth = Some(leaf_depth);
+        Ok(CursorIterator { db, state })
     }
 
     /// A linked array list iterator that starts at `start_index`.
@@ -496,28 +398,12 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             _ => return Err(Error::UnexpectedTag),
         }
         let header = db.read_btree_header(slot.value)?;
-        let Some(idx) = resolve_start_index(start_index, header.size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, header.size) else {
             return Ok(CursorIterator::empty(db));
         };
-        let mut stack = Vec::new();
-        let mut node_ptr = header.root_ptr;
-        let mut rem = idx;
-        loop {
-            let node = db.read_btree_node(node_ptr)?;
-            let position = node_ptr + BTREE_NODE_HEADER_SIZE as i64;
-            if node.kind == BTreeNodeKind::Leaf {
-                stack.push(IterLevel { position, block: node.values, index: check_rank(rem, node.num, false)? });
-                break;
-            }
-            let mut i = 0;
-            while i + 1 < node.num && rem >= node.counts[i] {
-                rem -= node.counts[i];
-                i += 1;
-            }
-            stack.push(IterLevel { position, block: node.children, index: i });
-            node_ptr = node.children[i].value;
-        }
-        Ok(CursorIterator::seeked(db, header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack))
+        let stack = iter_store::linked_array_list_seek(&mut DbStore::new(db), header, idx)?;
+        let state = iter_store::seeked_state(header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack);
+        Ok(CursorIterator { db, state })
     }
 
     fn sorted_root(cursor: &ReadCursor<'a, C>) -> Result<Option<(i64, i64)>> {
@@ -533,7 +419,9 @@ impl<'a, C: Core> CursorIterator<'a, C> {
     }
 
     fn levels(path: crate::sorted::NodePath) -> Vec<IterLevel> {
-        path.into_iter().map(|(position, block, index)| IterLevel { position, block, index }).collect()
+        path.into_iter()
+            .map(|(position, block, index)| IterLevel { position, block, index: index.min(SLOT_COUNT) })
+            .collect()
     }
 
     /// A sorted map iterator that starts at the entry with rank
@@ -545,11 +433,12 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             // an unwritten map is none (like iter()): yield nothing
             return Ok(CursorIterator::empty(db));
         };
-        let Some(idx) = resolve_start_index(start_index, size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, size) else {
             return Ok(CursorIterator::empty(db));
         };
         let stack = Self::levels(db.sorted_path_from_index(root_ptr, idx)?);
-        Ok(CursorIterator::seeked(db, size, idx, BTREE_NODE_HEADER_SIZE as i64, stack))
+        let state = iter_store::seeked_state(size, idx, BTREE_NODE_HEADER_SIZE as i64, stack);
+        Ok(CursorIterator { db, state })
     }
 
     /// A sorted map iterator that starts at the first entry with a key >=
@@ -561,38 +450,8 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             return Ok(CursorIterator::empty(db));
         };
         let (path, before) = db.sorted_path_from_key(root_ptr, start_key)?;
-        Ok(CursorIterator::seeked(db, size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path)))
-    }
-
-    // the next slot, or None once the stack is exhausted. empty slots are
-    // skipped, except in array list leaf blocks.
-    fn next_internal(&mut self) -> Result<Option<SlotPointer>> {
-        while let Some(level) = self.stack.last_mut() {
-            if level.index >= level.block.len() {
-                self.stack.pop();
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.index += 1;
-                }
-                continue;
-            }
-
-            let next_slot = level.block[level.index];
-            if next_slot.tag == Tag::Index {
-                // node_offset skips a b-tree node's kind+num header
-                let next_pos = next_slot.value + self.node_offset;
-                let level = self.level(next_pos)?;
-                self.stack.push(level);
-                continue;
-            }
-
-            level.index += 1;
-            if !next_slot.is_empty() || self.leaf_depth == Some(self.stack.len()) {
-                let level = self.stack.last().expect("checked above");
-                let position = level.position + ((level.index - 1) * SLOT_LENGTH) as i64;
-                return Ok(Some(SlotPointer::new(Some(position), next_slot)));
-            }
-        }
-        Ok(None)
+        let state = iter_store::seeked_state(size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path));
+        Ok(CursorIterator { db, state })
     }
 }
 
@@ -600,27 +459,27 @@ impl<'a, C: Core> Iterator for CursorIterator<'a, C> {
     type Item = Result<ReadCursor<'a, C>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.state.done {
             return None;
         }
         loop {
-            if self.kind == IterKind::Counted {
-                if self.index >= self.size {
-                    self.done = true;
+            if self.state.kind == IterKind::Counted {
+                if self.state.index >= self.state.size {
+                    self.state.done = true;
                     return None;
                 }
-                self.index += 1;
+                self.state.index += 1;
             }
-            match self.next_internal() {
+            match iter_store::next_internal(&mut DbStore::new(self.db), &mut self.state) {
                 Err(err) => {
-                    self.done = true;
+                    self.state.done = true;
                     return Some(Err(err));
                 }
                 // an empty array list item counts toward the size, but has no value
                 Ok(Some(slot_ptr)) if slot_ptr.slot.is_empty() => {}
                 Ok(Some(slot_ptr)) => return Some(Ok(ReadCursor::new(slot_ptr, self.db))),
                 Ok(None) => {
-                    self.done = true;
+                    self.state.done = true;
                     return None;
                 }
             }

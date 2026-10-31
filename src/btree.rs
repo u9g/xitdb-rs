@@ -298,11 +298,6 @@ pub(crate) fn branch(children: &[Slot], counts: &[i64]) -> (r: BTreeNode)
 } // verus!
 
 impl<C: Core> Database<C> {
-    // verified in btree_io.rs
-    pub(crate) fn read_btree_node(&self, ptr: i64) -> Result<BTreeNode> {
-        crate::btree_io::read_btree_node(&mut DbStore::new(self), ptr)
-    }
-
 
 
     // descend to the value slot at the given rank (0-based), returning a
