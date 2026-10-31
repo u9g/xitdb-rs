@@ -94,7 +94,7 @@ pub use crate::history::History;
 pub use crate::index::{Index, IndexedMap, MapIndex};
 pub use crate::migrate::{LAYOUT_VERSION_KEY, Migrated, Migration, Migrations};
 pub use crate::path::{HashMapGetTarget, PathPart, SortedMapGetTarget, WriteMode};
-pub use crate::record::Record;
+pub use crate::record::{LazyMap, Record};
 pub use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 pub use crate::typed::{KeyCodec, Map, MapIter, Set, SetIter, ValueCodec};
 #[cfg(feature = "serde")]
@@ -105,7 +105,10 @@ pub use xitdb_derive::Record;
 /// What `#[derive(Record)]` generates calls these. Not public API.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::record::{missing_field, read_field, read_record, remove_field, write_field, write_record};
+    pub use crate::record::{
+        field_changed, missing_field, read_field, read_record, write_changed_field, write_field, write_record,
+        write_record_changed,
+    };
 }
 
 /// Constants describing the file format.

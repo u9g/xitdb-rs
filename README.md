@@ -788,13 +788,14 @@ fn main() -> xitdb::Result<()> {
 
 A struct that's stored as a nested map of its fields, like the merges in the [Accessors](#accessors) example, otherwise needs its field names repeated wherever it's read and written. With the `derive` feature, `#[derive(Record)]` makes the struct a `ValueCodec` that does it, so a `Map` can store it:
 
-* Each field is stored under its name, or `#[xitdb(rename = "...")]`, with its type as its codec: `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` or another record. `#[xitdb(codec = Json<T>)]` picks another codec.
+* Each field is stored under its name, or `#[xitdb(rename = "...")]`, with its type as its codec: `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool`, an `Option` of one, or another record. `#[xitdb(codec = Json<T>)]` picks another codec (`Option<Json<T>>` for an `Option<T>` field).
 * A missing field reads as `Default::default()`, so adding a field needs no migration. With `#[xitdb(required)]`, it's an error instead.
-* An `Option` field that's `None` is missing from the map, rather than stored as an empty value; writing `None` removes it.
+* An `Option` field that's `None` is missing from the map, rather than stored as an empty value; writing `None` removes it. The codec decides this (`ValueCodec::is_missing`), not how the type is spelled, so a type alias of an `Option` works the same.
 * Keys in the map that aren't fields, such as ones written by newer code, are ignored when reading and kept when writing, by `put` too: the stored map is changed in place, not replaced.
 * A field that doesn't decode is an `Error::Decode` that names it, along with the collection and the key.
+* If `xitdb` isn't at `::xitdb`, such as when it's re-exported, give its path with `#[xitdb(crate = "path")]` on the struct.
 
-`Map::update` reads a record, applies a function to a copy, and writes only the fields whose values changed (compared with `PartialEq`). If none did, it writes nothing, so the transaction isn't committed; there's no need to compare first. A missing key is left missing, and `update` returns `None`; `Map::upsert` starts from the default record instead. The derive supports structs with named fields and no generics, and needs every field to implement `PartialEq`.
+`Map::update` reads a record, applies a function to a copy, and writes only the fields whose values changed: compared with `PartialEq`, except that floats are compared by their bits, so `-0.0` is a change from `0.0` and a NaN isn't a change from the same NaN. Only the changed fields of a nested record are written. If no field changed, it writes nothing at all, not even the collection, so the transaction isn't committed; there's no need to compare first. For a collection in a nested map, `Map::update_at` takes the path to it and only opens the maps along it if a field changed, since getting the nested map with `put_map` first would already copy the path. A missing key is left missing, and `update` returns `None`; `Map::upsert` starts from the default record instead. The derive supports structs with named fields and no generics, and needs every field to implement `PartialEq`.
 
 ```rust
 #[cfg(feature = "derive")]

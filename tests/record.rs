@@ -292,8 +292,9 @@ fn records_nest() {
     assert_eq!(merge_map.get_int("started-at").unwrap(), Some(1700000000));
     assert!(stored.get_slot("previous").unwrap().is_none());
 
-    // a changed nested record is rewritten in place, keeping its unknown
-    // keys
+    // a changed nested record is changed in place, keeping its unknown
+    // keys, and only its changed fields are written
+    let title = merge_map.get_slot("title").unwrap();
     history
         .transact(|moment| {
             MOMENTS.collection_mut(moment)?.put_map(1u64.to_be_bytes())?.put_map("merge")?.put("x", 1u64)
@@ -313,7 +314,10 @@ fn records_nest() {
     let stored = moment.get_map("moments").unwrap().unwrap().get_map(1u64.to_be_bytes()).unwrap().unwrap();
     let merge_map = stored.get_map("merge").unwrap().unwrap();
     assert_eq!((merge_map.get_uint("question").unwrap(), merge_map.get_uint("x").unwrap()), (Some(0), Some(1)));
-    assert!(stored.get_map("previous").unwrap().is_some());
+    assert_eq!(merge_map.get_slot("title").unwrap(), title);
+    // a nested record that was missing is written whole, defaults included
+    let previous = stored.get_map("previous").unwrap().unwrap();
+    assert_eq!(previous.get_string("title", MAX_READ).unwrap().as_deref(), Some(""));
 }
 
 #[test]
@@ -383,7 +387,7 @@ mod json {
     struct Job {
         #[xitdb(codec = Json<Progress>)]
         progress: Progress,
-        #[xitdb(codec = Json<Vec<String>>, rename = "log")]
+        #[xitdb(codec = Option<Json<Vec<String>>>, rename = "log")]
         lines: Option<Vec<String>>,
     }
 
@@ -413,4 +417,166 @@ mod json {
         assert_eq!(err.field.as_deref(), Some("log"));
         assert!(err.message.starts_with("invalid json"), "{}", err.message);
     }
+}
+
+#[test]
+fn floats_change_by_their_bits() {
+    #[derive(Record, Debug, Clone, PartialEq, Default)]
+    struct Reading {
+        value: f64,
+    }
+    const READINGS: Map<str, Reading> = Map::new("readings");
+
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| READINGS.put(moment, "a", &Reading { value: 0.0 })).unwrap();
+
+    // -0.0 == 0.0, but it's stored differently, so it's written
+    let (_, committed) =
+        history.transact_with_status(|moment| READINGS.update(moment, "a", |r| r.value = -0.0)).unwrap();
+    assert!(committed);
+    let value = READINGS.get(&history.latest().unwrap(), "a").unwrap().unwrap().value;
+    assert!(value == 0.0 && value.is_sign_negative());
+
+    // NaN != NaN, but the same NaN is stored the same, so it isn't
+    history.transact(|moment| READINGS.update(moment, "a", |r| r.value = f64::NAN)).unwrap();
+    let (_, committed) =
+        history.transact_with_status(|moment| READINGS.update(moment, "a", |r| r.value = f64::NAN)).unwrap();
+    assert!(!committed);
+    assert!(READINGS.get(&history.latest().unwrap(), "a").unwrap().unwrap().value.is_nan());
+}
+
+/// An `Option` by another name is still a missing field when it's `None`.
+type Thread = Option<String>;
+
+#[derive(Record, Debug, Clone, PartialEq, Default)]
+struct Aliased {
+    thread: Thread,
+}
+
+#[test]
+fn option_aliases_are_missing_fields_when_none() {
+    const ALIASED: Map<str, Aliased> = Map::new("aliased");
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.transact(|moment| ALIASED.put(moment, "a", &Aliased { thread: Some("t".into()) })).unwrap();
+    history.transact(|moment| ALIASED.update(moment, "a", |a| a.thread = None)).unwrap();
+    history.transact(|moment| ALIASED.put(moment, "b", &Aliased { thread: None })).unwrap();
+    let moment = history.latest().unwrap();
+    let aliased = moment.get_map("aliased").unwrap().unwrap();
+    for key in ["a", "b"] {
+        let map = aliased.get_map(key).unwrap().unwrap();
+        // missing, not an empty value
+        assert!(map.get_slot("thread").unwrap().is_none(), "{key}");
+        assert_eq!(ALIASED.get(&moment, key).unwrap(), Some(Aliased { thread: None }));
+    }
+}
+
+/// Names that the generated code mustn't collide with: a type named like
+/// a generic, and constants named like its variables.
+#[allow(non_upper_case_globals, dead_code)]
+mod collisions {
+    use xitdb::*;
+
+    pub type C = String;
+    pub type F = u64;
+    const map: u8 = 0;
+    const old: u8 = 0;
+    const value: u8 = 0;
+    const cursor: u8 = 0;
+    const changed: u8 = 0;
+
+    #[derive(Record, Debug, Clone, PartialEq, Default)]
+    pub struct Named {
+        pub r#type: C,
+        pub count: F,
+    }
+}
+
+#[test]
+fn raw_identifiers_and_colliding_names() {
+    use collisions::Named;
+    const NAMED: Map<str, Named> = Map::new("named");
+    assert_eq!(<Named as Record>::FIELDS, ["type", "count"]);
+
+    let named = Named { r#type: "kind".into(), count: 2 };
+    let db = with_moment(|moment| NAMED.put(moment, "a", &named));
+    let moment = latest(&db);
+    let map = moment.get_map("named").unwrap().unwrap().get_map("a").unwrap().unwrap();
+    assert_eq!(map.get_string("type", MAX_READ).unwrap().as_deref(), Some("kind"));
+    assert!(map.get_slot("r#type").unwrap().is_none());
+    assert_eq!(NAMED.get(&moment, "a").unwrap(), Some(named));
+}
+
+/// xitdb, re-exported, as a crate that wraps it would.
+mod reexport {
+    pub use xitdb as db;
+}
+
+#[derive(reexport::db::Record, Debug, Clone, PartialEq, Default)]
+#[xitdb(crate = "crate::reexport::db")]
+struct Reexported {
+    name: String,
+}
+
+#[test]
+fn the_crate_path_can_be_given() {
+    const REEXPORTED: Map<str, Reexported> = Map::new("reexported");
+    let value = Reexported { name: "n".into() };
+    let db = with_moment(|moment| REEXPORTED.put(moment, "a", &value));
+    assert_eq!(REEXPORTED.get(&latest(&db), "a").unwrap(), Some(value));
+}
+
+#[test]
+fn write_changed_fields_opens_the_map_only_for_a_change() {
+    let db = with_moment(|moment| MERGES.put(moment, URL, &merge()));
+    let history = History::new(&db).unwrap();
+    let (opened, committed) = history
+        .transact_with_status(|moment| {
+            let old = MERGES.get(moment, URL)?.unwrap();
+            let mut map = LazyMap::new(|| -> Result<WriteHashMap<'_, CoreMemory>> { panic!("nothing changed") });
+            let wrote = old.clone().write_changed_fields(&old, &mut map)?;
+            Ok::<_, Error>(wrote || map.is_open())
+        })
+        .unwrap();
+    assert!(!opened && !committed);
+}
+
+#[test]
+fn update_at_writes_nothing_along_the_path_if_nothing_changed() {
+    let path = ["rooms", "lobby"];
+    let db = with_moment(|moment| {
+        let mut lobby = moment.put_map("rooms")?.put_map("lobby")?;
+        MERGES.put(&mut lobby, URL, &merge())
+    });
+    let history = History::new(&db).unwrap();
+
+    let (updated, committed) = history
+        .transact_with_status(|moment| MERGES.update_at(moment, &path, URL, |merge| merge.question = true))
+        .unwrap();
+    assert_eq!(updated, Some(merge()));
+    assert!(!committed);
+
+    // getting the parent with put_map copies the path, so that commits
+    let (_, committed) = history
+        .transact_with_status(|moment| {
+            let mut lobby = moment.put_map("rooms")?.put_map("lobby")?;
+            MERGES.update(&mut lobby, URL, |merge| merge.question = true)
+        })
+        .unwrap();
+    assert!(committed);
+
+    let (updated, committed) = history
+        .transact_with_status(|moment| MERGES.update_at(moment, &path, URL, |merge| merge.question = false))
+        .unwrap();
+    assert!(committed);
+    let lobby = history.latest().unwrap().get_map("rooms").unwrap().unwrap().get_map("lobby").unwrap().unwrap();
+    assert_eq!(MERGES.get(&lobby, URL).unwrap(), updated);
+    assert!(!updated.unwrap().question);
+
+    // a missing map along the path is a missing key
+    let (updated, committed) = history
+        .transact_with_status(|moment| MERGES.update_at(moment, &["rooms", "hall"], URL, |_| unreachable!()))
+        .unwrap();
+    assert!(updated.is_none() && !committed);
 }
