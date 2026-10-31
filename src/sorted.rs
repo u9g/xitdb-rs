@@ -88,7 +88,7 @@ impl<C: Core> Database<C> {
                 let counts_offset = SLOT_LENGTH * 2 * BTREE_SLOT_COUNT;
                 node.children = decode_slots(&body)?;
                 node.separators = decode_slots(&body[separators_offset..])?;
-                node.counts = decode_counts(&body[counts_offset..]);
+                node.counts = decode_counts(&body[counts_offset..])?;
             }
         }
         Ok(node)

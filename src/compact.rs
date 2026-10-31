@@ -380,7 +380,7 @@ impl<S: Core, T: Core> Compactor<'_, '_, '_, S, T> {
         } else {
             None
         };
-        let counts = decode_counts(&body[SLOT_LENGTH * slot_blocks * BTREE_SLOT_COUNT..]);
+        let counts = decode_counts(&body[SLOT_LENGTH * slot_blocks * BTREE_SLOT_COUNT..])?;
 
         let mut buf = Vec::with_capacity(BTREE_NODE_HEADER_SIZE + body.len());
         buf.extend_from_slice(&[BTreeNodeKind::Branch as u8, num]);

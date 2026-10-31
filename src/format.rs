@@ -830,12 +830,14 @@ pub(crate) fn decode_slots(buf: &[u8]) -> (r: Result<[Slot; SLOT_COUNT]>)
     Ok(slots)
 }
 
-/// Decodes 16 counts.
-pub(crate) fn decode_counts(buf: &[u8]) -> (r: [i64; SLOT_COUNT])
+/// Decodes 16 counts. A negative count can only come from a corrupt file,
+/// and is rejected as `Error::InvalidBTreeNode`.
+pub(crate) fn decode_counts(buf: &[u8]) -> (r: Result<[i64; SLOT_COUNT]>)
     requires
         buf@.len() >= 8 * SLOT_COUNT,
     ensures
-        forall|i: int| 0 <= i < SLOT_COUNT ==> #[trigger] r[i] == u2i(be_u64_spec(buf@.subrange(i * 8, i * 8 + 8))),
+        r matches Ok(counts) ==> forall|i: int| 0 <= i < SLOT_COUNT ==> #[trigger] counts[i] == u2i(be_u64_spec(buf@.subrange(i * 8, i * 8 + 8))) && counts[i] >= 0,
+        r is Err ==> exists|i: int| 0 <= i < SLOT_COUNT && #[trigger] u2i(be_u64_spec(buf@.subrange(i * 8, i * 8 + 8))) < 0,
 {
     let mut counts = [0i64; SLOT_COUNT];
     let mut i: usize = 0;
@@ -843,17 +845,20 @@ pub(crate) fn decode_counts(buf: &[u8]) -> (r: [i64; SLOT_COUNT])
         invariant
             i <= SLOT_COUNT,
             buf@.len() >= 8 * SLOT_COUNT,
-            forall|j: int| 0 <= j < i ==> #[trigger] counts[j] == u2i(be_u64_spec(buf@.subrange(j * 8, j * 8 + 8))),
+            forall|j: int| 0 <= j < i ==> #[trigger] counts[j] == u2i(be_u64_spec(buf@.subrange(j * 8, j * 8 + 8))) && counts[j] >= 0,
         decreases SLOT_COUNT - i,
     {
         let c = read_i64(slice_subrange(buf, i * 8, i * 8 + 8));
         proof {
             assert(buf@.subrange(i * 8, i * 8 + 8).subrange(0, 8) =~= buf@.subrange(i * 8, i * 8 + 8));
         }
+        if c < 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
         counts[i] = c;
         i += 1;
     }
-    counts
+    Ok(counts)
 }
 
 pub(crate) fn encode_slots(buf: &mut Vec<u8>, slots: &[Slot])

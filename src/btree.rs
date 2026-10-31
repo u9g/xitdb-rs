@@ -106,7 +106,7 @@ impl<C: Core> Database<C> {
                 let mut body = [0u8; (SLOT_LENGTH + 8) * BTREE_SLOT_COUNT];
                 self.read_bytes(&mut body)?;
                 node.children = decode_slots(&body)?;
-                node.counts = decode_counts(&body[SLOT_LENGTH * BTREE_SLOT_COUNT..]);
+                node.counts = decode_counts(&body[SLOT_LENGTH * BTREE_SLOT_COUNT..])?;
             }
         }
         Ok(node)
