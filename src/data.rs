@@ -63,10 +63,9 @@ impl<'a> Data<'a> {
         Data::Bytes(Bytes::tagged(value.as_bytes(), format_tag))
     }
 
-    /// The slot that writing this stores, or `None` for a byte array too
-    /// long to fit in one, which is stored elsewhere. An empty slot is
-    /// marked as written, so it isn't treated as empty.
-    pub(crate) fn inline_slot(&self) -> Option<Slot> {
+    /// How writing this stores it. An empty slot is marked as written, so
+    /// it isn't treated as empty.
+    pub(crate) fn encode(&self) -> Encoded<'_, 'a> {
         let slot = match self {
             Data::None => Slot::default(),
             Data::Slot(slot) => *slot,
@@ -81,10 +80,18 @@ impl<'a> Data<'a> {
                 }
                 Slot::new(i64::from_be_bytes(buf), Tag::ShortBytes).with_full(bytes.format_tag.is_some())
             }
-            Data::Bytes(_) => return None,
+            Data::Bytes(bytes) => return Encoded::Long(bytes),
         };
-        Some(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
+        Encoded::Inline(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
     }
+}
+
+/// How [`Data`] is stored, as [`Data::encode`] returns it.
+pub(crate) enum Encoded<'s, 'a> {
+    /// In the slot itself.
+    Inline(Slot),
+    /// A byte array too long for a slot, which is stored elsewhere.
+    Long(&'s Bytes<'a>),
 }
 
 impl From<Slot> for Data<'_> {

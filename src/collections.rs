@@ -7,7 +7,7 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::core::Core;
-use crate::cursor::{CursorIterator, ReadCursor, ReadKvPairCursor, WriteCursor};
+use crate::cursor::{CursorIterator, KeyedPart, ReadCursor, ReadKvPairCursor, WriteCursor};
 use crate::data::{Bytes, Data};
 use crate::error::{Error, Result};
 use crate::path::{HashMapGetTarget, PathPart, SortedMapGetTarget};
@@ -66,15 +66,6 @@ fn removed(result: Result<WriteCursor<'_, impl Core>>) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(Error::KeyNotFound) => Ok(false),
         Err(err) => Err(err),
-    }
-}
-
-/// Whether a value read before a write is the same as `data`, so the write
-/// can be skipped. A value that's missing, or was never written, isn't.
-fn unchanged<C: Core>(value: Option<ReadCursor<'_, C>>, data: &Data<'_>) -> Result<bool> {
-    match value {
-        Some(value) => value.equals_data(data),
-        None => Ok(false),
     }
 }
 
@@ -209,19 +200,12 @@ impl<'a, C: Core> WriteArrayList<'a, C> {
     }
 
     /// Like [`WriteArrayList::put`], but only if `data` differs from the
-    /// item at `index` (see [`ReadCursor::equals`]). Returns whether it
-    /// wrote. If it's the same, nothing at all is written, not even a copy
-    /// of the list's blocks. An index out of range is still an
-    /// [`Error::KeyNotFound`].
+    /// item at `index` (see [`WriteCursor::write_path_if_changed`]).
+    /// Returns whether it wrote. If it's the same, nothing at all is
+    /// written, not even a copy of the list's blocks. An index out of range
+    /// is still an [`Error::KeyNotFound`].
     pub fn put_if_changed<'d>(&mut self, index: i64, data: impl Into<Data<'d>>) -> Result<bool> {
-        let data = data.into();
-        self.cursor.check_writable()?;
-        self.cursor.reload_slot()?;
-        if unchanged(self.get_cursor(index)?, &data)? {
-            return Ok(false);
-        }
-        self.put(index, data)?;
-        Ok(true)
+        self.cursor.write_path_if_changed(&[PathPart::ArrayListGet(index)], data)
     }
 
     pub fn append<'d>(&mut self, data: impl Into<Data<'d>>) -> Result<()> {
@@ -399,14 +383,7 @@ impl<'a, C: Core> WriteLinkedArrayList<'a, C> {
 
     /// Like [`WriteArrayList::put_if_changed`], for a linked array list.
     pub fn put_if_changed<'d>(&mut self, index: i64, data: impl Into<Data<'d>>) -> Result<bool> {
-        let data = data.into();
-        self.cursor.check_writable()?;
-        self.cursor.reload_slot()?;
-        if unchanged(self.get_cursor(index)?, &data)? {
-            return Ok(false);
-        }
-        self.put(index, data)?;
-        Ok(true)
+        self.cursor.write_path_if_changed(&[PathPart::LinkedArrayListGet(index)], data)
     }
 
     pub fn append<'d>(&mut self, data: impl Into<Data<'d>>) -> Result<()> {
@@ -485,14 +462,6 @@ impl<'a, C: Core> ReadHashMap<'a, C> {
 
     pub(crate) fn hash(&self, key: impl AsRef<[u8]>) -> Vec<u8> {
         self.cursor.db.digest(key.as_ref())
-    }
-
-    // the value at `hash`, or `None` if it isn't in the map or its key was
-    // never written. a put would write the key then, so the value doesn't
-    // count as unchanged.
-    fn stored_value(&self, hash: &[u8]) -> Result<Option<ReadCursor<'a, C>>> {
-        let kv = self.get_key_value_pair_by_hash(hash)?;
-        Ok(kv.filter(|kv| !kv.key_cursor.slot_ptr.slot.is_empty()).map(|kv| kv.value_cursor))
     }
 
     // the value of `key`, or `None` if it isn't in the map or its value is
@@ -632,78 +601,53 @@ impl<'a, C: Core> WriteHashMap<'a, C> {
     }
 
     /// Like [`WriteHashMap::put`], but only if `data` differs from the
-    /// value of `key` (see [`ReadCursor::equals`]). Returns whether it
-    /// wrote. A missing key always counts as changed, even for
+    /// value of `key` (see [`WriteCursor::write_path_if_changed`]). Returns
+    /// whether it wrote. A missing key always counts as changed, even for
     /// [`Data::None`], because writing it adds the key.
     ///
     /// If the value is the same, nothing at all is written: not even the
     /// copy of the map's blocks and the key-value pair that a write makes.
-    /// So in [`History::transact`](crate::History::transact), a moment
+    /// (On a root map outside a transaction, the comparison runs in a
+    /// transaction of its own, which is then discarded.) So in [`History::transact`](crate::History::transact), a moment
     /// whose top-level values are all put this way is only committed if one
     /// of them changed. For a value in a nested map, use
     /// [`WriteHashMap::put_path_if_changed`]: getting a nested map with
     /// [`WriteHashMap::put_map`] copies the path to it, which commits the
     /// moment even if nothing in the nested map changes.
     pub fn put_if_changed<'d>(&mut self, key: impl AsRef<[u8]>, data: impl Into<Data<'d>>) -> Result<bool> {
-        let key = key.as_ref();
-        let data = data.into();
-        self.cursor.check_writable()?;
-        self.cursor.reload_slot()?;
-        let hash = self.hash(key);
-        if unchanged(self.stored_value(&hash)?, &data)? {
-            return Ok(false);
-        }
-        self.put_key_and_value(&hash, Data::bytes(key), data)?;
-        Ok(true)
+        self.put_path_if_changed(&[key], data)
     }
 
     /// Like [`WriteHashMap::put_if_changed`], for a value in nested hash
     /// maps: the last part of `path` is the key, and the parts before it
     /// are the keys of the maps it's in, starting from this one. So
     /// `put_path_if_changed(&["merges", url, "question"], 3u64)` sets
-    /// `"question"` in the map at `url` in the map at `"merges"`.
+    /// `"question"` in the map at `url` in the map at `"merges"`. Maps along
+    /// the path that are missing or empty are created, and their keys are
+    /// stored, as [`WriteHashMap::put_map`] does. Anything else along it,
+    /// including a hash set or a counted map, is an [`Error::UnexpectedTag`],
+    /// and an empty `path` is an [`Error::KeyNotFound`]; either way nothing
+    /// is written. For a path through other collections, use
+    /// [`WriteCursor::write_path_if_changed`].
     ///
-    /// It reads along the path first, and only gets the maps along it with
-    /// [`WriteHashMap::put_map`] (which creates any that are missing) when
-    /// the value differs, so an unchanged value writes nothing at all, at
-    /// any depth. A value along the path that's neither missing, empty,
-    /// nor a hash map is an [`Error::UnexpectedTag`], and an empty `path`
-    /// is an [`Error::KeyNotFound`]; either way nothing is written.
+    /// It reads along the path first, and only writes along it when the
+    /// value differs, so an unchanged value writes nothing at all, at any
+    /// depth.
     pub fn put_path_if_changed<'d, K: AsRef<[u8]>>(&mut self, path: &[K], data: impl Into<Data<'d>>) -> Result<bool> {
-        let (key, maps) = path.split_last().ok_or(Error::KeyNotFound)?;
-        let data = data.into();
-        self.cursor.check_writable()?;
-        self.cursor.reload_slot()?;
-        if self.path_unchanged(maps, key.as_ref(), &data)? {
-            return Ok(false);
+        if path.is_empty() {
+            return Err(Error::KeyNotFound);
         }
-        let Some((first, rest)) = maps.split_first() else {
-            self.put(key, data)?;
-            return Ok(true);
-        };
-        let mut map = self.put_map(first)?;
-        for part in rest {
-            map = map.put_map(part)?;
-        }
-        map.put(key, data)?;
-        Ok(true)
-    }
-
-    // whether `key` in the map at `maps` is already `data`, read without
-    // writing. checks the maps along the path like put_map does.
-    fn path_unchanged<K: AsRef<[u8]>>(&self, maps: &[K], key: &[u8], data: &Data<'_>) -> Result<bool> {
-        let mut map = ReadHashMap { cursor: self.cursor.read_cursor() };
-        for part in maps {
-            let Some(value) = map.stored_value(&map.hash(part))? else {
-                return Ok(false);
-            };
-            match value.slot_ptr.slot.tag {
-                Tag::HashMap => map = ReadHashMap { cursor: value },
-                Tag::None => return Ok(false),
-                _ => return Err(Error::UnexpectedTag),
+        let hashes: Vec<Vec<u8>> = path.iter().map(|key| self.hash(key)).collect();
+        let init = PathPart::HashMapInit { counted: false, set: false };
+        let mut parts = Vec::with_capacity(path.len() * 2);
+        for (key, hash) in path.iter().zip(&hashes) {
+            if !parts.is_empty() {
+                parts.push(KeyedPart { part: init, key: None });
             }
+            let part = PathPart::HashMapGet(HashMapGetTarget::Value(hash));
+            parts.push(KeyedPart { part, key: Some(key.as_ref()) });
         }
-        unchanged(map.stored_value(&map.hash(key))?, data)
+        self.cursor.write_keyed_path_if_changed(&parts, &data.into())
     }
 
     /// Stores `key` and returns a cursor to its value.
@@ -1212,15 +1156,8 @@ impl<'a, C: Core> WriteSortedMap<'a, C> {
 
     /// Like [`WriteHashMap::put_if_changed`], for a sorted map.
     pub fn put_if_changed<'d>(&mut self, key: impl AsRef<[u8]>, data: impl Into<Data<'d>>) -> Result<bool> {
-        let key = key.as_ref();
-        let data = data.into();
-        self.cursor.check_writable()?;
-        self.cursor.reload_slot()?;
-        if unchanged(self.get_cursor(key)?, &data)? {
-            return Ok(false);
-        }
-        self.put(key, data)?;
-        Ok(true)
+        let target = SortedMapGetTarget::Value(key.as_ref());
+        self.cursor.write_path_if_changed(&[PathPart::SortedMapGet(target)], data)
     }
 
     /// Removes `key`, returning whether it was in the map.

@@ -238,7 +238,7 @@ The function can't return anything that borrows the moment, since an unchanged m
 
 ### Writing only what changed
 
-To refresh values that rarely change, such as state polled on a timer, write them with `put_if_changed`. It compares first and writes nothing at all if the value is the same, so the moment stays unchanged and isn't committed. For a value in nested maps, use `put_path_if_changed` with the keys leading to it: getting a nested map with `put_map` already copies the path to it, which counts as a change, so it reads along the path first and only gets the maps for writing if the value differs. Both return whether they wrote:
+To refresh values that rarely change, such as state polled on a timer, write them with `put_if_changed`. It compares first and writes nothing at all if the value is the same, so the moment stays unchanged and isn't committed. For a value in nested maps, use `put_path_if_changed` with the keys leading to it: getting a nested map with `put_map` already copies the path to it, which counts as a change, so it reads along the path first and only writes along it if the value differs. Both return whether they wrote:
 
 ```rust
 use xitdb::*;
@@ -274,7 +274,9 @@ fn main() -> xitdb::Result<()> {
 }
 ```
 
-Values compare exactly, as they would be stored: the type, value and format tag must match, so `Int` 1 isn't `Uint` 1, and floats compare by their bits. A missing key always counts as changed, even when writing `Data::None`, and `Data::None` and empty bytes are different values. A `Data::Slot` equals only that exact slot. Long byte arrays compare their length and format tag first, then their contents, which are read in chunks. `WriteArrayList`, `WriteLinkedArrayList` and `WriteSortedMap` have `put_if_changed` too, `WriteCursor` has `write_if_changed`, and `ReadCursor::equals` does the comparison without writing.
+Values compare exactly, as they would be stored: the type, value and format tag must match, so `Int` 1 isn't `Uint` 1, and floats compare by their bits. A missing key always counts as changed, even when writing `Data::None`, and `Data::None` and empty bytes are different values. A `Data::Slot` equals only the slot it writes, which is that slot, except that an empty one is written marked as written, like `Data::None`. Long byte arrays compare their length and format tag first, then their contents, which are read in chunks. `WriteArrayList`, `WriteLinkedArrayList` and `WriteSortedMap` have `put_if_changed` too, and `ReadCursor::equals` does the comparison without writing.
+
+These are all built on `WriteCursor::write_path_if_changed`, which takes a path like `write_path` and works through any mix of collections, such as a list in a counted map, at any depth. On the root cursor outside a transaction, the comparison and the write run in one transaction of their own, which is discarded if the value is the same.
 
 ## Migrations
 

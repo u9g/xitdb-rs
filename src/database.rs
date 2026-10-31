@@ -6,7 +6,7 @@ use crate::core::{Core, DynCore};
 #[cfg(feature = "sha1")]
 use crate::core::{CoreBufferedFile, CoreMemory};
 use crate::cursor::WriteCursor;
-use crate::data::Data;
+use crate::data::{Data, Encoded};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::hasher::Hasher;
@@ -1300,9 +1300,9 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let slot = match (data.inline_slot(), data) {
-                    (Some(slot), _) => slot,
-                    (None, Data::Bytes(bytes)) => {
+                let slot = match data.encode() {
+                    Encoded::Inline(slot) => slot,
+                    Encoded::Long(bytes) => {
                         let mut cursor = WriteCursor::new(slot_ptr, self);
                         let mut writer = cursor.writer()?;
                         writer.format_tag = bytes.format_tag;
@@ -1310,7 +1310,6 @@ impl<C: Core> Database<C> {
                         writer.finish()?;
                         writer.slot
                     }
-                    (None, _) => unreachable!("only long byte arrays aren't inline"),
                 };
                 self.write_slot_at(position, slot)?;
                 next(SlotPointer::new(slot_ptr.position, slot), ctx)

@@ -2,11 +2,11 @@ use std::io;
 use std::ops::Deref;
 
 use crate::core::Core;
-use crate::data::{Bytes, Data};
+use crate::data::{Bytes, Data, Encoded};
 use crate::database::{ContextFn, Database, is_root};
 use crate::error::{Error, Result};
 use crate::format::*;
-use crate::path::{PathPart, WriteMode};
+use crate::path::{HashMapGetTarget, PathPart, WriteMode};
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 use crate::sorted::short_bytes_value;
 
@@ -199,26 +199,28 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     /// type, the value, and any format tag must all be the same. So
     /// [`Data::Int`] 1 isn't [`Data::Uint`] 1, floats are compared by their
     /// bits (`-0.0` isn't `0.0`, and a NaN equals the same NaN), and
-    /// [`Data::Slot`] equals only that exact slot, so a copy of a
+    /// [`Data::Slot`] equals only the slot it writes, so a copy of a
     /// collection at another position isn't equal to it.
     ///
-    /// [`Data::None`] equals only a slot it was written to, not one that
-    /// was never written. An empty byte array is short bytes, so it equals
-    /// neither. A long byte array equals stored bytes with the same length
-    /// and format tag, and then the same contents, which are read in
-    /// chunks rather than all at once. Bytes stored as a long byte array
-    /// (as [`WriteCursor::writer`] does) don't equal short data, even with
-    /// the same contents, because writing it would store it differently.
+    /// Writing an empty slot marks it as written, so it isn't treated as
+    /// empty. So [`Data::None`], and a [`Data::Slot`] with [`Tag::None`],
+    /// equal only a slot that was written empty, not one that was never
+    /// written. An empty byte array is short bytes, so it equals neither.
+    ///
+    /// A long byte array equals stored bytes with the same length and
+    /// format tag, and then the same contents, which are read in chunks
+    /// rather than all at once. Bytes stored as a long byte array (as
+    /// [`WriteCursor::writer`] does) don't equal short data, even with the
+    /// same contents, because writing it would store it differently.
     pub fn equals<'d>(&self, data: impl Into<Data<'d>>) -> Result<bool> {
         self.equals_data(&data.into())
     }
 
     pub(crate) fn equals_data(&self, data: &Data<'_>) -> Result<bool> {
         let slot = self.slot()?;
-        let bytes = match (data.inline_slot(), data) {
-            (Some(inline), _) => return Ok(slot == inline),
-            (None, Data::Bytes(bytes)) => bytes,
-            (None, _) => unreachable!("only long byte arrays aren't inline"),
+        let bytes = match data.encode() {
+            Encoded::Inline(inline) => return Ok(slot == inline),
+            Encoded::Long(bytes) => bytes,
         };
         if slot.tag != Tag::Bytes || slot.full != bytes.format_tag.is_some() {
             return Ok(false);
@@ -752,7 +754,7 @@ impl<'a, C: Core> WriteCursor<'a, C> {
     }
 
     // require the active transaction and a writable slot
-    pub(crate) fn check_writable(&self) -> Result<()> {
+    fn check_writable(&self) -> Result<()> {
         if let Some(transaction) = self.transaction
             && Some(transaction) != self.read.db.transaction_id()
         {
@@ -776,7 +778,7 @@ impl<'a, C: Core> WriteCursor<'a, C> {
     }
 
     // reload because an earlier write may have moved what the slot points to
-    pub(crate) fn reload_slot(&mut self) -> Result<()> {
+    fn reload_slot(&mut self) -> Result<()> {
         if self.transaction.is_some()
             && let Some(position) = self.read.slot_ptr.position
         {
@@ -866,17 +868,143 @@ impl<'a, C: Core> WriteCursor<'a, C> {
     }
 
     /// Writes `data` only if it differs from what the slot holds (see
-    /// [`ReadCursor::equals`]), and returns whether it wrote. If it's the
-    /// same, nothing at all is written.
+    /// [`ReadCursor::equals`]), and returns whether it wrote. See
+    /// [`WriteCursor::write_path_if_changed`].
     pub fn write_if_changed<'d>(&mut self, data: impl Into<Data<'d>>) -> Result<bool> {
-        let data = data.into();
+        self.write_keyed_path_if_changed(&[], &data.into())
+    }
+
+    /// Like [`WriteCursor::write_path`] followed by a write of `data`, but
+    /// only if `data` differs from what's at the end of `path` (see
+    /// [`ReadCursor::equals`]). Returns whether it wrote.
+    ///
+    /// It follows `path` without writing first, stopping as soon as
+    /// something along it is missing or empty. If the value is there and
+    /// the same, nothing at all is written, not even the copies of the
+    /// blocks along the path that a write makes, so the path can go through
+    /// any mix of collections at any depth. Otherwise it writes along the
+    /// path, creating what's missing, as `write_path` would. An init part
+    /// on a value of another type is an [`Error::UnexpectedTag`], and a part
+    /// that only writes, like an append, always counts as a change. Like
+    /// `write_path`, a [`PathPart::HashMapGet`] doesn't store the key of a
+    /// new entry; [`WriteHashMap::put_path_if_changed`](crate::WriteHashMap::put_path_if_changed)
+    /// does.
+    ///
+    /// Inside a transaction, the comparison and the write are part of it.
+    /// On the root cursor outside one, they run in a transaction of their
+    /// own, so they're atomic, and it's discarded if the value is the same.
+    pub fn write_path_if_changed<'d>(&mut self, path: &[PathPart<'_>], data: impl Into<Data<'d>>) -> Result<bool> {
+        let path: Vec<KeyedPart<'_>> = path.iter().map(|&part| KeyedPart { part, key: None }).collect();
+        self.write_keyed_path_if_changed(&path, &data.into())
+    }
+
+    pub(crate) fn write_keyed_path_if_changed(&mut self, path: &[KeyedPart<'_>], data: &Data<'_>) -> Result<bool> {
         self.check_writable()?;
+        let db = self.read.db;
+        if !is_root(&self.read.slot_ptr) {
+            return self.write_if_changed_in_transaction(path, data);
+        }
+        // a write through the root would fail inside a transaction, so fail
+        // now rather than only when the value differs
+        if db.transaction.get().is_some() {
+            return Err(Error::NestedTopLevelWrite);
+        }
+        // compare in the transaction that writes, so nothing can commit in
+        // between, and discard it if there's nothing to write
+        let mut wrote = None;
+        let result = self.write_path_context(&[], |root| {
+            let changed = root.write_if_changed_in_transaction(path, data)?;
+            wrote = Some(changed);
+            if changed { Ok(()) } else { Err(Error::Io(io::Error::other("unchanged, so nothing to commit"))) }
+        });
+        match wrote {
+            Some(false) => Ok(false),
+            Some(true) => {
+                let cursor = result?;
+                if path.is_empty() {
+                    self.read.slot_ptr = cursor.read.slot_ptr;
+                }
+                Ok(true)
+            }
+            None => Err(result.expect_err("the callback runs unless the write fails first")),
+        }
+    }
+
+    fn write_if_changed_in_transaction(&mut self, path: &[KeyedPart<'_>], data: &Data<'_>) -> Result<bool> {
         self.reload_slot()?;
-        if self.read.equals_data(&data)? {
+        if let Some(existing) = self.read_existing(path)?
+            && existing.equals_data(data)?
+        {
             return Ok(false);
         }
-        self.write(data)?;
+        let mut cursor = self.clone();
+        for step in path {
+            cursor = match (step.part, step.key) {
+                (PathPart::HashMapGet(HashMapGetTarget::Value(hash)), Some(key)) => cursor.write_entry(hash, key)?,
+                (part, _) => cursor.write_path(&[part])?,
+            };
+        }
+        let written = cursor.write_path(&[PathPart::WriteData(data)])?;
+        if path.is_empty() {
+            self.read.slot_ptr = written.read.slot_ptr;
+        }
         Ok(true)
+    }
+
+    // follows `path` without writing, as far as it exists. returns `None` if
+    // something along it is missing or empty, so writing would create it.
+    fn read_existing(&self, path: &[KeyedPart<'_>]) -> Result<Option<ReadCursor<'a, C>>> {
+        let mut cursor = self.read.resolved_cursor()?;
+        for step in path {
+            if let Some(tag) = step.part.init_tag() {
+                match cursor.slot_ptr.slot.tag {
+                    Tag::None => return Ok(None),
+                    existing if existing == tag => continue,
+                    _ => return Err(Error::UnexpectedTag),
+                }
+            }
+            let part = match (step.part, step.key) {
+                // read the whole entry, to check that its key is stored
+                (PathPart::HashMapGet(HashMapGetTarget::Value(hash)), Some(_)) => {
+                    PathPart::HashMapGet(HashMapGetTarget::KvPair(hash))
+                }
+                (
+                    part @ (PathPart::ArrayListGet(_)
+                    | PathPart::LinkedArrayListGet(_)
+                    | PathPart::HashMapGet(_)
+                    | PathPart::SortedMapGet(_)),
+                    _,
+                ) => part,
+                _ => return Ok(None),
+            };
+            let Some(next) = cursor.read_path(&[part])? else {
+                return Ok(None);
+            };
+            cursor = match step.key {
+                Some(_) => {
+                    let kv = next.read_key_value_pair()?;
+                    if kv.key_cursor.slot_ptr.slot.is_empty() || kv.value_cursor.slot_ptr.slot.is_empty() {
+                        return Ok(None);
+                    }
+                    kv.value_cursor
+                }
+                None => next,
+            };
+        }
+        Ok(Some(cursor))
+    }
+
+    // a cursor to the value of the hash map entry at `hash`, storing `key`
+    // in the same write if the entry has no key yet
+    fn write_entry(&mut self, hash: &[u8], key: &[u8]) -> Result<WriteCursor<'a, C>> {
+        let mut value = None;
+        self.write_path_context(&[PathPart::HashMapGet(HashMapGetTarget::KvPair(hash))], |cursor| {
+            let mut kv = cursor.read_key_value_pair()?;
+            kv.key_cursor.write_if_empty(Data::bytes(key))?;
+            value = Some(kv.value_cursor);
+            Ok(())
+        })?;
+        Ok(value.expect("the context function ran"))
     }
 
     /// For a cursor to a key-value pair, writable cursors to the key and
@@ -912,6 +1040,15 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             format_tag: None,
         })
     }
+}
+
+/// A part of a path written by [`WriteCursor::write_path_if_changed`], with
+/// the key to store if it's a [`PathPart::HashMapGet`] of a value whose
+/// entry has no key yet. A missing key counts as a change.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyedPart<'p> {
+    pub(crate) part: PathPart<'p>,
+    pub(crate) key: Option<&'p [u8]>,
 }
 
 /// Writable cursors to the key and value of a key-value pair.

@@ -537,3 +537,152 @@ fn cursors() {
     assert!(db.root_cursor().write_if_changed(6u64).unwrap());
     assert_eq!(db.root_cursor().read_uint().unwrap(), 6);
 }
+
+#[test]
+fn mixed_paths() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history
+        .transact(|moment| {
+            let mut counted = WriteCountedHashMap::new(&mut moment.put_cursor("counted")?)?;
+            let mut list = WriteArrayList::new(&mut counted.put_cursor("list")?)?;
+            list.append(1u64)?;
+            let mut sorted = WriteSortedMap::new(&mut list.append_cursor()?)?;
+            sorted.put("x", "old")?;
+            let mut linked = WriteLinkedArrayList::new(&mut sorted.put_cursor("linked")?)?;
+            linked.append(5u64)
+        })
+        .unwrap();
+
+    let counted = db.digest(b"counted");
+    let list = db.digest(b"list");
+    let path = |sorted: PathPart<'static>| {
+        [
+            PathPart::HashMapGet(HashMapGetTarget::Value(&counted)),
+            PathPart::HashMapInit { counted: true, set: false },
+            PathPart::HashMapGet(HashMapGetTarget::Value(&list)),
+            PathPart::ArrayListInit,
+            PathPart::ArrayListGet(1),
+            PathPart::SortedMapInit { set: false },
+            sorted,
+        ]
+    };
+    let linked = path(PathPart::SortedMapGet(SortedMapGetTarget::Value(b"linked")));
+    let linked = [&linked[..], &[PathPart::LinkedArrayListInit, PathPart::LinkedArrayListGet(0)]].concat();
+    let x = path(PathPart::SortedMapGet(SortedMapGetTarget::Value(b"x")));
+
+    let write = |path: &[PathPart<'_>], data: Data<'_>| {
+        history
+            .transact_with_status(|moment| {
+                let before = len(&db);
+                let wrote = moment.write_cursor().clone().write_path_if_changed(path, data)?;
+                if !wrote {
+                    assert_eq!(len(&db), before, "a skipped write wrote something");
+                }
+                Ok::<_, Error>(wrote)
+            })
+            .unwrap()
+    };
+    assert_eq!(write(&linked, Data::Uint(5)), (false, false));
+    assert_eq!(write(&x, "old".into()), (false, false));
+    assert_eq!(history.count().unwrap(), 1);
+
+    assert_eq!(write(&linked, Data::Uint(6)), (true, true));
+    assert_eq!(write(&x, "new".into()), (true, true));
+    assert_eq!(write(&x, "new".into()), (false, false));
+    let latest = history.latest().unwrap();
+    let read = |path: &[PathPart<'_>]| {
+        // reads skip init parts, which only matter for writing
+        let path: Vec<_> = path.iter().copied().filter(|part| !is_init(part)).collect();
+        latest.cursor().read_path(&path).unwrap().unwrap()
+    };
+    assert_eq!(read(&linked).read_uint().unwrap(), 6);
+    assert_eq!(read(&x).read_string(MAX_READ).unwrap(), "new");
+    assert_eq!(history.count().unwrap(), 3);
+
+    // an init part on another kind of collection
+    let mut wrong = x;
+    wrong[1] = PathPart::HashMapInit { counted: false, set: false };
+    let result = history.transact_with_status(|moment| moment.write_cursor().clone().write_path_if_changed(&wrong, "new"));
+    assert!(matches!(result, Err(Error::UnexpectedTag)), "{result:?}");
+
+    // and a part that only writes always changes something
+    let mut append = x[..5].to_vec();
+    append[4] = PathPart::ArrayListAppend;
+    let (wrote, committed) = history
+        .transact_with_status(|moment| moment.write_cursor().clone().write_path_if_changed(&append, 1u64))
+        .unwrap();
+    assert!(wrote && committed);
+    assert_eq!(history.count().unwrap(), 4);
+}
+
+fn is_init(part: &PathPart<'_>) -> bool {
+    matches!(
+        part,
+        PathPart::HashMapInit { .. }
+            | PathPart::ArrayListInit
+            | PathPart::LinkedArrayListInit
+            | PathPart::SortedMapInit { .. }
+    )
+}
+
+#[test]
+fn root_maps_compare_and_write_in_one_transaction() {
+    let db = new_db();
+    let mut map = WriteHashMap::new(&mut db.root_cursor()).unwrap();
+    map.put("key", 1u64).unwrap();
+    let size = db.committed_size().unwrap();
+    let length = len(&db);
+
+    // unchanged: the transaction is discarded, so the file is as it was
+    assert!(!map.put_if_changed("key", 1u64).unwrap());
+    assert!(!map.put_path_if_changed(&["key"], 1u64).unwrap());
+    assert_eq!(db.committed_size().unwrap(), size);
+    assert_eq!(len(&db), length);
+
+    // a nested value works the same whether it changed or not, since it
+    // needs no transaction from the caller
+    assert!(map.put_path_if_changed(&["merges", "url", "question"], 3u64).unwrap());
+    assert!(!map.put_path_if_changed(&["merges", "url", "question"], 3u64).unwrap());
+    assert!(map.put_path_if_changed(&["merges", "url", "question"], 4u64).unwrap());
+    let merges = map.get_map("merges").unwrap().unwrap();
+    let merge = merges.get_map("url").unwrap().unwrap();
+    assert_eq!(merge.get_uint("question").unwrap(), Some(4));
+    // with the keys of the new maps stored, so they can be iterated
+    let keys: Vec<Vec<u8>> =
+        merges.entries().unwrap().map(|kv| kv.unwrap().key_cursor.read_bytes(MAX_READ).unwrap()).collect();
+    assert_eq!(keys, [b"url".to_vec()]);
+
+    // another handle's commit is seen, since the comparison is made in the
+    // transaction that would write
+    let mut other = WriteHashMap::new(&mut db.root_cursor()).unwrap();
+    other.put("key", 2u64).unwrap();
+    assert!(!map.put_if_changed("key", 2u64).unwrap());
+    assert!(map.put_if_changed("key", 1u64).unwrap());
+    assert_eq!(other.get_uint("key").unwrap(), Some(1));
+}
+
+#[test]
+fn misuse_fails_even_when_unchanged() {
+    let db = new_db();
+    let mut map = WriteHashMap::new(&mut db.root_cursor()).unwrap();
+    map.put("inner", 1u64).unwrap();
+
+    // a cursor from a transaction that has ended
+    let mut inner = map.put_cursor("inner").unwrap();
+    for data in [1u64, 2] {
+        let result = inner.write_if_changed(data);
+        assert!(matches!(result, Err(Error::ExpiredTransaction)), "{result:?}");
+    }
+
+    // the root cursor inside a transaction
+    let result = db.run_context(|_| {
+        for data in [1u64, 2] {
+            let result = map.put_if_changed("inner", data);
+            assert!(matches!(result, Err(Error::NestedTopLevelWrite)), "{result:?}");
+        }
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(map.get_uint("inner").unwrap(), Some(1));
+}
