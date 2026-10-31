@@ -108,3 +108,20 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// A uint above i64::MAX was written as a negative slot value, which every
+/// implementation reads as an error, so it could be written but never read
+/// back. Writing one is now the error.
+#[test]
+fn uint_above_i64_max_is_rejected_when_written() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let mut map = WriteHashMap::new(&mut db.root_cursor())?;
+    map.put("max", i64::MAX as u64)?;
+    assert_eq!(map.get_cursor("max")?.unwrap().read_uint()?, i64::MAX as u64);
+    for value in [i64::MAX as u64 + 1, u64::MAX] {
+        let result = map.put("too big", value);
+        assert!(matches!(result, Err(Error::ExpectedUnsignedLong)), "{value}: {result:?}");
+    }
+    assert!(map.get_cursor("too big")?.is_none());
+    Ok(())
+}

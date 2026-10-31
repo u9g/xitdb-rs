@@ -1226,7 +1226,11 @@ impl<C: Core> Database<C> {
                 let mut slot = match data {
                     Data::None => Slot::default(),
                     Data::Slot(slot) => *slot,
-                    Data::Uint(value) => Slot::new(*value as i64, Tag::Uint),
+                    // the slot holds an i64, and every implementation reads a
+                    // negative uint as an error, so it can't be written either
+                    Data::Uint(value) => {
+                        Slot::new(i64::try_from(*value).map_err(|_| Error::ExpectedUnsignedLong)?, Tag::Uint)
+                    }
                     Data::Int(value) => Slot::new(*value, Tag::Int),
                     Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
                     Data::Bytes(bytes) if bytes.is_short() => {

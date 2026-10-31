@@ -40,6 +40,9 @@ pub enum Data<'a> {
     None,
     /// Writes a slot as-is, which is how a data structure is cloned.
     Slot(Slot),
+    /// An unsigned int up to `i64::MAX`, the largest the format can store.
+    /// Writing a larger one returns
+    /// [`Error::ExpectedUnsignedLong`](crate::Error::ExpectedUnsignedLong).
     Uint(u64),
     Int(i64),
     Float(f64),
