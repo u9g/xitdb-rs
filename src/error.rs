@@ -65,6 +65,13 @@ pub enum Error {
         /// The newest version this code knows.
         expected: u64,
     },
+    /// The layout version recorded in a [`History`](crate::History) is
+    /// between the versions of the known [`Migration`](crate::Migration)s,
+    /// so it was made by a migration this code doesn't have.
+    UnknownLayoutVersion {
+        /// The recorded version.
+        found: u64,
+    },
     /// A [`Migration`](crate::Migration)'s version isn't greater than the one
     /// before it (or than 0, for the first).
     MigrationOutOfOrder {
@@ -92,6 +99,9 @@ impl fmt::Display for Error {
             }
             Error::LayoutTooOld { found, expected } => {
                 return write!(f, "layout version {found} is older than the expected version {expected}");
+            }
+            Error::UnknownLayoutVersion { found } => {
+                return write!(f, "layout version {found} isn't the version of any known migration");
             }
             Error::MigrationOutOfOrder { version, previous } => {
                 return write!(f, "migration version {version} must be greater than {previous}");

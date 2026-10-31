@@ -2,21 +2,25 @@
 
 use std::fmt;
 
-use crate::collections::WriteHashMap;
+use crate::collections::{ReadHashMap, WriteHashMap};
 use crate::core::Core;
 use crate::error::{Error, Result};
 use crate::history::History;
+use crate::slot::Tag;
 
 /// The key in each moment where [`History::migrate`] records the layout
 /// version, as a `Uint`, unless [`Migrations::with_key`] picks another.
-/// A moment without it is at version 0.
+/// A moment without it is at version 0. A non-negative `Int` there, as
+/// another implementation might write, is read as the same version.
 pub const LAYOUT_VERSION_KEY: &str = "xitdb/layout-version";
 
-/// One step from the previous layout version to `version`: `run` changes
-/// the moment, for example by renaming a key or reshaping its values.
-///
-/// `run` is a plain function, so it can't capture anything, and a generic
-/// one works for any core:
+/// A migration's function.
+type Run<C, E> = Box<dyn Fn(&mut WriteHashMap<'_, C>) -> Result<(), E> + Send + Sync>;
+
+/// One step from the previous layout version to `version`: a function
+/// that changes the moment, for example by renaming a key or reshaping its
+/// values. It's made with [`Migration::new`], from a function or a closure,
+/// which can capture configuration such as a default value:
 ///
 /// ```
 /// use xitdb::{Core, Migration, WriteHashMap};
@@ -26,7 +30,11 @@ pub const LAYOUT_VERSION_KEY: &str = "xitdb/layout-version";
 ///     Ok(())
 /// }
 ///
-/// let migration: Migration<xitdb::CoreMemory> = Migration { version: 1, name: "add tags", run: add_tags };
+/// let default_limit = 10u64;
+/// let migrations: Vec<Migration<xitdb::CoreMemory>> = vec![
+///     Migration::new(1, "add tags", add_tags),
+///     Migration::new(2, "add limit", move |moment| moment.put("limit", default_limit)),
+/// ];
 /// ```
 pub struct Migration<C: Core, E = Error> {
     /// The layout version after this migration. Versions start at 1, since
@@ -34,18 +42,26 @@ pub struct Migration<C: Core, E = Error> {
     pub version: u64,
     /// A name for logs, returned in [`Migrated::ran`].
     pub name: &'static str,
-    /// Changes the moment from the previous version's layout to this one's.
-    /// Reads see the writes of earlier migrations in the same run.
-    pub run: fn(&mut WriteHashMap<'_, C>) -> Result<(), E>,
+    run: Run<C, E>,
 }
 
-impl<C: Core, E> Clone for Migration<C, E> {
-    fn clone(&self) -> Self {
-        *self
+impl<C: Core, E> Migration<C, E> {
+    /// A migration to `version`. `run` changes the moment from the previous
+    /// version's layout to this one's. Its reads see the writes of earlier
+    /// migrations in the same run.
+    ///
+    /// `run` is boxed, so it must be `'static`. A function that's generic
+    /// over the core, such as `add_tags::<C>`, is only `'static` if `C` is,
+    /// so code that builds migrations for any core needs `C: Core + 'static`.
+    /// Every core in this crate is `'static`.
+    pub fn new(
+        version: u64,
+        name: &'static str,
+        run: impl Fn(&mut WriteHashMap<'_, C>) -> Result<(), E> + Send + Sync + 'static,
+    ) -> Self {
+        Migration { version, name, run: Box::new(run) }
     }
 }
-
-impl<C: Core, E> Copy for Migration<C, E> {}
 
 impl<C: Core, E> fmt::Debug for Migration<C, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,10 +119,19 @@ impl<C: Core, E> Migrations<C, E> {
         &self.list
     }
 
-    /// The migrations newer than `version`.
-    fn pending(&self, version: u64) -> &[Migration<C, E>] {
+    /// The migrations newer than `version`, or an error unless `version` is
+    /// 0 or one of the migrations' versions: [`Error::LayoutTooNew`] if it's
+    /// newer than all of them, and [`Error::UnknownLayoutVersion`] if it
+    /// falls between them.
+    fn pending(&self, version: u64) -> Result<&[Migration<C, E>]> {
+        if version > self.latest() {
+            return Err(Error::LayoutTooNew { found: version, known: self.latest() });
+        }
         let start = self.list.partition_point(|migration| migration.version <= version);
-        &self.list[start..]
+        if version != 0 && (start == 0 || self.list[start - 1].version != version) {
+            return Err(Error::UnknownLayoutVersion { found: version });
+        }
+        Ok(&self.list[start..])
     }
 }
 
@@ -129,16 +154,20 @@ pub struct Migrated {
 }
 
 impl<C: Core> History<'_, C> {
-    /// The layout version recorded in the latest moment under
-    /// [`LAYOUT_VERSION_KEY`], or 0 if there is none, as on a new database.
-    /// Returns [`Error::UnexpectedTag`] if the value there isn't a `Uint`.
-    /// For a custom key, read it with `history.latest()?.get_uint(key)`.
+    /// The layout version recorded in the latest moment under the key of
+    /// `migrations`, or 0 if there is none, as on a new database. This
+    /// doesn't check it against the migrations; see
+    /// [`History::check_version`] for that.
+    ///
+    /// The version is a `Uint`, or a non-negative `Int`. Anything else is an
+    /// [`Error::UnexpectedTag`], and a negative `Int` is an
+    /// [`Error::ExpectedUnsignedLong`].
     ///
     /// Like [`History::latest`], this never writes, so it works on a
     /// database opened with
     /// [`Database::open_read_only`](crate::Database::open_read_only).
-    pub fn version(&self) -> Result<u64> {
-        Ok(self.latest()?.get_uint(LAYOUT_VERSION_KEY)?.unwrap_or(0))
+    pub fn version<E>(&self, migrations: &Migrations<C, E>) -> Result<u64> {
+        recorded_version(&self.latest()?, migrations.key)
     }
 
     /// Brings the latest moment to the newest layout version: runs each
@@ -148,46 +177,59 @@ impl<C: Core> History<'_, C> {
     ///
     /// If a migration returns an error, nothing is committed, so the moment
     /// and its version stay exactly as they were, and that error is
-    /// returned. If the recorded version is newer than every migration,
-    /// so the data was written by newer code, it returns
-    /// [`Error::LayoutTooNew`] and changes nothing. If there's nothing to
-    /// run, nothing is committed.
+    /// returned. If nothing is pending, nothing is committed.
+    ///
+    /// The recorded version must be 0 or the version of one of the
+    /// migrations; otherwise nothing runs. If it's newer than every
+    /// migration, so the data was written by newer code, this returns
+    /// [`Error::LayoutTooNew`]. If it's between them, so the data was
+    /// written by code with a migration this list doesn't have, it returns
+    /// [`Error::UnknownLayoutVersion`].
     ///
     /// The version is read inside the transaction, so with one writer at a
-    /// time (see the README on locking), each migration runs exactly once.
+    /// time (see the locking rules under "Initializing a Database" in the
+    /// README), each
+    /// migration runs exactly once.
     pub fn migrate<E: From<Error>>(&self, migrations: &Migrations<C, E>) -> Result<Migrated, E> {
-        let known = migrations.latest();
         self.transact(|moment| {
-            let from = moment.get_uint(migrations.key)?.unwrap_or(0);
-            if from > known {
-                return Err(Error::LayoutTooNew { found: from, known }.into());
-            }
-            let pending = migrations.pending(from);
+            let from = recorded_version(moment, migrations.key)?;
+            let pending = migrations.pending(from)?;
             for migration in pending {
                 (migration.run)(moment)?;
             }
             if !pending.is_empty() {
-                moment.put(migrations.key, known)?;
+                moment.put(migrations.key, migrations.latest())?;
             }
             let ran = pending.iter().map(|migration| migration.name).collect();
-            Ok(Migrated { from, to: from.max(known), ran })
+            Ok(Migrated { from, to: migrations.latest(), ran })
         })
     }
 
     /// Checks, without writing, that the latest moment is at exactly the
     /// newest version of `migrations`, and returns it. This is for readers,
     /// which shouldn't migrate: it returns [`Error::LayoutTooNew`] if the
-    /// data was written by newer code, and [`Error::LayoutTooOld`] if the
-    /// writer hasn't migrated it yet.
+    /// data was written by newer code, [`Error::UnknownLayoutVersion`] if
+    /// its version isn't one of the migrations', and
+    /// [`Error::LayoutTooOld`] if the writer hasn't migrated it yet.
     pub fn check_version<E>(&self, migrations: &Migrations<C, E>) -> Result<u64> {
-        let found = self.latest()?.get_uint(migrations.key)?.unwrap_or(0);
-        let known = migrations.latest();
-        if found > known {
-            Err(Error::LayoutTooNew { found, known })
-        } else if found < known {
-            Err(Error::LayoutTooOld { found, expected: known })
-        } else {
+        let found = self.version(migrations)?;
+        if migrations.pending(found)?.is_empty() {
             Ok(found)
+        } else {
+            Err(Error::LayoutTooOld { found, expected: migrations.latest() })
         }
+    }
+}
+
+/// The layout version recorded in `moment` under `key`. A missing or empty
+/// value is version 0.
+fn recorded_version<C: Core>(moment: &ReadHashMap<'_, C>, key: &str) -> Result<u64> {
+    let Some(cursor) = moment.get_cursor(key)? else {
+        return Ok(0);
+    };
+    match cursor.slot()?.tag {
+        Tag::None => Ok(0),
+        Tag::Int => u64::try_from(cursor.read_int()?).map_err(|_| Error::ExpectedUnsignedLong),
+        _ => cursor.read_uint(),
     }
 }

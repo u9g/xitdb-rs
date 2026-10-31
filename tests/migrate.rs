@@ -50,13 +50,18 @@ fn add_tokens<C: Core>(moment: &mut WriteHashMap<'_, C>) -> Result<()> {
     Ok(())
 }
 
-fn migrations<C: Core>(count: usize) -> Migrations<C> {
+fn migrations<C: Core + 'static>(count: usize) -> Migrations<C> {
     let all = [
-        Migration { version: 1, name: "add proposals", run: add_proposals },
-        Migration { version: 2, name: "proposals to merges", run: proposals_to_merges },
-        Migration { version: 3, name: "add agent tokens", run: add_tokens },
+        Migration::new(1, "add proposals", add_proposals),
+        Migration::new(2, "proposals to merges", proposals_to_merges),
+        Migration::new(3, "add agent tokens", add_tokens),
     ];
     Migrations::new(all.into_iter().take(count)).unwrap()
+}
+
+// the recorded version under the default key
+fn version<C: Core + 'static>(history: &History<'_, C>) -> Result<u64> {
+    history.version(&migrations::<C>(0))
 }
 
 fn merge_status(moment: &ReadHashMap<'_, impl Core>, url: &str) -> Option<String> {
@@ -67,7 +72,7 @@ fn merge_status(moment: &ReadHashMap<'_, impl Core>, url: &str) -> Option<String
 fn fresh_database_runs_all_migrations() {
     let db = new_db();
     let history = History::new(&db).unwrap();
-    assert_eq!(history.version().unwrap(), 0);
+    assert_eq!(version(&history).unwrap(), 0);
 
     let migrated = history.migrate(&migrations(3)).unwrap();
     assert_eq!(
@@ -77,7 +82,7 @@ fn fresh_database_runs_all_migrations() {
 
     // all in one moment
     assert_eq!(history.count().unwrap(), 1);
-    assert_eq!(history.version().unwrap(), 3);
+    assert_eq!(version(&history).unwrap(), 3);
     let latest = history.latest().unwrap();
     assert_eq!(latest.get_uint(LAYOUT_VERSION_KEY).unwrap(), Some(3));
     assert!(latest.get_set("agent-tokens").unwrap().is_some());
@@ -108,7 +113,7 @@ fn adding_a_migration_runs_only_the_new_one() {
     let db = new_db();
     let history = History::new(&db).unwrap();
     history.migrate(&migrations(1)).unwrap();
-    assert_eq!(history.version().unwrap(), 1);
+    assert_eq!(version(&history).unwrap(), 1);
 
     // the app writes data in the version 1 layout
     history.transact(|moment| moment.put_map("proposals")?.put("https://example.com/pr/3", "open")).unwrap();
@@ -165,15 +170,15 @@ fn failing_migration_changes_nothing() {
     let db = new_db();
     let history = History::new(&db).unwrap();
     history.transact(|moment| moment.put("foo", "foo")).unwrap();
-    history.migrate(&Migrations::new([Migration { version: 1, name: "add baz", run: add_baz }]).unwrap()).unwrap();
+    history.migrate(&Migrations::new([Migration::new(1, "add baz", add_baz)]).unwrap()).unwrap();
     let size = db.committed_size().unwrap();
     let len = db.core().length().unwrap();
 
     // the second migration fails after the first changed the moment
     let migrations = Migrations::new([
-        Migration { version: 1, name: "add baz", run: add_baz },
-        Migration { version: 2, name: "rename foo", run: rename_foo },
-        Migration { version: 3, name: "reject", run: reject },
+        Migration::new(1, "add baz", add_baz),
+        Migration::new(2, "rename foo", rename_foo),
+        Migration::new(3, "reject", reject),
     ])
     .unwrap();
     let result = history.migrate(&migrations);
@@ -183,7 +188,7 @@ fn failing_migration_changes_nothing() {
     assert_eq!(history.count().unwrap(), 2);
     assert_eq!(db.committed_size().unwrap(), size);
     assert_eq!(db.core().length().unwrap(), len);
-    assert_eq!(history.version().unwrap(), 1);
+    assert_eq!(version(&history).unwrap(), 1);
     let latest = history.latest().unwrap();
     assert_eq!(latest.get_string("foo", MAX_READ).unwrap().as_deref(), Some("foo"));
     assert!(latest.get_cursor("bar").unwrap().is_none());
@@ -194,13 +199,13 @@ fn failing_migration_changes_nothing() {
         Ok(())
     }
     let migrations = Migrations::new([
-        Migration { version: 1, name: "add baz", run: add_baz },
-        Migration { version: 2, name: "not a list", run: not_a_list },
+        Migration::new(1, "add baz", add_baz),
+        Migration::new(2, "not a list", not_a_list),
     ])
     .unwrap();
     let result = history.migrate(&migrations);
     assert!(matches!(result, Err(AppError::Db(Error::UnexpectedTag))));
-    assert_eq!(history.version().unwrap(), 1);
+    assert_eq!(version(&history).unwrap(), 1);
     assert_eq!(db.committed_size().unwrap(), size);
 }
 
@@ -218,7 +223,7 @@ fn too_new_version_is_an_error() {
     assert!(matches!(result, Err(Error::LayoutTooNew { found: 3, known: 0 })));
     assert_eq!(db.committed_size().unwrap(), size);
     assert_eq!(history.count().unwrap(), 1);
-    assert_eq!(history.version().unwrap(), 3);
+    assert_eq!(version(&history).unwrap(), 3);
 
     let err = history.migrate(&migrations(2)).unwrap_err();
     assert_eq!(err.to_string(), "layout version 3 is newer than the newest known version 2");
@@ -227,7 +232,7 @@ fn too_new_version_is_an_error() {
 #[test]
 fn rejects_invalid_lists() {
     fn check(versions: &[u64]) -> Result<Migrations<CoreMemory>> {
-        Migrations::new(versions.iter().map(|&version| Migration { version, name: "add tokens", run: add_tokens }))
+        Migrations::new(versions.iter().map(|&version| Migration::new(version, "add tokens", add_tokens)))
     }
     assert!(matches!(check(&[1, 1]), Err(Error::MigrationOutOfOrder { version: 1, previous: 1 })));
     assert!(matches!(check(&[1, 3, 2]), Err(Error::MigrationOutOfOrder { version: 2, previous: 3 })));
@@ -244,19 +249,96 @@ fn rejects_invalid_lists() {
 fn version_on_empty_and_migrated_databases() {
     let db = new_db();
     let history = History::new(&db).unwrap();
-    assert_eq!(history.version().unwrap(), 0);
+    assert_eq!(version(&history).unwrap(), 0);
 
     // data without a recorded version is at version 0
     history.transact(|moment| moment.put("foo", "foo")).unwrap();
-    assert_eq!(history.version().unwrap(), 0);
+    assert_eq!(version(&history).unwrap(), 0);
 
     history.migrate(&migrations(2)).unwrap();
-    assert_eq!(history.version().unwrap(), 2);
+    assert_eq!(version(&history).unwrap(), 2);
 
     // a version that isn't a Uint is an error
     history.transact(|moment| moment.put(LAYOUT_VERSION_KEY, "two")).unwrap();
-    assert!(matches!(history.version(), Err(Error::UnexpectedTag)));
+    assert!(matches!(version(&history), Err(Error::UnexpectedTag)));
     assert!(matches!(history.migrate(&migrations(3)), Err(Error::UnexpectedTag)));
+    assert!(matches!(history.check_version(&migrations(3)), Err(Error::UnexpectedTag)));
+
+    // so is an empty value: it reads as version 0
+    history.transact(|moment| moment.put(LAYOUT_VERSION_KEY, Data::None)).unwrap();
+    assert_eq!(version(&history).unwrap(), 0);
+}
+
+#[test]
+fn reads_an_int_version() {
+    // another implementation may write the version as an Int
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.migrate(&migrations(1)).unwrap();
+    history.transact(|moment| moment.put(LAYOUT_VERSION_KEY, 1i64)).unwrap();
+    assert_eq!(version(&history).unwrap(), 1);
+    assert_eq!(history.check_version(&migrations(1)).unwrap(), 1);
+
+    // migrating reads it, and records the new version as a Uint
+    let migrated = history.migrate(&migrations(2)).unwrap();
+    assert_eq!(migrated, Migrated { from: 1, to: 2, ran: vec!["proposals to merges"] });
+    let slot = history.latest().unwrap().get_slot(LAYOUT_VERSION_KEY).unwrap().unwrap();
+    assert_eq!(slot.tag, Tag::Uint);
+
+    // a negative Int isn't a version
+    history.transact(|moment| moment.put(LAYOUT_VERSION_KEY, -1i64)).unwrap();
+    assert!(matches!(version(&history), Err(Error::ExpectedUnsignedLong)));
+    assert!(matches!(history.migrate(&migrations(3)), Err(Error::ExpectedUnsignedLong)));
+}
+
+#[test]
+fn unknown_version_is_an_error() {
+    fn check(versions: &[u64]) -> Migrations<CoreMemory> {
+        Migrations::new(versions.iter().map(|&version| Migration::new(version, "add tokens", add_tokens))).unwrap()
+    }
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    history.migrate(&check(&[1, 4])).unwrap();
+    let size = db.committed_size().unwrap();
+
+    // version 4 was made by a migration that [1, 3, 5] doesn't have, so 5 can't run on it
+    let result = history.migrate(&check(&[1, 3, 5]));
+    assert!(matches!(result, Err(Error::UnknownLayoutVersion { found: 4 })));
+    assert!(matches!(history.check_version(&check(&[1, 3, 5])), Err(Error::UnknownLayoutVersion { found: 4 })));
+    assert!(matches!(history.check_version(&check(&[5])), Err(Error::UnknownLayoutVersion { found: 4 })));
+    assert_eq!(db.committed_size().unwrap(), size);
+    assert_eq!(version(&history).unwrap(), 4);
+    assert_eq!(
+        history.migrate(&check(&[5])).unwrap_err().to_string(),
+        "layout version 4 isn't the version of any known migration"
+    );
+
+    // a list that has 4 runs only what comes after it, even with gaps
+    let migrated = history.migrate(&check(&[2, 4, 7])).unwrap();
+    assert_eq!(migrated, Migrated { from: 4, to: 7, ran: vec!["add tokens"] });
+    assert_eq!(history.check_version(&check(&[2, 4, 7])).unwrap(), 7);
+}
+
+#[test]
+fn migrations_can_capture() {
+    let db = new_db();
+    let history = History::new(&db).unwrap();
+    let default_status = String::from("open");
+    let migrations = Migrations::new([
+        Migration::new(1, "add proposals", add_proposals),
+        Migration::new(2, "default status", move |moment: &mut WriteHashMap<'_, CoreMemory>| {
+            moment.put("default-status", default_status.as_str())
+        }),
+    ])
+    .unwrap();
+    history.migrate(&migrations).unwrap();
+    let latest = history.latest().unwrap();
+    assert_eq!(latest.get_string("default-status", MAX_READ).unwrap().as_deref(), Some("open"));
+    assert!(latest.get_map("proposals").unwrap().is_some());
+
+    // a migration list can be shared between threads
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    assert_send_sync(&migrations);
 }
 
 #[test]
@@ -279,6 +361,8 @@ fn custom_key() {
     let latest = history.latest().unwrap();
     assert_eq!(latest.get_uint("schema").unwrap(), Some(3));
     assert!(latest.get_cursor(LAYOUT_VERSION_KEY).unwrap().is_none());
+    assert_eq!(history.version(&migrations).unwrap(), 3);
+    assert_eq!(version(&history).unwrap(), 0);
     assert_eq!(history.check_version(&migrations).unwrap(), 3);
     assert_eq!(history.migrate(&migrations).unwrap().ran.len(), 0);
 }
@@ -298,7 +382,7 @@ fn read_only_reader_checks_version() {
     let before = std::fs::read(tmp.path()).unwrap();
     let db = Database::open_read_only(tmp.path()).unwrap();
     let history = History::new(&db).unwrap();
-    assert_eq!(history.version().unwrap(), 2);
+    assert_eq!(version(&history).unwrap(), 2);
     assert_eq!(history.check_version(&migrations(2)).unwrap(), 2);
     // an older reader refuses newer data, and a newer one waits for the writer to migrate
     assert!(matches!(history.check_version(&migrations(1)), Err(Error::LayoutTooNew { found: 2, known: 1 })));
