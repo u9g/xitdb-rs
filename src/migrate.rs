@@ -188,8 +188,7 @@ impl<C: Core> History<'_, C> {
     ///
     /// The version is read inside the transaction, so with one writer at a
     /// time (see the locking rules under "Initializing a Database" in the
-    /// README), each
-    /// migration runs exactly once.
+    /// README), each migration runs exactly once.
     pub fn migrate<E: From<Error>>(&self, migrations: &Migrations<C, E>) -> Result<Migrated, E> {
         self.transact(|moment| {
             let from = recorded_version(moment, migrations.key)?;
