@@ -69,6 +69,8 @@ mod index;
 mod migrate;
 mod path;
 mod record;
+#[cfg(feature = "serde")]
+mod replica_serde;
 mod slot;
 mod sorted;
 mod typed;

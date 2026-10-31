@@ -228,6 +228,10 @@ pub fn root_trailer_checksum(file_id: u64, position: i64, root: Slot, commit_id:
 
 /// What a replica sends its source, so the source knows which bytes to
 /// send back (see [`Database::replication_start`](crate::Database::replication_start)).
+///
+/// With the `serde` feature, it implements `Serialize` and `Deserialize` as
+/// `{"committedSize":123,"checksum":"456"}`, with the u64 checksum as a
+/// decimal string, because a JSON number can't always hold it exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicaState {
     pub committed_size: i64,

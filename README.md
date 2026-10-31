@@ -1000,6 +1000,28 @@ If a sync is interrupted, the replica stays at its last commit, and the next syn
 
 Only change a replica with `apply_replicated`. If you write to it directly, it no longer matches the source, and the next sync will replace it.
 
+### Replicating to TypeScript
+
+Replicas don't have to use this crate. Replication to and from the TypeScript implementation (the [`xitdb`](https://www.npmjs.com/package/xitdb) npm package, 0.26.0) is tested by `interop/ts/run.sh`, which needs cargo, Node 22.18 or later, and pnpm or npm. It runs `examples/ts_replication.rs`, which keeps a database in memory like a server would, and `interop/ts/client.ts`, which holds an in-memory replica like a browser client would:
+
+* A new replica gets a full copy of a history with every data type, then a delta for each transaction, and reads every value back.
+* The replica sends its `ReplicaState`, and `replication_start` returns its committed size, so it only gets what it missed.
+* The replica rejects a delta that skips a transaction or comes from another file, and syncs again.
+* After the source is compacted into a new database, `replication_start` returns 0, and the replica gets a full copy.
+* Both compute the same trailer checksums, and a database written in TypeScript replicates to this crate.
+
+With the `serde` feature, `ReplicaState` implements `Serialize` and `Deserialize`, and the test uses them to send it as JSON. The checksum is a decimal string, because it is a u64 and a JavaScript number can only hold integers up to 2^53 exactly:
+
+```json
+{"committedSize":137438,"checksum":"11364480133251437419"}
+```
+
+In TypeScript, that is `{ committedSize: state.committedSize, checksum: state.checksum.toString() }` one way and `{ committedSize, checksum: BigInt(checksum) }` the other.
+
+To keep replicas up to date after each transaction, the source can send everyone the bytes the transaction added, from the committed size before it to the one after it, along with that start position. A replica that missed one of them must not apply the next, and doesn't: in TypeScript, `openReplicated(start, length)` throws `InvalidRangeException` when `start` is neither 0 nor the replica's `committedSize()`, and `close()` throws `InvalidDatabaseException` when the bytes don't end with a trailer of the replica's file at `start + length`, such as bytes from before the source was compacted. Either way, the replica stays at its last commit, and it should sync again by sending its `ReplicaState`.
+
+Note that in xitdb-ts 0.26.0, `readUint()` and `readInt()` return a JavaScript number, so they lose precision past 2^53, and `readUint()` throws `ExpectedUnsignedLongException` for values of 2^63 or more. For the exact value, read the slot: `BigInt.asUintN(64, cursor.slot().value)` for a uint, and `cursor.slot().value` for an int.
+
 ## Thread Safety
 
 It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance (a `Database` is `Send` but not `Sync`), each with its own file handle. Also, keep in mind that writes still need to come from one thread at a time; across processes, take an exclusive lock on a separate lock file before writing (see [Initializing a Database](#initializing-a-database)).
@@ -1010,7 +1032,7 @@ On Unix, a file can be renamed over while other processes have it open. On Windo
 
 ## Compatibility
 
-This crate reads and writes the same format as the other implementations. Its test suite is a port of the Go implementation's, and it includes a database written by the Go implementation (`tests/testdata/test.db`). `interop/run.sh` round-trips a database between this crate and the Go implementation: Rust writes every data type, Go verifies it and appends a moment, Rust verifies that and compacts the database, and Go verifies the compacted copy.
+This crate reads and writes the same format as the other implementations. Its test suite is a port of the Go implementation's, and it includes a database written by the Go implementation (`tests/testdata/test.db`). `interop/run.sh` round-trips a database between this crate and the Go implementation: Rust writes every data type, Go verifies it and appends a moment, Rust verifies that and compacts the database, and Go verifies the compacted copy. `interop/ts/run.sh` replicates databases between this crate and the TypeScript implementation (see [Replicating to TypeScript](#replicating-to-typescript)).
 
 The API follows the Go implementation's, adapted to Rust:
 
