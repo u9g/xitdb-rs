@@ -38,16 +38,18 @@ they hold whatever it is.
 `src/snapshot.rs` proves what the write guarantee means for readers
 (`theorem_snapshots_unchanged`). After any write that keeps
 `tx_hdr_ok(f, g, limit)`, as every verified write does, any array list,
-hash map, linked array list or sorted map (by rank) read whose blocks all
-lie in committed data
+hash map, linked array list or sorted map read (by rank or by key) whose
+blocks all lie in committed data
 (between the root header and `limit`) returns the same result as before,
 and its blocks still lie in committed data. So by induction the result
 holds after any sequence of writes. Committed data only points at
 committed data, so every read of a past moment is such a read.
 
-Sorted map reads by key compare keys stored as byte arrays, and have no
-read specification yet; reads by rank (`sorted_get_by_index`, specified by
-`sorted_read`) are covered.
+Each of these reads is specified over the bytes, and the code is proved to
+return exactly that: `read_array_list_slot` (`al_read`), `read_map_slot`
+(`map_read`), `read_btree_slot` (`btree_read`), `sorted_get_by_index`
+(`sorted_read`) and `sorted_get` (`sorted_find`, which compares keys stored
+inline or as byte arrays in lexicographic order).
 
 ## The boundary
 
@@ -95,7 +97,8 @@ Every function below runs in the crate, with the properties listed.
   - join and split, which only append.
 - **Sorted maps** (`sorted_store.rs`): get, get-by-index, rank, paths,
   put, remove and root growth. Reads change nothing, and writes change
-  nothing before `limit`.
+  nothing before `limit`. Get and get-by-index return exactly what the
+  bytes encode.
 - **Path steps** (`path_store.rs`): what each step of a path writes when it
   creates, copies or updates a collection or writes data. None of them
   changes a committed byte other than the root header.

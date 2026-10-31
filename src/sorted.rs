@@ -112,11 +112,29 @@ pub(crate) fn branch(children: &[Slot], separators: &[Slot], counts: &[i64]) -> 
     node
 }
 
+/// The length of `buf` up to its first zero byte, at most `total`, from `i`.
+pub open spec fn short_len(buf: Seq<u8>, total: int, i: int) -> int
+    decreases total - i,
+{
+    if 0 <= i < total && buf[i] != 0 {
+        short_len(buf, total, i + 1)
+    } else {
+        i
+    }
+}
+
+/// The key bytes a short bytes slot holds inline.
+pub open spec fn short_key(slot: Slot) -> Seq<u8> {
+    let buf = crate::bytes::u64_be_spec(crate::bytes::i2u(slot.value));
+    buf.subrange(0, short_len(buf, if slot.full { 6 } else { 8 }, 0))
+}
+
 /// Decodes a short bytes slot's inline value: its big-endian bytes, and
 /// the length up to the first zero byte.
 pub(crate) fn short_bytes_value(slot: Slot) -> (r: ([u8; 8], usize))
     ensures
         r.0@ == crate::bytes::u64_be_spec(crate::bytes::i2u(slot.value)),
+        r.1 as int == short_len(r.0@, if slot.full { 6 } else { 8 }, 0),
         r.1 <= (if slot.full { 6usize } else { 8usize }),
         forall|i: int| 0 <= i < r.1 ==> #[trigger] r.0@[i] != 0,
         r.1 < (if slot.full { 6usize } else { 8usize }) ==> r.0@[r.1 as int] == 0,
@@ -128,6 +146,7 @@ pub(crate) fn short_bytes_value(slot: Slot) -> (r: ([u8; 8], usize))
         invariant
             len <= total <= 8,
             forall|i: int| 0 <= i < len ==> #[trigger] buf@[i] != 0,
+            short_len(buf@, total as int, len as int) == short_len(buf@, total as int, 0),
         decreases total - len,
     {
         len += 1;

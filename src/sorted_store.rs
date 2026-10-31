@@ -84,12 +84,37 @@ fn zero_vec(n: usize) -> (r: Vec<u8>)
 }
 
 /// Lexicographic comparison of byte strings, as `<[u8]>::cmp`.
-fn lex_cmp(a: &[u8], b: &[u8]) -> (r: Ordering) {
+/// Byte strings in lexicographic order, from index `i`.
+pub open spec fn lex_spec(a: Seq<u8>, b: Seq<u8>, i: int) -> Ordering
+    decreases a.len() - i,
+{
+    if 0 <= i && i < a.len() && i < b.len() {
+        if a[i] < b[i] {
+            Ordering::Less
+        } else if a[i] > b[i] {
+            Ordering::Greater
+        } else {
+            lex_spec(a, b, i + 1)
+        }
+    } else if a.len() < b.len() {
+        Ordering::Less
+    } else if a.len() > b.len() {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+fn lex_cmp(a: &[u8], b: &[u8]) -> (r: Ordering)
+    ensures
+        r == lex_spec(a@, b@, 0),
+{
     let mut i: usize = 0;
     while i < a.len() && i < b.len()
         invariant
             i <= a@.len(),
             i <= b@.len(),
+            lex_spec(a@, b@, i as int) == lex_spec(a@, b@, 0),
         decreases a.len() - i,
     {
         if a[i] < b[i] {
@@ -124,8 +149,9 @@ fn is_less(o: Ordering) -> (r: bool)
 }
 
 /// `read_sorted_node`.
-/// `n` is the sorted node encoded at `ptr`, as far as the descent by rank
-/// reads it: the header, a leaf's entries, a branch's children and counts.
+/// `n` is the sorted node encoded at `ptr`, as far as the descents read
+/// it: the header, a leaf's entries, a branch's children, separators and
+/// counts.
 pub open spec fn snode_at(f: Seq<u8>, ptr: int, n: SortedNode) -> bool {
     &&& 0 <= ptr
     &&& ptr + BTREE_NODE_HEADER_SIZE <= f.len()
@@ -136,6 +162,7 @@ pub open spec fn snode_at(f: Seq<u8>, ptr: int, n: SortedNode) -> bool {
         BTreeNodeKind::Leaf => forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] slot_at(f, ptr + 2 + 9 * i, n.entries[i]),
         BTreeNodeKind::Branch => {
             &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] slot_at(f, ptr + 2 + 9 * i, n.children[i])
+            &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] slot_at(f, ptr + 146 + 9 * i, n.separators[i])
             &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] n.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i)))
             &&& ptr + 290 + 128 <= f.len()
             &&& forall|i: int| 0 <= i < BTREE_SLOT_COUNT ==> #[trigger] n.counts[i] >= 0
@@ -179,7 +206,7 @@ pub proof fn lemma_snode_unique(f: Seq<u8>, ptr: int, a: SortedNode, b: SortedNo
         a.kind == b.kind,
         a.num == b.num,
         a.kind == BTreeNodeKind::Leaf ==> a.entries@ == b.entries@,
-        a.kind == BTreeNodeKind::Branch ==> a.children@ == b.children@ && a.counts@ == b.counts@,
+        a.kind == BTreeNodeKind::Branch ==> a.children@ == b.children@ && a.counts@ == b.counts@ && a.separators@ == b.separators@,
 {
     match (a.kind, b.kind) {
         (BTreeNodeKind::Leaf, BTreeNodeKind::Leaf) => {
@@ -200,8 +227,14 @@ pub proof fn lemma_snode_unique(f: Seq<u8>, ptr: int, a: SortedNode, b: SortedNo
                 assert(a.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
                 assert(b.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
             }
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies a.separators@[i] == b.separators@[i] by {
+                assert(slot_at(f, ptr + 146 + 9 * i, a.separators[i]));
+                assert(slot_at(f, ptr + 146 + 9 * i, b.separators[i]));
+                lemma_slot_encode_injective(a.separators[i], b.separators[i]);
+            }
             assert(a.children@ =~= b.children@);
             assert(a.counts@ =~= b.counts@);
+            assert(a.separators@ =~= b.separators@);
         },
         _ => {},
     }
@@ -233,6 +266,179 @@ proof fn lemma_sorted_read_step(f: Seq<u8>, ptr: int, rank: int, depth: nat, n: 
         assert(crate::btree::cfr(c.counts@, c.num as int, 0, rank, false) == (i, rem));
         crate::btree::lemma_cfr_range(n.counts@, n.num as int, 0, rank, false);
         assert(c.children@[i] == n.children@[i]);
+    }
+}
+
+/// The bytes of a key stored in `slot`: inline, or a byte array.
+pub open spec fn stored_key(f: Seq<u8>, slot: Slot) -> Option<Seq<u8>> {
+    if slot.tag == Tag::ShortBytes {
+        Some(crate::sorted::short_key(slot))
+    } else if slot.tag == Tag::Bytes {
+        let v = slot.value as int;
+        let len = u2i(be_u64_spec(f.subrange(v, v + 8)));
+        if 0 <= v && v + 8 <= f.len() && 0 <= len && v + 8 + len <= f.len() {
+            Some(f.subrange(v + 8, v + 8 + len))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Where an entry's key slot is: after the hash in a hash map pair, first
+/// in a sorted map pair.
+pub open spec fn entry_key_pos(entry: Slot, hash_size: int) -> int {
+    entry.value as int + if entry.tag == Tag::KvPair { hash_size } else { 0 }
+}
+
+/// The key of the entry `entry` points at.
+pub open spec fn entry_key(f: Seq<u8>, entry: Slot, hash_size: int) -> Option<Seq<u8>> {
+    if entry.tag == Tag::KvPair || entry.tag == Tag::SortedKvPair {
+        match slot_spec(f, entry_key_pos(entry, hash_size)) {
+            Some(ks) => stored_key(f, ks),
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// The child of a branch that `key` belongs under: the last one whose
+/// separator is at most `key`, from `i` on.
+pub open spec fn ck_index(f: Seq<u8>, n: SortedNode, i: int, key: Seq<u8>) -> Option<int>
+    decreases n.num - i,
+{
+    if 0 <= i && i + 1 < n.num {
+        match stored_key(f, n.separators[i + 1]) {
+            Some(k) => if lex_spec(k, key, 0) == Ordering::Greater {
+                Some(i)
+            } else {
+                ck_index(f, n, i + 1, key)
+            },
+            None => None,
+        }
+    } else {
+        Some(i)
+    }
+}
+
+/// A leaf's entry for `key`, scanning from `i`: `Some(None)` if it isn't
+/// there, `None` if a key can't be read.
+pub open spec fn leaf_find(f: Seq<u8>, n: SortedNode, ptr: int, i: int, key: Seq<u8>, hash_size: int) -> Option<Option<(int, Slot)>>
+    decreases n.num - i,
+{
+    if 0 <= i < n.num {
+        match entry_key(f, n.entries[i], hash_size) {
+            Some(k) => {
+                let c = lex_spec(k, key, 0);
+                if c == Ordering::Equal {
+                    Some(Some((ptr + 2 + 9 * i, n.entries[i])))
+                } else if c == Ordering::Greater {
+                    Some(None)
+                } else {
+                    leaf_find(f, n, ptr, i + 1, key, hash_size)
+                }
+            },
+            None => None,
+        }
+    } else {
+        Some(None)
+    }
+}
+
+/// The entry for `key` under the node at `ptr`, descending at most
+/// `depth` levels, over the bytes.
+pub open spec fn sorted_find(f: Seq<u8>, ptr: int, key: Seq<u8>, hash_size: int, depth: nat) -> Option<Option<(int, Slot)>>
+    decreases depth,
+{
+    if depth == 0 {
+        None
+    } else if exists|n: SortedNode| snode_at(f, ptr, n) {
+        let n = choose|n: SortedNode| snode_at(f, ptr, n);
+        match n.kind {
+            BTreeNodeKind::Leaf => leaf_find(f, n, ptr, 0, key, hash_size),
+            BTreeNodeKind::Branch => if n.num >= 1 {
+                match ck_index(f, n, 0, key) {
+                    Some(i) => sorted_find(f, n.children[i].value as int, key, hash_size, (depth - 1) as nat),
+                    None => None,
+                }
+            } else {
+                None
+            },
+        }
+    } else {
+        None
+    }
+}
+
+pub proof fn lemma_ck_index_ext(f: Seq<u8>, a: SortedNode, b: SortedNode, i: int, key: Seq<u8>)
+    requires
+        a.num == b.num,
+        a.num <= BTREE_SLOT_COUNT,
+        a.separators@ == b.separators@,
+    ensures
+        ck_index(f, a, i, key) == ck_index(f, b, i, key),
+    decreases a.num - i,
+{
+    if 0 <= i && i + 1 < a.num {
+        assert(a.separators[i + 1] == a.separators@[i + 1]);
+        assert(b.separators[i + 1] == b.separators@[i + 1]);
+        lemma_ck_index_ext(f, a, b, i + 1, key);
+    }
+}
+
+pub proof fn lemma_leaf_find_ext(f: Seq<u8>, a: SortedNode, b: SortedNode, ptr: int, i: int, key: Seq<u8>, hash_size: int)
+    requires
+        a.num == b.num,
+        a.num <= BTREE_SLOT_COUNT,
+        a.entries@ == b.entries@,
+    ensures
+        leaf_find(f, a, ptr, i, key, hash_size) == leaf_find(f, b, ptr, i, key, hash_size),
+    decreases a.num - i,
+{
+    if 0 <= i < a.num {
+        assert(a.entries[i] == a.entries@[i]);
+        assert(b.entries[i] == b.entries@[i]);
+        lemma_leaf_find_ext(f, a, b, ptr, i + 1, key, hash_size);
+    }
+}
+
+/// One level of the descent by key, for the node the code read.
+proof fn lemma_sorted_find_step(f: Seq<u8>, ptr: int, key: Seq<u8>, hash_size: int, depth: nat, n: SortedNode)
+    requires
+        snode_at(f, ptr, n),
+        depth >= 1,
+    ensures
+        n.kind == BTreeNodeKind::Leaf ==> sorted_find(f, ptr, key, hash_size, depth) == leaf_find(f, n, ptr, 0, key, hash_size),
+        (n.kind == BTreeNodeKind::Branch && n.num >= 1) ==> sorted_find(f, ptr, key, hash_size, depth) == match ck_index(f, n, 0, key) {
+            Some(i) => sorted_find(f, n.children[i].value as int, key, hash_size, (depth - 1) as nat),
+            None => None,
+        },
+{
+    let c = choose|m: SortedNode| snode_at(f, ptr, m);
+    lemma_snode_unique(f, ptr, n, c);
+    if n.kind == BTreeNodeKind::Leaf {
+        lemma_leaf_find_ext(f, n, c, ptr, 0, key, hash_size);
+    }
+    if n.kind == BTreeNodeKind::Branch && n.num >= 1 {
+        lemma_ck_index_ext(f, n, c, 0, key);
+        if let Some(i) = ck_index(f, n, 0, key) {
+            lemma_ck_index_range(f, n, 0, key);
+            assert(c.children@[i] == n.children@[i]);
+        }
+    }
+}
+
+proof fn lemma_ck_index_range(f: Seq<u8>, n: SortedNode, i: int, key: Seq<u8>)
+    requires
+        0 <= i < n.num,
+    ensures
+        ck_index(f, n, i, key) matches Some(j) ==> i <= j < n.num,
+    decreases n.num - i,
+{
+    if i + 1 < n.num {
+        lemma_ck_index_range(f, n, i + 1, key);
     }
 }
 
@@ -274,6 +480,9 @@ pub fn read_sorted_node<S: Store>(s: &mut S, ptr: i64) -> (r: Result<SortedNode>
             proof {
                 assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(f, ptr + 2 + 9 * i, node.children[i]) by {
                     assert(f.subrange(ptr + 2 + 9 * i, ptr + 2 + 9 * i + 9) =~= body@.subrange(i * 9, i * 9 + 9));
+                }
+                assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(f, ptr + 146 + 9 * i, node.separators[i]) by {
+                    assert(f.subrange(ptr + 146 + 9 * i, ptr + 146 + 9 * i + 9) =~= body@.subrange(144, 288).subrange(i * 9, i * 9 + 9));
                 }
                 let cb = body@.subrange(288, 416);
                 assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] node.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))) by {
@@ -335,14 +544,33 @@ pub fn sorted_write_node<S: Store>(s: &mut S, node: &SortedNode, old_ptr: i64, l
 pub fn read_kv_pair<S: Store>(s: &mut S, kv_slot: Slot, hash_size: usize) -> (r: Result<KeyValuePair>)
     ensures
         final(s).file() == old(s).file(),
+        r is Ok ==> (kv_slot.tag == Tag::KvPair || kv_slot.tag == Tag::SortedKvPair)
+            && slot_at(old(s).file(), entry_key_pos(kv_slot, hash_size as int), r.unwrap().key_slot),
 {
     if hash_size > 0xffff {
         return Err(Error::InvalidHashSize);
     }
     let len = KeyValuePair::encoded_len(kv_slot.tag, hash_size)?;
     let mut buf = zero_vec(len);
+    let ghost f = s.file();
     s.read_at(kv_slot.value, buf.as_mut_slice())?;
-    KeyValuePair::decode(buf.as_slice(), kv_slot.tag, hash_size)
+    let r = KeyValuePair::decode(buf.as_slice(), kv_slot.tag, hash_size);
+    proof {
+        if let Ok(kv) = &r {
+            let v = kv_slot.value as int;
+            if kv_slot.tag == Tag::KvPair {
+                let h = hash_size as int;
+                assert(kv_encode_spec(*kv).subrange(h, h + 9) =~= slot_encode_spec(kv.key_slot));
+                assert(buf@.subrange(h, h + 9) =~= buf@.subrange(0, h + 18).subrange(h, h + 9));
+                assert(f.subrange(v + h, v + h + 9) =~= buf@.subrange(h, h + 9));
+            } else {
+                assert(sorted_kv_encode_spec(*kv).subrange(0, 9) =~= slot_encode_spec(kv.key_slot));
+                assert(buf@.subrange(0, 9) =~= buf@.subrange(0, 18).subrange(0, 9));
+                assert(f.subrange(v, v + 9) =~= buf@.subrange(0, 9));
+            }
+        }
+    }
+    r
 }
 
 /// `write_kv_pair`: the entry, appended.
@@ -400,6 +628,7 @@ pub fn checked_len<S: Store>(s: &mut S, pos: i64, len: i64) -> (r: Result<usize>
 pub fn compare_key<S: Store>(s: &mut S, key_slot: Slot, target: &[u8]) -> (r: Result<Ordering>)
     ensures
         final(s).file() == old(s).file(),
+        r is Ok ==> (stored_key(old(s).file(), key_slot) matches Some(k) && r.unwrap() == lex_spec(k, target@, 0)),
 {
     match key_slot.tag {
         Tag::ShortBytes => {
@@ -407,6 +636,7 @@ pub fn compare_key<S: Store>(s: &mut S, key_slot: Slot, target: &[u8]) -> (r: Re
             Ok(lex_cmp(slice_subrange(buf.as_slice(), 0, len), target))
         },
         Tag::Bytes => {
+            let ghost f = s.file();
             let mut lbuf = [0u8; 8];
             s.read_at(key_slot.value, &mut lbuf)?;
             let len = read_i64(&lbuf);
@@ -417,6 +647,11 @@ pub fn compare_key<S: Store>(s: &mut S, key_slot: Slot, target: &[u8]) -> (r: Re
             let len = checked_len(s, start, len)?;
             let mut key = zero_vec(len);
             s.read_at(start, key.as_mut_slice())?;
+            proof {
+                let v = key_slot.value as int;
+                assert(lbuf@.subrange(0, 8) =~= f.subrange(v, v + 8));
+                assert(key@ =~= f.subrange(v + 8, v + 8 + len));
+            }
             Ok(lex_cmp(key.as_slice(), target))
         },
         _ => Err(Error::UnexpectedTag),
@@ -428,8 +663,12 @@ pub fn compare_entry_key<S: Store>(s: &mut S, entry: Slot, target: &[u8], hash_s
         hash_size <= 0xffff,
     ensures
         final(s).file() == old(s).file(),
+        r is Ok ==> (entry_key(old(s).file(), entry, hash_size as int) matches Some(k) && r.unwrap() == lex_spec(k, target@, 0)),
 {
     let kv = read_kv_pair(s, entry, hash_size)?;
+    proof {
+        lemma_slot_spec(s.file(), entry_key_pos(entry, hash_size as int), kv.key_slot);
+    }
     compare_key(s, kv.key_slot, target)
 }
 
@@ -441,6 +680,7 @@ pub fn child_for_key<S: Store>(s: &mut S, node: &SortedNode, key: &[u8]) -> (r: 
     ensures
         final(s).file() == old(s).file(),
         r is Ok ==> r.unwrap().0 < node.num || (node.num == 0 && r.unwrap().0 == 0),
+        r is Ok ==> ck_index(old(s).file(), *node, 0, key@) == Some(r.unwrap().0 as int),
 {
     let mut i: usize = 0;
     let mut before = 0i64;
@@ -449,6 +689,9 @@ pub fn child_for_key<S: Store>(s: &mut S, node: &SortedNode, key: &[u8]) -> (r: 
             i < node.num || (node.num == 0 && i == 0),
             node.num <= BTREE_SLOT_COUNT,
             s.file() == old(s).file(),
+            ck_index(old(s).file(), *node, i as int, key@) == ck_index(old(s).file(), *node, 0, key@),
+        ensures
+            ck_index(old(s).file(), *node, 0, key@) == Some(i as int),
         decreases node.num - i,
     {
         let c = compare_key(s, node.separators[i + 1], key)?;
@@ -503,16 +746,29 @@ fn entry_position(node_ptr: i64, i: usize) -> (r: Result<i64>)
 pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usize) -> (r: Result<Option<SortedSlot>>)
     ensures
         final(s).file() == old(s).file(),
+        r is Ok ==> exists|d: nat| #[trigger] sorted_find(old(s).file(), root_ptr as int, key@, hash_size as int, d) == Some(
+            match r.unwrap() {
+                Some(ss) => Some((ss.position as int, ss.slot)),
+                None => None,
+            },
+        ),
 {
     if hash_size > 0xffff {
         return Err(Error::InvalidHashSize);
     }
     let mut node_ptr = root_ptr;
     let mut fuel = walk_bound(s, SORTED_BRANCH_BLOCK_SIZE as u64)?;
+    let ghost f = s.file();
+    let ghost h = hash_size as int;
+    let ghost mut k: nat = 0;
     loop
         invariant
-            s.file() == old(s).file(),
+            s.file() == f,
+            f == old(s).file(),
             hash_size <= 0xffff,
+            h == hash_size as int,
+            forall|d: nat| #[trigger] sorted_find(f, node_ptr as int, key@, h, d) is Some ==> sorted_find(f, root_ptr as int, key@, h, d + k)
+                == sorted_find(f, node_ptr as int, key@, h, d),
         decreases fuel,
     {
         if fuel == 0 {
@@ -521,12 +777,21 @@ pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usi
         fuel = fuel - 1;
         let node = read_sorted_node(s, node_ptr)?;
         if matches!(node.kind, BTreeNodeKind::Leaf) {
+            proof {
+                lemma_sorted_find_step(f, node_ptr as int, key@, h, 1, node);
+            }
             let mut i: usize = 0;
             while i < node.num
                 invariant
                     i <= node.num <= BTREE_SLOT_COUNT,
-                    s.file() == old(s).file(),
+                    s.file() == f,
+                    f == old(s).file(),
                     hash_size <= 0xffff,
+                    h == hash_size as int,
+                    leaf_find(f, node, node_ptr as int, i as int, key@, h) == leaf_find(f, node, node_ptr as int, 0, key@, h),
+                    sorted_find(f, node_ptr as int, key@, h, 1) == leaf_find(f, node, node_ptr as int, 0, key@, h),
+                    forall|d: nat| #[trigger] sorted_find(f, node_ptr as int, key@, h, d) is Some ==> sorted_find(f, root_ptr as int, key@, h, d + k)
+                        == sorted_find(f, node_ptr as int, key@, h, d),
                 decreases node.num - i,
             {
                 let entry = node.entries[i];
@@ -534,17 +799,41 @@ pub fn sorted_get<S: Store>(s: &mut S, root_ptr: i64, key: &[u8], hash_size: usi
                 match c {
                     Ordering::Equal => {
                         let position = entry_position(node_ptr, i)?;
+                        proof {
+                            assert(sorted_find(f, root_ptr as int, key@, h, 1 + k) == Some(Some((position as int, entry))));
+                        }
                         return Ok(Some(SortedSlot { slot: entry, position }));
                     },
-                    Ordering::Greater => return Ok(None),
+                    Ordering::Greater => {
+                        proof {
+                            assert(sorted_find(f, root_ptr as int, key@, h, 1 + k) == Some(None::<(int, Slot)>));
+                        }
+                        return Ok(None);
+                    },
                     Ordering::Less => {},
                 }
                 i += 1;
             }
+            proof {
+                assert(sorted_find(f, root_ptr as int, key@, h, 1 + k) == Some(None::<(int, Slot)>));
+            }
             return Ok(None);
         }
+        // a branch without children is corrupt
+        if node.num == 0 {
+            return Err(Error::InvalidBTreeNode);
+        }
         let (i, _) = child_for_key(s, &node, key)?;
+        let ghost old_ptr = node_ptr;
         node_ptr = node.children[i].value;
+        proof {
+            assert forall|d: nat| #[trigger] sorted_find(f, node_ptr as int, key@, h, d) is Some implies sorted_find(f, root_ptr as int, key@, h, d + k + 1)
+                == sorted_find(f, node_ptr as int, key@, h, d) by {
+                lemma_sorted_find_step(f, old_ptr as int, key@, h, d + 1, node);
+                assert(((d + 1) - 1) as nat == d);
+            }
+            k = k + 1;
+        }
     }
 }
 

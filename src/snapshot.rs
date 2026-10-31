@@ -3,9 +3,9 @@
 //! Every verified write keeps `tx_hdr_ok(f, g, limit)`: nothing before
 //! `limit`, where the transaction started, changes apart from the root
 //! header. This module proves what that means for readers. A read of an
-//! array list, hash map, linked array list or sorted map (by rank) whose
-//! blocks all lie in committed data (between the root header and `limit`)
-//! gives the same result after the write as before it. Committed data only points at
+//! array list, hash map, linked array list or sorted map (by rank or by
+//! key) whose blocks all lie in committed data (between the root header and
+//! `limit`) gives the same result after the write as before it. Committed data only points at
 //! committed data, so this holds for every read of a past moment, and by
 //! induction for any sequence of writes.
 
@@ -443,6 +443,10 @@ proof fn lemma_snode_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, n: Sorte
                 assert(slot_at(f, ptr + 2 + 9 * i, n.children[i]));
                 lemma_agree_range(f, g, upto, ptr + 2 + 9 * i, SLOT_LENGTH as int);
             }
+            assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] slot_at(g, ptr + 146 + 9 * i, n.separators[i]) by {
+                assert(slot_at(f, ptr + 146 + 9 * i, n.separators[i]));
+                lemma_agree_range(f, g, upto, ptr + 146 + 9 * i, SLOT_LENGTH as int);
+            }
             assert forall|i: int| 0 <= i < BTREE_SLOT_COUNT implies #[trigger] n.counts[i] == u2i(be_u64_spec(g.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))) by {
                 assert(n.counts[i] == u2i(be_u64_spec(f.subrange(ptr + 290 + 8 * i, ptr + 298 + 8 * i))));
                 lemma_agree_range(f, g, upto, ptr + 290 + 8 * i, 8);
@@ -511,12 +515,191 @@ pub proof fn lemma_sorted_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, ran
     }
 }
 
+// sorted maps, by key
+
+/// The bytes of the key in `slot` lie in committed data.
+pub open spec fn key_fits(f: Seq<u8>, upto: int, slot: Slot) -> bool {
+    slot.tag == Tag::Bytes ==> {
+        let v = slot.value as int;
+        &&& fits(v, 8, upto)
+        &&& u2i(be_u64_spec(f.subrange(v, v + 8))) >= 0 ==> fits(v + 8, u2i(be_u64_spec(f.subrange(v, v + 8))) as int, upto)
+    }
+}
+
+/// The key of the entry `entry` points at lies in committed data.
+pub open spec fn entry_fits(f: Seq<u8>, upto: int, entry: Slot, hash_size: int) -> bool {
+    (entry.tag == Tag::KvPair || entry.tag == Tag::SortedKvPair) ==> {
+        &&& fits(entry_key_pos(entry, hash_size), SLOT_LENGTH as int, upto)
+        &&& match slot_spec(f, entry_key_pos(entry, hash_size)) {
+            Some(ks) => key_fits(f, upto, ks),
+            None => true,
+        }
+    }
+}
+
+proof fn lemma_key_frame(f: Seq<u8>, g: Seq<u8>, upto: int, slot: Slot)
+    requires
+        agree(f, g, upto),
+        key_fits(f, upto, slot),
+    ensures
+        stored_key(g, slot) == stored_key(f, slot),
+        key_fits(g, upto, slot),
+{
+    if slot.tag == Tag::Bytes {
+        let v = slot.value as int;
+        lemma_agree_range(f, g, upto, v, 8);
+        let len = u2i(be_u64_spec(f.subrange(v, v + 8))) as int;
+        if len >= 0 {
+            lemma_agree_range(f, g, upto, v + 8, len);
+        }
+    }
+}
+
+proof fn lemma_entry_frame(f: Seq<u8>, g: Seq<u8>, upto: int, entry: Slot, hash_size: int)
+    requires
+        agree(f, g, upto),
+        entry_fits(f, upto, entry, hash_size),
+    ensures
+        entry_key(g, entry, hash_size) == entry_key(f, entry, hash_size),
+        entry_fits(g, upto, entry, hash_size),
+{
+    if entry.tag == Tag::KvPair || entry.tag == Tag::SortedKvPair {
+        let p = entry_key_pos(entry, hash_size);
+        lemma_slot_frame(f, g, upto, p);
+        if let Some(ks) = slot_spec(f, p) {
+            lemma_key_frame(f, g, upto, ks);
+        }
+    }
+}
+
+proof fn lemma_ck_frame(f: Seq<u8>, g: Seq<u8>, upto: int, n: SortedNode, i: int, key: Seq<u8>)
+    requires
+        agree(f, g, upto),
+        forall|j: int| 1 <= j < n.num ==> key_fits(f, upto, #[trigger] n.separators[j]),
+    ensures
+        ck_index(g, n, i, key) == ck_index(f, n, i, key),
+    decreases n.num - i,
+{
+    if 0 <= i && i + 1 < n.num {
+        lemma_key_frame(f, g, upto, n.separators[i + 1]);
+        lemma_ck_frame(f, g, upto, n, i + 1, key);
+    }
+}
+
+proof fn lemma_leaf_find_frame(f: Seq<u8>, g: Seq<u8>, upto: int, n: SortedNode, ptr: int, i: int, key: Seq<u8>, hash_size: int)
+    requires
+        agree(f, g, upto),
+        forall|j: int| 0 <= j < n.num ==> entry_fits(f, upto, #[trigger] n.entries[j], hash_size),
+    ensures
+        leaf_find(g, n, ptr, i, key, hash_size) == leaf_find(f, n, ptr, i, key, hash_size),
+    decreases n.num - i,
+{
+    if 0 <= i < n.num {
+        lemma_entry_frame(f, g, upto, n.entries[i], hash_size);
+        lemma_leaf_find_frame(f, g, upto, n, ptr, i + 1, key, hash_size);
+    }
+}
+
+/// Every node, entry key and separator key the descent by key reads lies
+/// in committed data.
+pub open spec fn find_fits(f: Seq<u8>, upto: int, ptr: int, key: Seq<u8>, hash_size: int, depth: nat) -> bool
+    decreases depth,
+{
+    if depth == 0 {
+        true
+    } else {
+        &&& fits(ptr, BTREE_NODE_HEADER_SIZE as int, upto)
+        &&& fits(ptr, snode_size(f, ptr), upto)
+        &&& (exists|n: SortedNode| snode_at(f, ptr, n)) ==> {
+            let n = choose|n: SortedNode| snode_at(f, ptr, n);
+            match n.kind {
+                BTreeNodeKind::Leaf => forall|j: int| 0 <= j < n.num ==> entry_fits(f, upto, #[trigger] n.entries[j], hash_size),
+                BTreeNodeKind::Branch => {
+                    &&& forall|j: int| 1 <= j < n.num ==> key_fits(f, upto, #[trigger] n.separators[j])
+                    &&& n.num >= 1 ==> match ck_index(f, n, 0, key) {
+                        Some(i) => find_fits(f, upto, n.children[i].value as int, key, hash_size, (depth - 1) as nat),
+                        None => true,
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A sorted map lookup by key in committed data gives the same result.
+pub proof fn lemma_find_frame(f: Seq<u8>, g: Seq<u8>, upto: int, ptr: int, key: Seq<u8>, hash_size: int, depth: nat)
+    requires
+        agree(f, g, upto),
+        find_fits(f, upto, ptr, key, hash_size, depth),
+    ensures
+        sorted_find(g, ptr, key, hash_size, depth) == sorted_find(f, ptr, key, hash_size, depth),
+        find_fits(g, upto, ptr, key, hash_size, depth),
+    decreases depth,
+{
+    if depth > 0 {
+        assert(g[ptr] == f[ptr]);
+        assert(snode_size(g, ptr) == snode_size(f, ptr));
+        lemma_agree_symm(f, g, upto);
+        let ef = exists|n: SortedNode| snode_at(f, ptr, n);
+        let eg = exists|n: SortedNode| snode_at(g, ptr, n);
+        if ef {
+            let a = choose|n: SortedNode| snode_at(f, ptr, n);
+            assert(a.kind == BTreeNodeKind::Leaf <==> f[ptr] == kind_byte_spec(BTreeNodeKind::Leaf)) by {
+                if a.kind != BTreeNodeKind::Leaf {
+                    assert(kind_byte_spec(a.kind) != kind_byte_spec(BTreeNodeKind::Leaf));
+                }
+            }
+            lemma_snode_frame(f, g, upto, ptr, a);
+            assert(eg);
+            let b = choose|n: SortedNode| snode_at(g, ptr, n);
+            assert(b.kind == a.kind) by {
+                lemma_kind_byte(a.kind, b.kind);
+            }
+            lemma_snode_frame(g, f, upto, ptr, b);
+            lemma_snode_unique(f, ptr, a, b);
+            match a.kind {
+                BTreeNodeKind::Leaf => {
+                    lemma_leaf_find_frame(f, g, upto, a, ptr, 0, key, hash_size);
+                    lemma_leaf_find_ext(g, a, b, ptr, 0, key, hash_size);
+                    assert forall|j: int| 0 <= j < b.num implies entry_fits(g, upto, #[trigger] b.entries[j], hash_size) by {
+                        assert(b.entries[j] == b.entries@[j] && a.entries[j] == a.entries@[j]);
+                        lemma_entry_frame(f, g, upto, a.entries[j], hash_size);
+                    }
+                },
+                BTreeNodeKind::Branch => {
+                    lemma_ck_frame(f, g, upto, a, 0, key);
+                    lemma_ck_index_ext(g, a, b, 0, key);
+                    assert forall|j: int| 1 <= j < b.num implies key_fits(g, upto, #[trigger] b.separators[j]) by {
+                        assert(b.separators[j] == b.separators@[j] && a.separators[j] == a.separators@[j]);
+                        lemma_key_frame(f, g, upto, a.separators[j]);
+                    }
+                    if a.num >= 1 {
+                        if let Some(i) = ck_index(f, a, 0, key) {
+                            assert(a.children[i] == a.children@[i]);
+                            assert(b.children[i] == b.children@[i]);
+                            lemma_find_frame(f, g, upto, a.children[i].value as int, key, hash_size, (depth - 1) as nat);
+                        }
+                    }
+                },
+            }
+        } else if eg {
+            let b = choose|n: SortedNode| snode_at(g, ptr, n);
+            assert(b.kind == BTreeNodeKind::Leaf <==> g[ptr] == kind_byte_spec(BTreeNodeKind::Leaf)) by {
+                if b.kind != BTreeNodeKind::Leaf {
+                    assert(kind_byte_spec(b.kind) != kind_byte_spec(BTreeNodeKind::Leaf));
+                }
+            }
+            lemma_snode_frame(g, f, upto, ptr, b);
+        }
+    }
+}
+
 // the theorem
 
 /// Old snapshots never change. After a write that keeps
 /// `tx_hdr_ok(f, g, limit)`, as every verified write does, any array list,
-/// hash map, linked array list or sorted map read whose blocks lie in
-/// committed data gives the same result, and still lies in committed data,
+/// hash map, linked array list or sorted map read (by rank or by key)
+/// whose blocks lie in committed data gives the same result, and still lies in committed data,
 /// so this extends to any sequence of writes.
 pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
     requires
@@ -533,6 +716,9 @@ pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
             ==> btree_read(g, ptr, rank, depth) == btree_read(f, ptr, rank, depth) && btree_fits(g, limit, ptr, rank, depth),
         forall|ptr: int, rank: int, depth: nat| #[trigger] sorted_fits(f, limit, ptr, rank, depth)
             ==> sorted_read(g, ptr, rank, depth) == sorted_read(f, ptr, rank, depth) && sorted_fits(g, limit, ptr, rank, depth),
+        forall|ptr: int, key: Seq<u8>, hash_size: int, depth: nat| #[trigger] find_fits(f, limit, ptr, key, hash_size, depth)
+            ==> sorted_find(g, ptr, key, hash_size, depth) == sorted_find(f, ptr, key, hash_size, depth)
+                && find_fits(g, limit, ptr, key, hash_size, depth),
 {
     lemma_tx_agree(f, g, limit);
     assert forall|index_pos: int, key: int, shift: nat| #[trigger] al_fits(f, limit, index_pos, key, shift)
@@ -552,6 +738,11 @@ pub proof fn theorem_snapshots_unchanged(f: Seq<u8>, g: Seq<u8>, limit: int)
     assert forall|ptr: int, rank: int, depth: nat| #[trigger] sorted_fits(f, limit, ptr, rank, depth)
         implies sorted_read(g, ptr, rank, depth) == sorted_read(f, ptr, rank, depth) && sorted_fits(g, limit, ptr, rank, depth) by {
         lemma_sorted_frame(f, g, limit, ptr, rank, depth);
+    }
+    assert forall|ptr: int, key: Seq<u8>, hash_size: int, depth: nat| #[trigger] find_fits(f, limit, ptr, key, hash_size, depth)
+        implies sorted_find(g, ptr, key, hash_size, depth) == sorted_find(f, ptr, key, hash_size, depth)
+            && find_fits(g, limit, ptr, key, hash_size, depth) by {
+        lemma_find_frame(f, g, limit, ptr, key, hash_size, depth);
     }
 }
 
