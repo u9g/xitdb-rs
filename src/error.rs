@@ -81,7 +81,9 @@ pub enum Error {
         previous: u64,
     },
     /// A typed collection's codec couldn't decode a stored key or value.
-    /// Boxed so that it doesn't make every `Result` bigger.
+    /// Boxed so that it doesn't make every `Result` bigger. It displays all
+    /// of the [`DecodeError`], so it has no
+    /// [`source`](std::error::Error::source).
     Decode(Box<DecodeError>),
 }
 
@@ -183,7 +185,6 @@ impl std::error::Error for Error {
             Error::Io(err) => Some(err),
             Error::CompactFileReopenFailed { rename_error, .. } => Some(rename_error),
             Error::InvalidUtf8(err) => Some(err),
-            Error::Decode(err) => Some(err),
             _ => None,
         }
     }

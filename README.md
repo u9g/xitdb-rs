@@ -625,9 +625,9 @@ fn main() -> xitdb::Result<()> {
 When the same collections are used all over an app, naming them and converting their keys and values by hand gets repetitive. A `Map<K, V>` or `Set<K>` declares a collection once, as a `const`, with its name in the parent map and its types. Each method takes the parent: reads take a `&ReadHashMap` (a moment, or any nested map; a `WriteHashMap` dereferences to one), and writes take a `&mut WriteHashMap`.
 
 * A missing collection reads as empty: `get` returns `None`, `contains` returns `false`, and `iter` yields nothing. Writes create it with `put_map`/`put_set`, so they run inside a transaction like those. `remove`, and `Set::insert` of a key that's already there, write nothing.
-* Like the typed getters, an empty value (`Data::None`) reads as a missing key.
+* Like the typed getters, an empty value (`Data::None`) reads as a missing key, for `get`, `contains`, `remove` and `iter` alike.
 * `iter` yields owned `(key, value)` pairs (or keys, for a set) as `Result`s.
-* A value that doesn't decode is an `Error::Decode`, with the collection's name, the key and what was wrong, rather than being skipped.
+* A value that doesn't decode is an `Error::Decode`, with the collection's name, the key and what was wrong, rather than being skipped. So is anything under the name that isn't the right kind of collection, for reads and writes alike. I/O errors stay `Error::Io`.
 * The data is a plain hash map or set under the name, so untyped code and the other implementations read and write the same collections.
 
 Keys are converted by a `KeyCodec`, implemented for `str`, `String`, `[u8]`, `Vec<u8>` and the integer types (big-endian at the type's full width). Values are converted by a `ValueCodec`, which reads from a `ReadCursor` and writes through a `WriteCursor`, so a value can be a nested structure. It's implemented for `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` (stored as the `Uint` `0` or `1`), and `Option<T>` (with `None` stored as an empty value). With the `serde` feature, `Json<T>` stores any serde type as JSON, tagged `js`; it also reads untagged JSON strings, so `Map<str, Json<Proposal>>` reads collections written with `serde_json::to_string`.

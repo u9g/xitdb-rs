@@ -54,6 +54,12 @@ fn check_put_tag(slot: Option<Slot>, tag: Tag) -> Result<()> {
     }
 }
 
+/// Whether a value cursor from a map has a value: the typed getters treat
+/// an empty one (written as [`Data::None`]) like a missing key.
+pub(crate) fn has_value<C: Core>(cursor: &ReadCursor<'_, C>) -> bool {
+    cursor.slot_ptr.slot.tag != Tag::None
+}
+
 /// Maps "key not found" to `false`, as remove methods report it.
 fn removed(result: Result<WriteCursor<'_, impl Core>>) -> Result<bool> {
     match result {
@@ -440,14 +446,18 @@ impl<'a, C: Core> ReadHashMap<'a, C> {
         Ok(KvPairIterator { iter: self.cursor.iter()? })
     }
 
-    fn hash(&self, key: impl AsRef<[u8]>) -> Vec<u8> {
+    pub(crate) fn hash(&self, key: impl AsRef<[u8]>) -> Vec<u8> {
         self.cursor.db.digest(key.as_ref())
     }
 
     // the value of `key`, or `None` if it isn't in the map or its value is
     // empty. the typed getters treat both the same way.
-    fn get_value_cursor(&self, key: impl AsRef<[u8]>) -> Result<Option<ReadCursor<'a, C>>> {
-        Ok(self.get_cursor(key)?.filter(|cursor| cursor.slot_ptr.slot.tag != Tag::None))
+    pub(crate) fn get_value_cursor(&self, key: impl AsRef<[u8]>) -> Result<Option<ReadCursor<'a, C>>> {
+        self.get_value_cursor_by_hash(&self.hash(key))
+    }
+
+    pub(crate) fn get_value_cursor_by_hash(&self, hash: &[u8]) -> Result<Option<ReadCursor<'a, C>>> {
+        Ok(self.get_cursor_by_hash(hash)?.filter(has_value))
     }
 
     /// The hash map at `key`. Like all the typed getters, this returns
@@ -596,19 +606,33 @@ impl<'a, C: Core> WriteHashMap<'a, C> {
     /// transaction, it returns [`Error::ExpectedTxStart`] without writing
     /// anything.
     pub fn put_map(&mut self, key: impl AsRef<[u8]>) -> Result<WriteHashMap<'a, C>> {
-        let init = PathPart::HashMapInit { counted: false, set: false };
-        Ok(WriteHashMap { cursor: self.put_collection(key.as_ref(), init, Tag::HashMap)? })
+        let key = key.as_ref();
+        self.put_map_by_hash(&self.hash(key), key)
     }
 
     /// Like [`WriteHashMap::put_map`], for a hash set.
     pub fn put_set(&mut self, key: impl AsRef<[u8]>) -> Result<WriteHashSet<'a, C>> {
+        let key = key.as_ref();
+        self.put_set_by_hash(&self.hash(key), key)
+    }
+
+    // like put_map, when the caller already has the hash of `key`
+    pub(crate) fn put_map_by_hash(&mut self, hash: &[u8], key: &[u8]) -> Result<WriteHashMap<'a, C>> {
+        let init = PathPart::HashMapInit { counted: false, set: false };
+        Ok(WriteHashMap { cursor: self.put_collection(hash, key, init, Tag::HashMap)? })
+    }
+
+    // like put_set, when the caller already has the hash of `key`
+    pub(crate) fn put_set_by_hash(&mut self, hash: &[u8], key: &[u8]) -> Result<WriteHashSet<'a, C>> {
         let init = PathPart::HashMapInit { counted: false, set: true };
-        Ok(WriteHashSet { cursor: self.put_collection(key.as_ref(), init, Tag::HashSet)? })
+        Ok(WriteHashSet { cursor: self.put_collection(hash, key, init, Tag::HashSet)? })
     }
 
     /// Like [`WriteHashMap::put_map`], for an array list.
     pub fn put_list(&mut self, key: impl AsRef<[u8]>) -> Result<WriteArrayList<'a, C>> {
-        Ok(WriteArrayList { cursor: self.put_collection(key.as_ref(), PathPart::ArrayListInit, Tag::ArrayList)? })
+        let key = key.as_ref();
+        let hash = self.hash(key);
+        Ok(WriteArrayList { cursor: self.put_collection(&hash, key, PathPart::ArrayListInit, Tag::ArrayList)? })
     }
 
     /// Sets the stored key of `key` to `data`, if it isn't set yet.
@@ -672,12 +696,11 @@ impl<'a, C: Core> WriteHashMap<'a, C> {
 
     // checks the existing value before writing, then writes the key (if
     // it's empty) and initializes the collection in one write
-    fn put_collection(&mut self, key: &[u8], init: PathPart<'_>, tag: Tag) -> Result<WriteCursor<'a, C>> {
+    fn put_collection(&mut self, hash: &[u8], key: &[u8], init: PathPart<'_>, tag: Tag) -> Result<WriteCursor<'a, C>> {
         self.cursor.check_in_transaction()?;
-        let hash = self.hash(key);
-        check_put_tag(self.get_slot_by_hash(&hash)?, tag)?;
+        check_put_tag(self.get_slot_by_hash(hash)?, tag)?;
         let mut collection = None;
-        self.cursor.write_path_context(&[PathPart::HashMapGet(HashMapGetTarget::KvPair(&hash))], |cursor| {
+        self.cursor.write_path_context(&[PathPart::HashMapGet(HashMapGetTarget::KvPair(hash))], |cursor| {
             let mut kv = cursor.read_key_value_pair()?;
             kv.key_cursor.write_if_empty(Data::bytes(key))?;
             collection = Some(kv.value_cursor.write_path(&[init])?);

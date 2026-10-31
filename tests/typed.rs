@@ -271,7 +271,9 @@ fn integers_read_across_signedness() {
     let db = with_moment(|moment| {
         let mut ints = moment.put_map("ints")?;
         ints.put("from-uint", 5u64)?;
-        ints.put("too-big", u64::MAX >> 1)?;
+        ints.put("max", u64::MAX >> 1)?;
+        ints.put("too-big", 1u64 << 63)?;
+        ints.put("u64-max", u64::MAX)?;
         let mut uints = moment.put_map("uints")?;
         uints.put("from-int", 6i64)?;
         uints.put("negative", -1i64)?;
@@ -279,10 +281,71 @@ fn integers_read_across_signedness() {
     });
     let moment = latest(&db);
     assert_eq!(INTS.get(&moment, "from-uint").unwrap(), Some(5));
-    assert_eq!(INTS.get(&moment, "too-big").unwrap(), Some(i64::MAX));
+    assert_eq!(INTS.get(&moment, "max").unwrap(), Some(i64::MAX));
+    let err = decode_error(INTS.get(&moment, "too-big"));
+    assert_eq!((err.collection.as_deref(), err.key.as_deref()), (Some("ints"), Some("\"too-big\"")));
+    assert_eq!(err.message, "9223372036854775808 doesn't fit in an i64");
+    let err = decode_error(INTS.get(&moment, "u64-max"));
+    assert_eq!(err.message, "18446744073709551615 doesn't fit in an i64");
     assert_eq!(UINTS.get(&moment, "from-int").unwrap(), Some(6));
     let err = decode_error(UINTS.get(&moment, "negative"));
     assert_eq!(err.message, "-1 doesn't fit in a u64");
+}
+
+#[test]
+fn u64_values_above_i64_max_round_trip() {
+    const UINTS: Map<str, u64> = Map::new("uints");
+    const BOOLS: Map<str, bool> = Map::new("uints");
+    let db = with_moment(|moment| {
+        UINTS.put(moment, "max", &u64::MAX)?;
+        UINTS.put(moment, "2^63", &(1 << 63))?;
+        Ok(())
+    });
+    let moment = latest(&db);
+    assert_eq!(UINTS.get(&moment, "max").unwrap(), Some(u64::MAX));
+    assert_eq!(UINTS.get(&moment, "2^63").unwrap(), Some(1 << 63));
+    let mut entries: Vec<_> = UINTS.iter(&moment).unwrap().collect::<Result<_>>().unwrap();
+    entries.sort();
+    assert_eq!(entries, [("2^63".to_string(), 1 << 63), ("max".to_string(), u64::MAX)]);
+
+    // a large Uint isn't a bool
+    let err = decode_error(BOOLS.get(&moment, "max"));
+    assert_eq!(err.message, "expected 0 or 1 for a bool, found 18446744073709551615");
+}
+
+/// A codec that reads with `ReadCursor::read_uint`, which rejects a Uint
+/// above `i64::MAX`, or fails with an I/O error for 0.
+struct StrictUint;
+
+impl ValueCodec for StrictUint {
+    type Owned = u64;
+    type Borrowed = u64;
+
+    fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<u64> {
+        match cursor.read_uint()? {
+            0 => Err(Error::Io(std::io::Error::other("disk on fire"))),
+            value => Ok(value),
+        }
+    }
+
+    fn write<C: Core>(value: &u64, cursor: &mut WriteCursor<'_, C>) -> Result<()> {
+        cursor.write(*value)
+    }
+}
+
+#[test]
+fn errors_from_stored_data_are_decode_errors_and_io_errors_are_not() {
+    const STRICT: Map<str, StrictUint> = Map::new("strict");
+    let db = with_moment(|moment| {
+        STRICT.put(moment, "big", &u64::MAX)?;
+        STRICT.put(moment, "zero", &0)?;
+        Ok(())
+    });
+    let moment = latest(&db);
+    let err = decode_error(STRICT.get(&moment, "big"));
+    assert_eq!((err.collection.as_deref(), err.key.as_deref()), (Some("strict"), Some("\"big\"")));
+    assert_eq!(err.message, "expected unsigned long");
+    assert!(matches!(STRICT.get(&moment, "zero"), Err(Error::Io(_))));
 }
 
 #[test]
@@ -334,9 +397,87 @@ fn decode_errors_have_context() {
     assert_eq!(err.key.as_deref(), Some("\"abc\""));
     assert_eq!(err.message, "expected a 4-byte u32 key, found 3 bytes");
 
-    // a collection of the wrong type isn't a decode error
-    let db = with_moment(|moment| moment.put("names", "not a map"));
-    assert!(matches!(NAMES.get(&latest(&db), "a"), Err(Error::UnexpectedTag)));
+    // the whole message is in Display, so it isn't repeated as a source
+    let err = NAMES.get(&moment, "int").unwrap_err();
+    assert!(std::error::Error::source(&err).is_none());
+}
+
+#[test]
+fn collections_of_the_wrong_kind_are_errors_for_reads_and_writes() {
+    let db = with_moment(|moment| {
+        moment.put("names", "not a map")?;
+        moment.put_set("started")?.put("a")?;
+        moment.put_map("set-as-map")?.put("a", "x")?;
+        let mut counted = moment.put_cursor("counted")?;
+        WriteCountedHashMap::new(&mut counted)?.put("a", "x")?;
+        Ok(())
+    });
+    let history = History::new(&db).unwrap();
+    let moment = history.latest().unwrap();
+    const STARTED_AS_MAP: Map<str, String> = Map::new("started");
+    const MAP_AS_SET: Set<str> = Set::new("set-as-map");
+    const COUNTED: Map<str, String> = Map::new("counted");
+
+    let check = |result: Result<()>, collection: &str, message: &str| {
+        let err = decode_error(result);
+        assert_eq!((err.collection.as_deref(), err.key.as_deref()), (Some(collection), None));
+        assert_eq!(err.message, message);
+    };
+    let expected_map = "expected a hash map, found HashSet";
+    let expected_set = "expected a hash set, found HashMap";
+
+    // reads
+    check(NAMES.get(&moment, "a").map(drop), "names", "expected a hash map, found Bytes");
+    check(STARTED_AS_MAP.get(&moment, "a").map(drop), "started", expected_map);
+    check(STARTED_AS_MAP.contains(&moment, "a").map(drop), "started", expected_map);
+    check(STARTED_AS_MAP.iter(&moment).map(drop), "started", expected_map);
+    check(STARTED_AS_MAP.collection(&moment).map(drop), "started", expected_map);
+    check(MAP_AS_SET.contains(&moment, "a").map(drop), "set-as-map", expected_set);
+    check(MAP_AS_SET.iter(&moment).map(drop), "set-as-map", expected_set);
+    check(COUNTED.get(&moment, "a").map(drop), "counted", "expected a hash map, found CountedHashMap");
+
+    // writes, which write nothing
+    let size = db.committed_size().unwrap();
+    let write = |f: &dyn Fn(&mut WriteHashMap<'_, CoreMemory>) -> Result<()>| history.transact(|moment| f(moment));
+    check(write(&|moment| STARTED_AS_MAP.put(moment, "a", "x")), "started", expected_map);
+    check(write(&|moment| STARTED_AS_MAP.remove(moment, "a").map(drop)), "started", expected_map);
+    check(write(&|moment| MAP_AS_SET.insert(moment, "b").map(drop)), "set-as-map", expected_set);
+    check(write(&|moment| MAP_AS_SET.remove(moment, "a").map(drop)), "set-as-map", expected_set);
+    check(write(&|moment| COUNTED.put(moment, "a", "y")), "counted", "expected a hash map, found CountedHashMap");
+    assert_eq!(db.committed_size().unwrap(), size);
+}
+
+#[test]
+fn keys_that_are_missing_or_not_bytes_are_decode_errors() {
+    let db = new_db();
+    let hash = db.digest(b"k");
+    let other_hash = db.digest(b"other");
+    History::new(&db)
+        .unwrap()
+        .transact(|moment| {
+            let mut names = moment.put_map("names")?;
+            // written by hash only, so the stored key is empty
+            names.put_by_hash(&hash, "v")?;
+            names.put_key_by_hash(&other_hash, 5u64)?;
+            names.put_by_hash(&other_hash, "w")?;
+            moment.put_set("started")?.put_by_hash(&hash, Data::None)?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    let moment = latest(&db);
+
+    let mut errors: Vec<_> = NAMES.iter(&moment).unwrap().map(decode_error).collect();
+    errors.sort_by(|a, b| a.message.cmp(&b.message));
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(errors.len(), 2);
+    assert_eq!((errors[0].collection.as_deref(), errors[0].key.as_deref()), (Some("names"), None));
+    assert_eq!(errors[0].message, "expected a byte array key, found Uint");
+    assert_eq!((errors[1].collection.as_deref(), errors[1].key.as_deref()), (Some("names"), None));
+    assert_eq!(errors[1].message, format!("the key with hash {hex} is missing"));
+
+    let err = decode_error(STARTED.iter(&moment).unwrap().next().unwrap());
+    assert_eq!((err.collection.as_deref(), err.key.as_deref()), (Some("started"), None));
+    assert_eq!(err.message, format!("the key with hash {hex} is missing"));
 }
 
 #[test]
@@ -352,6 +493,11 @@ fn empty_values_read_as_missing() {
     assert!(!NAMES.contains(&moment, "empty").unwrap());
     let entries: Vec<_> = NAMES.iter(&moment).unwrap().collect::<Result<_>>().unwrap();
     assert_eq!(entries, [("a".to_string(), "alice".to_string())]);
+
+    // removing it is like removing a missing key: false, and no write
+    let (removed, committed) =
+        History::new(&db).unwrap().transact_with_status(|moment| NAMES.remove(moment, "empty")).unwrap();
+    assert!(!removed && !committed);
 }
 
 #[test]

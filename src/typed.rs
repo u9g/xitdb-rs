@@ -33,9 +33,9 @@ use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::collections::{KeyIterator, KvPairIterator, ReadHashMap, ReadHashSet, WriteHashMap, WriteHashSet};
+use crate::collections::{KvPairIterator, ReadHashMap, ReadHashSet, WriteHashMap, WriteHashSet, has_value};
 use crate::core::Core;
-use crate::cursor::{ReadCursor, WriteCursor};
+use crate::cursor::{CursorIterator, ReadCursor, ReadKvPairCursor, WriteCursor};
 use crate::data::Data;
 use crate::error::{DecodeError, Error, Result};
 use crate::slot::Tag;
@@ -78,14 +78,21 @@ pub trait KeyCodec: fmt::Debug {
 /// `read` can open it with [`ReadHashMap::new`].
 ///
 /// The built-in codecs check what they read: a value of the wrong type is an
-/// [`Error::Decode`], not a default. Typed collections treat an empty value
+/// [`Error::Decode`], not a default. A [`Map`] turns every other error
+/// from `read`, except [`Error::Io`], into an [`Error::Decode`] too: those
+/// are all about the stored data (a wrong tag, an invalid size), while an
+/// I/O error is about the storage, so it stays as it is.
+///
+/// Typed collections treat an empty value
 /// ([`Data::None`]) as a missing key, like [`ReadHashMap::get_map`], so
 /// `read` only sees one inside a nested structure:
 ///
 /// * `String` and `Vec<u8>` are byte arrays. They're written without a
 ///   format tag, and read with any.
 /// * `i64` and `u64` are written as [`Data::Int`] and [`Data::Uint`]. Each
-///   also reads the other, if the value fits.
+///   also reads the other, if the value fits. Every `u64` round-trips, but
+///   the Go and Java implementations can't read a `Uint` above `i64::MAX`
+///   (their `readUint` rejects it), so stay below that to share data.
 /// * `f64` is [`Data::Float`].
 /// * `bool` is [`Data::Uint`] `0` or `1`; any other value is an error.
 /// * `Option<T>` writes `None` as an empty value ([`Data::None`]), and reads
@@ -193,6 +200,23 @@ fn value_tag<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<Tag> {
     Ok(cursor.slot()?.tag)
 }
 
+/// Reads an integer slot, as a `Uint` or an `Int`. A `Uint` is read from
+/// its bits, so values above `i64::MAX` round-trip; [`ReadCursor::read_uint`]
+/// rejects them, like the Go implementation.
+fn read_integer<C: Core>(cursor: &ReadCursor<'_, C>, expected: &str) -> Result<Integer> {
+    let slot = cursor.slot()?;
+    match slot.tag {
+        Tag::Uint => Ok(Integer::Uint(slot.value as u64)),
+        Tag::Int => Ok(Integer::Int(slot.value)),
+        tag => Err(unexpected(expected, tag)),
+    }
+}
+
+enum Integer {
+    Uint(u64),
+    Int(i64),
+}
+
 fn unexpected(expected: &str, found: Tag) -> Error {
     Error::decode(format!("expected {expected}, found {found:?}"))
 }
@@ -235,13 +259,11 @@ impl ValueCodec for i64 {
     type Borrowed = i64;
 
     fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<i64> {
-        match value_tag(cursor)? {
-            Tag::Int => cursor.read_int(),
-            Tag::Uint => {
-                let value = cursor.read_uint()?;
+        match read_integer(cursor, "an integer")? {
+            Integer::Int(value) => Ok(value),
+            Integer::Uint(value) => {
                 i64::try_from(value).map_err(|_| Error::decode(format!("{value} doesn't fit in an i64")))
             }
-            tag => Err(unexpected("an integer", tag)),
         }
     }
 
@@ -255,13 +277,11 @@ impl ValueCodec for u64 {
     type Borrowed = u64;
 
     fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<u64> {
-        match value_tag(cursor)? {
-            Tag::Uint => cursor.read_uint(),
-            Tag::Int => {
-                let value = cursor.read_int()?;
+        match read_integer(cursor, "an integer")? {
+            Integer::Uint(value) => Ok(value),
+            Integer::Int(value) => {
                 u64::try_from(value).map_err(|_| Error::decode(format!("{value} doesn't fit in a u64")))
             }
-            tag => Err(unexpected("an integer", tag)),
         }
     }
 
@@ -291,13 +311,11 @@ impl ValueCodec for bool {
     type Borrowed = bool;
 
     fn read<C: Core>(cursor: &ReadCursor<'_, C>) -> Result<bool> {
-        match value_tag(cursor)? {
-            Tag::Uint => match cursor.read_uint()? {
-                0 => Ok(false),
-                1 => Ok(true),
-                value => Err(Error::decode(format!("expected 0 or 1 for a bool, found {value}"))),
-            },
-            tag => Err(unexpected("a bool (0 or 1)", tag)),
+        match read_integer(cursor, "a bool (0 or 1)")? {
+            Integer::Uint(0) => Ok(false),
+            Integer::Uint(1) => Ok(true),
+            Integer::Uint(value) => Err(Error::decode(format!("expected 0 or 1 for a bool, found {value}"))),
+            Integer::Int(_) => Err(unexpected("a bool (0 or 1)", Tag::Int)),
         }
     }
 
@@ -393,23 +411,87 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> ValueCodec for Json<T> {
 
 // Collections
 
-/// Adds the collection's name and the key to a decode error from a codec.
-/// [`Error::UnexpectedTag`] and [`Error::InvalidUtf8`], which a codec gets
-/// from the cursor methods, become decode errors too, so they get the same
-/// context. Context the codec already added is kept.
+/// Adds the collection's name and the key to an error from a codec's read.
+/// Every error but [`Error::Io`] is about the stored data, so it becomes an
+/// [`Error::Decode`]; an I/O error is about the storage, so it's returned as
+/// it is. Context the codec already added is kept.
 fn with_context(err: Error, collection: &str, key: impl FnOnce() -> Option<String>) -> Error {
     let mut decode = match err {
         Error::Decode(decode) => decode,
-        Error::UnexpectedTag | Error::InvalidUtf8(_) => {
-            Box::new(DecodeError { collection: None, key: None, message: err.to_string() })
-        }
-        other => return other,
+        Error::Io(_) => return err,
+        other => Box::new(DecodeError { collection: None, key: None, message: other.to_string() }),
     };
     decode.collection.get_or_insert_with(|| collection.to_owned());
     if decode.key.is_none() {
         decode.key = key();
     }
     Error::Decode(decode)
+}
+
+/// The error for a value under a collection's name that isn't that kind of
+/// collection.
+fn wrong_kind(collection: &str, expected: Tag, found: Tag) -> Error {
+    let expected = if expected == Tag::HashSet { "a hash set" } else { "a hash map" };
+    let message = format!("expected {expected}, found {found:?}");
+    Error::Decode(Box::new(DecodeError { collection: Some(collection.to_owned()), key: None, message }))
+}
+
+/// The collection under `name` (whose hash is `hash`) in `parent`, or
+/// `None` if it's missing or empty. Any value other than a `kind`
+/// collection is a [`wrong_kind`] error.
+fn find<'a, C: Core>(
+    parent: &ReadHashMap<'a, C>,
+    name: &str,
+    hash: &[u8],
+    kind: Tag,
+) -> Result<Option<ReadCursor<'a, C>>> {
+    match parent.get_value_cursor_by_hash(hash)? {
+        Some(cursor) if cursor.slot_ptr.slot.tag != kind => Err(wrong_kind(name, kind, cursor.slot_ptr.slot.tag)),
+        found => Ok(found),
+    }
+}
+
+/// Opens the collection under `name` for writing with `put` (`put_map` or
+/// `put_set`, by hash), turning its [`Error::UnexpectedTag`] into the
+/// [`wrong_kind`] error that reads return.
+fn open_mut<'a, C: Core, T>(
+    parent: &mut WriteHashMap<'a, C>,
+    name: &str,
+    hash: &[u8],
+    kind: Tag,
+    put: impl FnOnce(&mut WriteHashMap<'a, C>, &[u8], &[u8]) -> Result<T>,
+) -> Result<T> {
+    match put(parent, hash, name.as_bytes()) {
+        Err(Error::UnexpectedTag) => match parent.get_slot_by_hash(hash)? {
+            Some(slot) => Err(wrong_kind(name, kind, slot.tag)),
+            None => Err(Error::UnexpectedTag),
+        },
+        result => result,
+    }
+}
+
+/// Reads and decodes a stored key. A key that isn't a byte array, or is
+/// missing (because it was written by hash only), is an [`Error::Decode`].
+/// The bytes are only read again if the key doesn't decode, to show it.
+fn read_key<C: Core, K: KeyCodec + ?Sized>(name: &str, cursor: &ReadCursor<'_, C>, hash: &[u8]) -> Result<K::Owned> {
+    let tag = cursor.slot_ptr.slot.tag;
+    let key = match tag {
+        Tag::Bytes | Tag::ShortBytes => cursor.read_bytes(None).and_then(K::decode_key),
+        Tag::None => Err(Error::decode(format!("the key with hash {} is missing", hex(hash)))),
+        tag => Err(unexpected("a byte array key", tag)),
+    };
+    key.map_err(|err| {
+        with_context(err, name, || match tag {
+            Tag::Bytes | Tag::ShortBytes => {
+                cursor.read_bytes(None).ok().map(|bytes| format!("{:?}", String::from_utf8_lossy(&bytes)))
+            }
+            _ => None,
+        })
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A typed hash map stored under `name` in a parent hash map. `K` is the
@@ -421,6 +503,13 @@ fn with_context(err: Error, collection: &str, key: impl FnOnce() -> Option<Strin
 /// missing collection reads as empty. Writes take a [`WriteHashMap`] and
 /// create the collection if it's missing; like [`WriteHashMap::put_map`],
 /// they must run inside a transaction, such as [`History::transact`].
+/// Anything under `name` other than a plain hash map (including a hash set
+/// or a counted map) is an [`Error::Decode`] with the collection's name,
+/// for reads and writes alike, and nothing is written.
+///
+/// Like [`ReadHashMap::get_map`], an empty value ([`Data::None`]) counts as
+/// a missing key everywhere: [`Map::get`] returns `None`, [`Map::contains`]
+/// and [`Map::remove`] return `false`, and [`Map::iter`] skips it.
 ///
 /// The collection is a plain hash map, so it's the same data as
 /// `parent.put_map(name)?.put(key, value)`, and untyped code (or another
@@ -463,38 +552,41 @@ impl<K: ?Sized, V> Map<K, V> {
 
     /// The untyped collection, or `None` if it's missing.
     pub fn collection<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>) -> Result<Option<ReadHashMap<'a, C>>> {
-        parent.get_map(self.name)
+        self.find(parent, &parent.hash(self.name))?.map(ReadHashMap::new).transpose()
     }
 
     /// The untyped collection, creating it if it's missing (see
     /// [`WriteHashMap::put_map`]).
     pub fn collection_mut<'a, C: Core>(&self, parent: &mut WriteHashMap<'a, C>) -> Result<WriteHashMap<'a, C>> {
-        parent.put_map(self.name)
+        let hash = parent.hash(self.name);
+        self.open_mut(parent, &hash)
+    }
+
+    fn find<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>, hash: &[u8]) -> Result<Option<ReadCursor<'a, C>>> {
+        find(parent, self.name, hash, Tag::HashMap)
+    }
+
+    fn open_mut<'a, C: Core>(&self, parent: &mut WriteHashMap<'a, C>, hash: &[u8]) -> Result<WriteHashMap<'a, C>> {
+        open_mut(parent, self.name, hash, Tag::HashMap, WriteHashMap::put_map_by_hash)
     }
 }
 
 impl<K: KeyCodec + ?Sized, V: ValueCodec> Map<K, V> {
-    /// The value of `key`, or `None` if it's missing or empty (see
-    /// [`ReadHashMap::get_map`]), or the collection is. A value its codec
-    /// can't decode is an [`Error::Decode`] with the collection's name and
-    /// the key.
+    /// The value of `key`, or `None` if it's missing or empty, or the
+    /// collection is. A value its codec can't decode is an
+    /// [`Error::Decode`] with the collection's name and the key.
     pub fn get<C: Core>(&self, parent: &ReadHashMap<'_, C>, key: &K) -> Result<Option<V::Owned>> {
         let Some(map) = self.collection(parent)? else { return Ok(None) };
-        match map.get_cursor(key.encode_key())? {
-            Some(cursor) if cursor.slot_ptr.slot.tag != Tag::None => {
-                let value =
-                    V::read(&cursor).map_err(|err| with_context(err, self.name, || Some(format!("{key:?}"))))?;
-                Ok(Some(value))
-            }
-            _ => Ok(None),
-        }
+        let Some(cursor) = map.get_value_cursor(key.encode_key())? else { return Ok(None) };
+        let value = V::read(&cursor).map_err(|err| with_context(err, self.name, || Some(format!("{key:?}"))))?;
+        Ok(Some(value))
     }
 
     /// Whether `key` has a value. Like [`Map::get`], an empty value counts
     /// as missing, but this doesn't decode it.
     pub fn contains<C: Core>(&self, parent: &ReadHashMap<'_, C>, key: &K) -> Result<bool> {
         let Some(map) = self.collection(parent)? else { return Ok(false) };
-        Ok(map.get_slot(key.encode_key())?.is_some_and(|slot| slot.tag != Tag::None))
+        Ok(map.get_value_cursor(key.encode_key())?.is_some())
     }
 
     /// Sets `key` to `value`, creating the collection if it's missing.
@@ -503,18 +595,23 @@ impl<K: KeyCodec + ?Sized, V: ValueCodec> Map<K, V> {
         V::write(value, &mut cursor)
     }
 
-    /// Removes `key`, returning whether it was in the collection. If it
-    /// wasn't, nothing is written, so the collection isn't created.
+    /// Removes `key`, returning whether it had a value. If it didn't (it's
+    /// missing or empty, as [`Map::contains`] sees it), nothing is written,
+    /// so the collection isn't created.
     pub fn remove<C: Core>(&self, parent: &mut WriteHashMap<'_, C>, key: &K) -> Result<bool> {
-        let key = key.encode_key();
-        match self.collection(parent)? {
-            Some(map) if map.get_slot(&key)?.is_some() => self.collection_mut(parent)?.remove(&key),
-            _ => Ok(false),
+        let name_hash = parent.hash(self.name);
+        let Some(cursor) = self.find(parent, &name_hash)? else { return Ok(false) };
+        let map = ReadHashMap::new(cursor)?;
+        let key_hash = map.hash(key.encode_key());
+        if map.get_value_cursor_by_hash(&key_hash)?.is_none() {
+            return Ok(false);
         }
+        self.open_mut(parent, &name_hash)?.remove_by_hash(&key_hash)
     }
 
     /// Iterates over the keys and values, decoded, in hash order. Empty
-    /// values are skipped, as [`Map::get`] treats them as missing.
+    /// values are skipped, as [`Map::get`] treats them as missing. A stored
+    /// key that's missing (written by hash only) is an [`Error::Decode`].
     pub fn iter<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>) -> Result<MapIter<'a, C, K, V>> {
         let pairs = self.collection(parent)?.map(|map| map.entries()).transpose()?;
         Ok(MapIter { name: self.name, pairs, types: PhantomData })
@@ -538,33 +635,26 @@ impl<C: Core, K: KeyCodec + ?Sized, V: ValueCodec> Iterator for MapIter<'_, C, K
                 Ok(kv) => kv,
                 Err(err) => return Some(Err(err)),
             };
-            if kv.value_cursor.slot_ptr.slot.tag == Tag::None {
-                continue;
+            if has_value(&kv.value_cursor) {
+                return Some(read_entry::<C, K, V>(self.name, &kv));
             }
-            return Some(read_entry::<C, K, V>(self.name, &kv.key_cursor, &kv.value_cursor));
         }
     }
 }
 
-fn read_key<C: Core, K: KeyCodec + ?Sized>(name: &str, cursor: &ReadCursor<'_, C>) -> Result<K::Owned> {
-    let bytes = cursor.read_bytes(None)?;
-    let describe = |bytes: &[u8]| Some(format!("{:?}", String::from_utf8_lossy(bytes)));
-    K::decode_key(bytes.clone()).map_err(|err| with_context(err, name, || describe(&bytes)))
-}
-
 fn read_entry<C: Core, K: KeyCodec + ?Sized, V: ValueCodec>(
     name: &str,
-    key_cursor: &ReadCursor<'_, C>,
-    value_cursor: &ReadCursor<'_, C>,
+    kv: &ReadKvPairCursor<'_, C>,
 ) -> Result<(K::Owned, V::Owned)> {
-    let key = read_key::<C, K>(name, key_cursor)?;
-    let value = V::read(value_cursor).map_err(|err| with_context(err, name, || Some(format!("{key:?}"))))?;
+    let key = read_key::<C, K>(name, &kv.key_cursor, &kv.hash)?;
+    let value = V::read(&kv.value_cursor).map_err(|err| with_context(err, name, || Some(format!("{key:?}"))))?;
     Ok((key, value))
 }
 
 /// A typed hash set stored under `name` in a parent hash map. `K` is the
-/// key's [`KeyCodec`]. Like [`Map`], it holds no data, and is used with
-/// any parent map.
+/// key's [`KeyCodec`]. Like [`Map`], it holds no data, is used with any
+/// parent map, and anything under `name` other than a plain hash set is an
+/// [`Error::Decode`].
 ///
 /// The collection is a plain hash set, the same data as
 /// `parent.put_set(name)?.put(key)`.
@@ -599,24 +689,29 @@ impl<K: ?Sized> Set<K> {
 
     /// The untyped collection, or `None` if it's missing.
     pub fn collection<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>) -> Result<Option<ReadHashSet<'a, C>>> {
-        parent.get_set(self.name)
+        self.find(parent, &parent.hash(self.name))?.map(ReadHashSet::new).transpose()
     }
 
     /// The untyped collection, creating it if it's missing (see
     /// [`WriteHashMap::put_set`]).
     pub fn collection_mut<'a, C: Core>(&self, parent: &mut WriteHashMap<'a, C>) -> Result<WriteHashSet<'a, C>> {
-        parent.put_set(self.name)
+        let hash = parent.hash(self.name);
+        self.open_mut(parent, &hash)
+    }
+
+    fn find<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>, hash: &[u8]) -> Result<Option<ReadCursor<'a, C>>> {
+        find(parent, self.name, hash, Tag::HashSet)
+    }
+
+    fn open_mut<'a, C: Core>(&self, parent: &mut WriteHashMap<'a, C>, hash: &[u8]) -> Result<WriteHashSet<'a, C>> {
+        open_mut(parent, self.name, hash, Tag::HashSet, WriteHashMap::put_set_by_hash)
     }
 }
 
 impl<K: KeyCodec + ?Sized> Set<K> {
     pub fn contains<C: Core>(&self, parent: &ReadHashMap<'_, C>, key: &K) -> Result<bool> {
-        self.contains_encoded(parent, &key.encode_key())
-    }
-
-    fn contains_encoded<C: Core>(&self, parent: &ReadHashMap<'_, C>, key: &[u8]) -> Result<bool> {
         match self.collection(parent)? {
-            Some(set) => set.contains(key),
+            Some(set) => set.contains(key.encode_key()),
             None => Ok(false),
         }
     }
@@ -625,34 +720,41 @@ impl<K: KeyCodec + ?Sized> Set<K> {
     /// written.
     pub fn insert<C: Core>(&self, parent: &mut WriteHashMap<'_, C>, key: &K) -> Result<bool> {
         let key = key.encode_key();
-        if self.contains_encoded(parent, &key)? {
-            return Ok(false);
+        let name_hash = parent.hash(self.name);
+        let key_hash = parent.hash(&key);
+        if let Some(cursor) = self.find(parent, &name_hash)? {
+            if ReadHashSet::new(cursor)?.get_slot_by_hash(&key_hash)?.is_some() {
+                return Ok(false);
+            }
         }
-        self.collection_mut(parent)?.put(&key)?;
+        self.open_mut(parent, &name_hash)?.put_by_hash(&key_hash, Data::bytes(&*key))?;
         Ok(true)
     }
 
     /// Removes `key`, returning whether it was in the set. If it wasn't,
     /// nothing is written, so the collection isn't created.
     pub fn remove<C: Core>(&self, parent: &mut WriteHashMap<'_, C>, key: &K) -> Result<bool> {
-        let key = key.encode_key();
-        if !self.contains_encoded(parent, &key)? {
+        let name_hash = parent.hash(self.name);
+        let Some(cursor) = self.find(parent, &name_hash)? else { return Ok(false) };
+        let key_hash = parent.hash(key.encode_key());
+        if ReadHashSet::new(cursor)?.get_slot_by_hash(&key_hash)?.is_none() {
             return Ok(false);
         }
-        self.collection_mut(parent)?.remove(&key)
+        self.open_mut(parent, &name_hash)?.remove_by_hash(&key_hash)
     }
 
-    /// Iterates over the decoded keys, in hash order.
+    /// Iterates over the decoded keys, in hash order. A stored key that's
+    /// missing (written by hash only) is an [`Error::Decode`].
     pub fn iter<'a, C: Core>(&self, parent: &ReadHashMap<'a, C>) -> Result<SetIter<'a, C, K>> {
-        let keys = self.collection(parent)?.map(|set| set.keys()).transpose()?;
-        Ok(SetIter { name: self.name, keys, types: PhantomData })
+        let cursors = self.collection(parent)?.map(|set| set.iter()).transpose()?;
+        Ok(SetIter { name: self.name, cursors, types: PhantomData })
     }
 }
 
 /// Iterates over the decoded keys of a [`Set`]. Made by [`Set::iter`].
 pub struct SetIter<'a, C: Core, K: ?Sized> {
     name: &'static str,
-    keys: Option<KeyIterator<'a, C>>,
+    cursors: Option<CursorIterator<'a, C>>,
     types: PhantomData<fn(&K)>,
 }
 
@@ -660,7 +762,10 @@ impl<C: Core, K: KeyCodec + ?Sized> Iterator for SetIter<'_, C, K> {
     type Item = Result<K::Owned>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let cursor = self.keys.as_mut()?.next()?;
-        Some(cursor.and_then(|cursor| read_key::<C, K>(self.name, &cursor)))
+        let cursor = self.cursors.as_mut()?.next()?;
+        Some(cursor.and_then(|cursor| {
+            let kv = cursor.read_key_value_pair()?;
+            read_key::<C, K>(self.name, &kv.key_cursor, &kv.hash)
+        }))
     }
 }
