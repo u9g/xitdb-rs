@@ -65,6 +65,7 @@ mod array_list_store;
 mod bytes;
 mod crc64;
 mod cursor;
+mod cursor_store;
 mod data;
 mod database;
 mod error;

@@ -7,6 +7,7 @@ use crate::database::{ContextFn, Database, is_root};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode};
+use crate::store::DbStore;
 use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
 use crate::sorted::short_bytes_value;
 
@@ -124,39 +125,10 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     /// Reads a byte array along with its format tag.
     pub fn read_bytes_object(&self, max_size: Option<u64>) -> Result<Bytes<'static>> {
         let slot_ptr = self.resolved()?;
-        let too_long = |size: u64| max_size.is_some_and(|max| size > max);
-        match slot_ptr.slot.tag {
-            Tag::None => Ok(Bytes::default()),
-            Tag::Bytes => {
-                let value_size = self.db.read_i64_at(slot_ptr.slot.value)?;
-                if value_size < 0 {
-                    return Err(Error::ExpectedUnsignedLong);
-                }
-                if too_long(value_size as u64) {
-                    return Err(Error::StreamTooLong);
-                }
-                let mut value = vec![0u8; self.db.checked_len(slot_ptr.slot.value + 8, value_size)?];
-                self.db.seek(slot_ptr.slot.value + 8)?;
-                self.db.read_bytes(&mut value)?;
-                let format_tag = if slot_ptr.slot.full {
-                    let mut tag = [0u8; 2];
-                    self.db.read_bytes(&mut tag)?;
-                    Some(tag)
-                } else {
-                    None
-                };
-                Ok(Bytes { value: value.into(), format_tag })
-            }
-            Tag::ShortBytes => {
-                let (buf, len) = short_bytes_value(slot_ptr.slot);
-                if too_long(len as u64) {
-                    return Err(Error::StreamTooLong);
-                }
-                let format_tag = slot_ptr.slot.full.then(|| [buf[6], buf[7]]);
-                Ok(Bytes { value: buf[..len].to_vec().into(), format_tag })
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        // verified in cursor_store.rs
+        let (value, format_tag) =
+            crate::cursor_store::read_bytes_value(&mut DbStore::new(self.db), slot_ptr.slot, max_size)?;
+        Ok(Bytes { value: value.into(), format_tag })
     }
 
     /// For a cursor to a key-value pair (as yielded when iterating a map or
@@ -164,8 +136,9 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     pub fn read_key_value_pair(&self) -> Result<ReadKvPairCursor<'a, C>> {
         let slot_ptr = self.resolved()?;
         let kv = self.db.read_kv_pair(slot_ptr.slot)?;
-        let key_slot_pos = slot_ptr.slot.value + self.db.kv_key_offset(slot_ptr.slot.tag);
-        let value_slot_pos = key_slot_pos + SLOT_LENGTH as i64;
+        // verified in cursor_store.rs
+        let (key_slot_pos, value_slot_pos) =
+            crate::cursor_store::kv_slot_positions(slot_ptr.slot.value, self.db.kv_key_offset(slot_ptr.slot.tag))?;
         Ok(ReadKvPairCursor {
             value_cursor: ReadCursor::new(SlotPointer::new(Some(value_slot_pos), kv.value_slot), self.db),
             key_cursor: ReadCursor::new(SlotPointer::new(Some(key_slot_pos), kv.key_slot), self.db),
@@ -176,21 +149,9 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     /// An incremental reader for a byte array.
     pub fn reader(&self) -> Result<CursorReader<'a, C>> {
         let slot_ptr = self.resolved()?;
-        match slot_ptr.slot.tag {
-            Tag::Bytes => {
-                let size = self.db.read_i64_at(slot_ptr.slot.value)?;
-                let start_position = slot_ptr.slot.value + 8;
-                let size = self.db.checked_len(start_position, size)? as u64;
-                let start_position = start_position as u64;
-                Ok(CursorReader { db: self.db, size, start_position, relative_position: 0, inline: None })
-            }
-            Tag::ShortBytes => {
-                // short bytes are stored in the slot itself, which we already have
-                let (buf, len) = short_bytes_value(slot_ptr.slot);
-                Ok(CursorReader { db: self.db, size: len as u64, start_position: 0, relative_position: 0, inline: Some(buf) })
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        // verified in cursor_store.rs
+        let (start_position, size, inline) = crate::cursor_store::reader_bounds(&mut DbStore::new(self.db), slot_ptr.slot)?;
+        Ok(CursorReader { db: self.db, size, start_position, relative_position: 0, inline })
     }
 
     /// Whether writing `data` here would leave the slot as it is. Anything
@@ -303,10 +264,9 @@ impl<C: Core> CursorReader<'_, C> {
     /// Fills `buf`, or returns [`Error::EndOfStream`] if there aren't
     /// enough bytes left.
     pub fn read_fully(&mut self, buf: &mut [u8]) -> Result<()> {
-        if self.size < self.relative_position || self.size - self.relative_position < buf.len() as u64 {
-            return Err(Error::EndOfStream);
-        }
-        let start = self.start_position + self.relative_position;
+        // verified in cursor_store.rs
+        let start = crate::cursor_store::reader_range(self.size, self.start_position, self.relative_position, buf.len())
+            .ok_or(Error::EndOfStream)?;
         match &self.inline {
             Some(inline) => buf.copy_from_slice(&inline[start as usize..start as usize + buf.len()]),
             None => self.db.read_at(start as i64, buf)?,
@@ -1026,11 +986,9 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             return Err(Error::CursorNotWriteable);
         }
         let db = self.read.db;
-        if db.tx_start.get().is_none() {
-            return Err(Error::ExpectedTxStart);
-        }
-        let ptr_pos = db.append(&0i64.to_be_bytes())?;
-        let start_position = db.len()?;
+        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.frozen_at);
+        // verified in cursor_store.rs
+        let (ptr_pos, start_position) = crate::cursor_store::writer_begin(&mut DbStore::new(db), limit)?;
         Ok(CursorWriter {
             parent: self,
             size: 0,
@@ -1101,21 +1059,19 @@ impl<C: Core> CursorWriter<'_, '_, C> {
 
     fn write_bytes(&mut self, buf: &[u8]) -> Result<()> {
         self.check_writable()?;
-        if self.size < self.relative_position {
-            return Err(Error::EndOfStream);
-        }
         let db = self.parent.read.db;
-        let new_position = self.relative_position + buf.len() as i64;
-
-        // another allocation may now follow this byte array.
-        // extending it would overwrite that allocation.
-        if new_position > self.size && db.len()? != self.start_position + self.size {
-            return Err(Error::UnexpectedWriterPosition);
-        }
-
-        db.write_at(self.start_position + self.relative_position, buf)?;
-        self.relative_position = new_position;
-        self.size = self.size.max(self.relative_position);
+        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.parent.frozen_at);
+        // verified in cursor_store.rs
+        let (relative_position, size) = crate::cursor_store::writer_write(
+            &mut DbStore::new(db),
+            self.start_position,
+            self.size,
+            self.relative_position,
+            buf,
+            limit,
+        )?;
+        self.relative_position = relative_position;
+        self.size = size;
         Ok(())
     }
 
@@ -1134,24 +1090,19 @@ impl<C: Core> CursorWriter<'_, '_, C> {
     pub fn finish(&mut self) -> Result<()> {
         self.check_writable()?;
         let db = self.parent.read.db;
-        if let Some(format_tag) = self.format_tag {
-            self.slot = self.slot.with_full(true);
-            let format_tag_pos = db.len()?;
-            if self.start_position + self.size != format_tag_pos {
-                return Err(Error::UnexpectedWriterPosition);
-            }
-            db.write_at(format_tag_pos, &format_tag)?;
-        }
-
-        db.write_i64_at(self.slot.value, self.size)?;
-
         let position = self.parent.read.slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-        db.write_slot_at(position, self.slot)?;
-
+        let limit = db.tx_start.get().ok_or(Error::ExpectedTxStart)?.max(self.parent.frozen_at);
+        // verified in cursor_store.rs
+        self.slot = crate::cursor_store::writer_finish(
+            &mut DbStore::new(db),
+            self.slot,
+            self.start_position,
+            self.size,
+            self.format_tag,
+            position,
+            limit,
+        )?;
         self.parent.read.slot_ptr = self.parent.read.slot_ptr.with_slot(self.slot);
-        if db.tx_start.get().is_none() {
-            db.core().sync()?;
-        }
         Ok(())
     }
 }

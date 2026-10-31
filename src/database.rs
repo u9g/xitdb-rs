@@ -280,47 +280,16 @@ impl<C: Core> Database<C> {
         self.write_bytes(buf)
     }
 
-    /// Writes `buf` at the end and returns its position.
-    pub(crate) fn append(&self, buf: &[u8]) -> Result<i64> {
-        let pos = self.len()?;
-        self.write_at(pos, buf)?;
-        Ok(pos)
-    }
-
-    /// Validates the length of a byte array read from disk before a buffer
-    /// is allocated for it, so corrupt data can't cause a huge allocation.
-    /// Small lengths aren't checked against the end of the database, which
-    /// would cost a syscall on some cores; reading them fails anyway if
-    /// they run past the end.
-    pub(crate) fn checked_len(&self, pos: i64, len: i64) -> Result<usize> {
-        const UNCHECKED_LEN: i64 = 1 << 16;
-        if len < 0 {
-            return Err(Error::ExpectedUnsignedLong);
-        }
-        if len > UNCHECKED_LEN && pos.checked_add(len).is_none_or(|end| end > self.len().unwrap_or(0)) {
-            return Err(Error::InvalidDatabase);
-        }
-        usize::try_from(len).map_err(|_| Error::InvalidDatabase)
-    }
-
     pub(crate) fn read_i64_at(&self, pos: i64) -> Result<i64> {
         let mut buf = [0u8; 8];
         self.read_at(pos, &mut buf)?;
         Ok(i64::from_be_bytes(buf))
     }
 
-    pub(crate) fn write_i64_at(&self, pos: i64, value: i64) -> Result<()> {
-        self.write_at(pos, &value.to_be_bytes())
-    }
-
     pub(crate) fn read_slot_at(&self, pos: i64) -> Result<Slot> {
         let mut buf = [0u8; SLOT_LENGTH];
         self.read_at(pos, &mut buf)?;
         Slot::from_bytes(&buf)
-    }
-
-    pub(crate) fn write_slot_at(&self, pos: i64, slot: Slot) -> Result<()> {
-        self.write_at(pos, &slot.to_bytes())
     }
 
     pub(crate) fn read_index_block(&self, pos: i64) -> Result<[Slot; SLOT_COUNT]> {
