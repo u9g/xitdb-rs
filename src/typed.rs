@@ -415,7 +415,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> ValueCodec for Json<T> {
 /// Every error but [`Error::Io`] is about the stored data, so it becomes an
 /// [`Error::Decode`]; an I/O error is about the storage, so it's returned as
 /// it is. Context the codec already added is kept.
-fn with_context(err: Error, collection: &str, key: impl FnOnce() -> Option<String>) -> Error {
+pub(crate) fn with_context(err: Error, collection: &str, key: impl FnOnce() -> Option<String>) -> Error {
     let mut decode = match err {
         Error::Decode(decode) => decode,
         Error::Io(_) => return err,
@@ -473,7 +473,7 @@ fn open_mut<'a, C: Core, T>(
 /// Reads and decodes a stored key. A key that isn't a byte array, or is
 /// missing (because it was written by hash only), is an [`Error::Decode`].
 /// The bytes are only read again if the key doesn't decode, to show it.
-fn read_key<C: Core, K: KeyCodec + ?Sized>(name: &str, cursor: &ReadCursor<'_, C>, hash: &[u8]) -> Result<K::Owned> {
+pub(crate) fn read_key<C: Core, K: KeyCodec + ?Sized>(name: &str, cursor: &ReadCursor<'_, C>, hash: &[u8]) -> Result<K::Owned> {
     let tag = cursor.slot_ptr.slot.tag;
     let key = match tag {
         Tag::Bytes | Tag::ShortBytes => cursor.read_bytes(None).and_then(K::decode_key),

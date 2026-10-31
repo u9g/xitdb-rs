@@ -52,6 +52,7 @@
 struct ReadmeDoctests;
 
 mod btree;
+mod bulk;
 mod collections;
 mod compact;
 mod core;
@@ -64,6 +65,7 @@ mod file_offset_map;
 mod format;
 mod hasher;
 mod history;
+mod index;
 mod migrate;
 mod path;
 mod slot;
@@ -88,6 +90,7 @@ pub use crate::file_offset_map::FileOffsetMap;
 pub use crate::format::{Header, ReplicaState, root_trailer_checksum};
 pub use crate::hasher::{Hasher, bytes_to_id, id_to_bytes};
 pub use crate::history::History;
+pub use crate::index::{Index, IndexedMap, MapIndex};
 pub use crate::migrate::{LAYOUT_VERSION_KEY, Migrated, Migration, Migrations};
 pub use crate::path::{HashMapGetTarget, PathPart, SortedMapGetTarget, WriteMode};
 pub use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
