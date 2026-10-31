@@ -235,6 +235,117 @@ pub fn read_array_list_slot<S: Store>(
     }
 }
 
+/// `read_array_list_slot_append`: the slot for key `header.size`, moving a
+/// full root under a new one and clearing the slot (values left by a
+/// rollback or slice).
+pub fn read_array_list_slot_append<S: Store>(
+    s: &mut S,
+    header: ArrayListHeader,
+    limit: Option<i64>,
+) -> (r: Result<(ArrayListHeader, SlotPointer)>)
+    requires
+        header.size >= 0,
+        limit is Some && 0 <= limit.unwrap() <= old(s).file().len() && header.ptr >= limit.unwrap(),
+    ensures
+        r is Ok ==> kept_below(old(s).file(), final(s).file(), limit.unwrap() as int),
+        r is Ok ==> {
+            let (h, sp) = r.unwrap();
+            &&& h.size == header.size + 1
+            &&& h.ptr >= limit.unwrap()
+            &&& sp.slot == (Slot { value: 0, tag: Tag::None, full: false })
+            &&& sp.position is Some && sp.position.unwrap() >= limit.unwrap()
+            &&& slot_at(final(s).file(), sp.position.unwrap() as int, sp.slot)
+        },
+{
+    let mut index_pos = header.ptr;
+    let key = header.size;
+    let size = match header.size.checked_add(1) {
+        Some(n) => n,
+        None => return Err(Error::InvalidDatabase),
+    };
+
+    let prev_shift = array_list_shift(key - 1);
+    let next_shift = array_list_shift(key);
+    let ghost f0 = s.file();
+    let ghost l = limit.unwrap() as int;
+
+    if prev_shift != next_shift {
+        // root overflow
+        let next_index_pos = append(s, &[0u8; INDEX_BLOCK_SIZE])?;
+        let ghost f1 = s.file();
+        write_slot_at(s, next_index_pos, Slot::new(index_pos, Tag::Index))?;
+        proof {
+            assert(f1.subrange(0, l) =~= f0.subrange(0, l));
+            lemma_overwrite_keeps(f1, next_index_pos as int, slot_encode_spec(Slot { value: index_pos, tag: Tag::Index, full: false }), l);
+            lemma_kept_trans(f0, f1, s.file(), l);
+        }
+        index_pos = next_index_pos;
+    }
+
+    let ghost f2 = s.file();
+    let slot_ptr = read_array_list_slot(s, index_pos, key, next_shift, true, limit)?;
+    let ghost f3 = s.file();
+    // clear values left by a rollback or slice
+    let slot_ptr = slot_ptr.with_slot(Slot::new(0, Tag::None));
+    let position = match slot_ptr.position {
+        Some(p) => p,
+        None => return Err(Error::CursorNotWriteable),
+    };
+    write_slot_at(s, position, slot_ptr.slot)?;
+    proof {
+        lemma_kept_trans(f0, f2, f3, l);
+        lemma_overwrite_keeps(f3, position as int, slot_encode_spec(slot_ptr.slot), l);
+        lemma_kept_trans(f0, f3, s.file(), l);
+        lemma_slot_roundtrip(slot_ptr.slot);
+        let g = s.file();
+        assert(g.subrange(position as int, position + SLOT_LENGTH) =~= slot_encode_spec(slot_ptr.slot));
+    }
+    Ok((ArrayListHeader { ptr: index_pos, size }, slot_ptr))
+}
+
+/// `read_array_list_slice`: the root of the first `size` items, copied if
+/// it is committed.
+pub fn read_array_list_slice<S: Store>(
+    s: &mut S,
+    header: ArrayListHeader,
+    size: i64,
+    limit: Option<i64>,
+) -> (r: Result<ArrayListHeader>)
+    requires
+        header.size >= 0,
+        limit is Some ==> 0 <= limit.unwrap() <= old(s).file().len(),
+    ensures
+        r is Ok ==> r.unwrap().size == size && 0 <= size <= header.size,
+        r is Ok ==> r.unwrap().ptr == header.ptr && final(s).file() == old(s).file() || (limit is Some && r.unwrap().ptr
+            >= limit.unwrap() && kept_below(old(s).file(), final(s).file(), limit.unwrap() as int)),
+{
+    if size > header.size || size < 0 {
+        return Err(Error::KeyNotFound);
+    }
+
+    let prev_shift = array_list_shift(header.size - 1);
+    let next_shift = array_list_shift(size - 1);
+
+    if prev_shift == next_shift {
+        return Ok(ArrayListHeader { ptr: header.ptr, size });
+    }
+
+    let mut shift = prev_shift;
+    let mut index_pos = header.ptr;
+    while shift > next_shift
+        invariant
+            s.file() == old(s).file(),
+        decreases shift,
+    {
+        index_pos = read_slot_at(s, index_pos)?.value;
+        shift -= 1;
+    }
+    // the new root may still belong to a past moment. unlike child
+    // nodes, root nodes are written directly, so copy it now.
+    let index_pos = copy_index_block_if_old(s, index_pos, limit)?;
+    Ok(ArrayListHeader { ptr: index_pos, size })
+}
+
 /// The slot index the code computes is nibble `shift` of the key.
 proof fn lemma_key_digit(key: i64, shift: u8)
     requires

@@ -1546,31 +1546,15 @@ impl<C: Core> Database<C> {
 
     // array list
 
+    // verified in array_list_store.rs
     fn read_array_list_slot_append(
         &self,
         header: ArrayListHeader,
-        write_mode: WriteMode,
+        _write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<(ArrayListHeader, SlotPointer)> {
-        let mut index_pos = header.ptr;
-        let key = header.size;
-
-        let prev_shift = array_list_shift(key - 1);
-        let next_shift = array_list_shift(key);
-
-        if prev_shift != next_shift {
-            // root overflow
-            let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-            self.write_slot_at(next_index_pos, Slot::new(index_pos, Tag::Index))?;
-            index_pos = next_index_pos;
-        }
-
-        let slot_ptr = self.read_array_list_slot(index_pos, key, next_shift, write_mode, frozen_at)?;
-        // clear values left by a rollback or slice
-        let slot_ptr = slot_ptr.with_slot(Slot::default());
-        let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-        self.write_slot_at(position, slot_ptr.slot)?;
-        Ok((ArrayListHeader { ptr: index_pos, size: header.size + 1 }, slot_ptr))
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::array_list_store::read_array_list_slot_append(&mut DbStore::new(self), header, limit)
     }
 
     // verified in array_list_store.rs
@@ -1587,27 +1571,9 @@ impl<C: Core> Database<C> {
         crate::array_list_store::read_array_list_slot(&mut DbStore::new(self), index_pos, key, shift, write, limit)
     }
 
+    // verified in array_list_store.rs
     fn read_array_list_slice(&self, header: ArrayListHeader, size: i64, frozen_at: i64) -> Result<ArrayListHeader> {
-        if size > header.size || size < 0 {
-            return Err(Error::KeyNotFound);
-        }
-
-        let prev_shift = array_list_shift(header.size - 1);
-        let next_shift = array_list_shift(size - 1);
-
-        if prev_shift == next_shift {
-            return Ok(ArrayListHeader { ptr: header.ptr, size });
-        }
-
-        let mut shift = prev_shift;
-        let mut index_pos = header.ptr;
-        while shift > next_shift {
-            index_pos = self.read_slot_at(index_pos)?.value;
-            shift -= 1;
-        }
-        // the new root may still belong to a past moment. unlike child
-        // nodes, root nodes are written directly, so copy it now.
-        let index_pos = self.copy_index_block_if_old(index_pos, frozen_at)?;
-        Ok(ArrayListHeader { ptr: index_pos, size })
+        let limit = self.tx_start.get().map(|tx_start| tx_start.max(frozen_at));
+        crate::array_list_store::read_array_list_slice(&mut DbStore::new(self), header, size, limit)
     }
 }
