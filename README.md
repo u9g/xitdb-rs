@@ -31,6 +31,7 @@ This is a Rust port of [xitdb](https://github.com/xit-vcs/xitdb). It reads and w
 * [Accessors](#accessors)
 * [Typed Collections](#typed-collections)
 * [Records](#records)
+* [Structured Values](#structured-values)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
 * [Replication](#replication)
@@ -673,7 +674,7 @@ When the same collections are used all over an app, naming them and converting t
 * A value that doesn't decode is an `Error::Decode`, with the collection's name, the key and what was wrong, rather than being skipped. So is anything under the name that isn't the right kind of collection, for reads and writes alike. I/O errors stay `Error::Io`.
 * The data is a plain hash map or set under the name, so untyped code and the other implementations read and write the same collections.
 
-Keys are converted by a `KeyCodec`, implemented for `str`, `String`, `[u8]`, `Vec<u8>` and the integer types (big-endian at the type's full width). Values are converted by a `ValueCodec`, which reads from a `ReadCursor` and writes through a `WriteCursor`, so a value can be a nested structure. It's implemented for `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` (stored as the `Uint` `0` or `1`), and `Option<T>` (with `None` stored as an empty value). With the `serde` feature, `Json<T>` stores any serde type as JSON, tagged `js`; it also reads untagged JSON strings, so `Map<str, Json<Proposal>>` reads collections written with `serde_json::to_string`.
+Keys are converted by a `KeyCodec`, implemented for `str`, `String`, `[u8]`, `Vec<u8>` and the integer types (big-endian at the type's full width). Values are converted by a `ValueCodec`, which reads from a `ReadCursor` and writes through a `WriteCursor`, so a value can be a nested structure. It's implemented for `String`, `Vec<u8>`, `i64`, `u64`, `f64`, `bool` (stored as the `Uint` `0` or `1`), and `Option<T>` (with `None` stored as an empty value). With the `serde` feature, `Json<T>` stores any serde type as JSON, tagged `js`; it also reads untagged JSON strings, so `Map<str, Json<Proposal>>` reads collections written with `serde_json::to_string`. `Structured<T>` stores a serde type as nested maps and lists instead, writing only what changed (see [Structured Values](#structured-values)). `put` compares with what's stored first, through the codec's `ValueCodec::write_if_changed`, and for all of these codecs it writes nothing at all if the value is unchanged, so a transaction that puts only unchanged values isn't committed.
 
 ```rust
 use xitdb::*;
@@ -848,6 +849,89 @@ fn main() -> xitdb::Result<()> {
 }
 
 #[cfg(not(feature = "derive"))]
+fn main() {}
+```
+
+## Structured Values
+
+`Json<T>` stores a value as one blob, so changing any part of it writes all of it again. With the `serde` feature, `put_structured` stores any `Serialize` type as nested data instead, and writes a new value over the stored one by changing only what differs. Unchanged parts stay shared with earlier moments, so a small change to a large value appends only the changed values and a copy of the blocks along the path to them. If nothing changed, nothing is written and the transaction isn't committed. That keeps each transaction's bytes small, which is what a [replica](#replication) has to fetch.
+
+The stored data is plain, so untyped code and the other xitdb implementations can read it without knowing the Rust types:
+
+* A struct or a map is a `HashMap` from each field name or key to its value. Keys are stored as their bytes; integer, bool and char keys and unit variants as their text (`"42"`), as in JSON. Other key types are an `Error::Serialize` naming the path to the map.
+* A `Vec`, a tuple or a tuple struct is an `ArrayList`.
+* A string or a char is a byte array, and so are bytes serialized with `serialize_bytes` (as `serde_bytes` does; a plain `Vec<u8>` is a list of numbers).
+* Signed integers are `Int`, unsigned ones `Uint`, and floats `Float`, as the typed collections' codecs store them. 128-bit integers are stored the same way if they fit in 64 bits.
+* Bools are the text `true` or `false`, tagged `bl` (`BOOL_FORMAT_TAG`), so a reader can tell them from numbers. That's what makes them read back as bools where serde doesn't say what type it expects: `#[serde(untagged)]` and internally tagged enums, `#[serde(flatten)]`, and `serde_json::Value`. A reader that ignores format tags sees the string `"true"`. Reading a bool field also accepts the `Uint` `0` or `1` that the `bool` codec and `#[derive(Record)]` store, and the `bool` codec reads the tagged form, so the two read each other's bools.
+* A struct field that's `None` is left out of its map, so it's a missing key. Every other `None`, and `()`, unit structs, `PhantomData` and newtypes of them, is an empty value (`Data::None`), so a map entry whose value is `None` keeps its key, and the item stays in a list. `Some(None)` reads back as `None`, as in JSON.
+* A newtype struct is its contents.
+* Enums are externally tagged, like serde_json's default: a unit variant is its name, and any other variant is a map with one key, its name, whose value is its contents. So `Failed { reason }` is `{"Failed": {"reason": ...}}`.
+
+Writing compares as it goes. Scalars are written only if they differ, compared like `put_if_changed`. A map is changed in place: keys whose values differ are written, recursively, new keys are added, and keys that are gone (or now `None`) are removed. A list is compared item by item, by index; if it grew, the new items are appended, and if it shrank, it's sliced. Anything stored of another kind is replaced. Maps and lists are only opened for writing once something in them differs, so nothing is copied for the parts that didn't change.
+
+Since lists are compared by index, inserting or removing an item in the middle of a list, or reordering it, changes every item after that point, and they're all written again. Appending and removing from the end are cheap. For a collection whose items have IDs, store a map keyed by ID, plus a list of IDs if the order matters, so that a change to one item writes only that item.
+
+`get_structured` reads a value back. `write_structured` and `read_structured` do the same at a cursor, and `Structured<T>` is a `ValueCodec`, so a `Map<str, Structured<T>>` stores one such value per key; its `put` compares the same way, and only opens the collection and the key once something differs, so putting an unchanged value writes nothing. A value that doesn't deserialize is an `Error::Decode` whose `field` is the path to the part that didn't, like `clusters.3.checks`.
+
+```rust
+#[cfg(feature = "serde")]
+fn main() -> xitdb::Result<()> {
+    use serde::{Deserialize, Serialize};
+    use xitdb::*;
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    enum State {
+        Pending,
+        Passed,
+        Failed { reason: String },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct Check {
+        name: String,
+        state: State,
+        url: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct PullRequest {
+        number: u64,
+        checks: Vec<Check>,
+    }
+
+    let db = Database::in_memory()?;
+    let history = History::new(&db)?;
+    let mut prs = vec![PullRequest {
+        number: 7,
+        checks: vec![
+            Check { name: "build".into(), state: State::Passed, url: None },
+            Check { name: "test".into(), state: State::Pending, url: None },
+        ],
+    }];
+    history.transact(|moment| put_structured(moment, "prs", &prs))?;
+
+    // the stored data is plain maps, lists and scalars
+    let moment = history.latest()?;
+    let stored = ReadHashMap::new(moment.get_list("prs")?.unwrap().get_cursor(0)?.unwrap())?;
+    assert_eq!(stored.get_uint("number")?, Some(7));
+    let test = ReadHashMap::new(stored.get_list("checks")?.unwrap().get_cursor(1)?.unwrap())?;
+    assert_eq!(test.get_string("state", None)?.as_deref(), Some("Pending"));
+    assert!(test.get_cursor("url")?.is_none());
+
+    // one check fails: only it, and the path to it, is written
+    prs[0].checks[1].state = State::Failed { reason: "timeout".into() };
+    history.transact(|moment| put_structured(moment, "prs", &prs))?;
+    let moment = history.latest()?;
+    assert_eq!(get_structured::<_, Vec<PullRequest>>(&moment, "prs")?, Some(prs.clone()));
+
+    // the same value again writes nothing, so nothing is committed
+    let (wrote, committed) = history.transact_with_status(|moment| put_structured(moment, "prs", &prs))?;
+    assert!(!wrote && !committed);
+    assert_eq!(history.count()?, 2);
+    Ok(())
+}
+
+#[cfg(not(feature = "serde"))]
 fn main() {}
 ```
 
