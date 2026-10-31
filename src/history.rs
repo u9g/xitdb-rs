@@ -2,7 +2,7 @@
 
 use std::io;
 
-use crate::collections::{ReadArrayList, ReadHashMap, WriteArrayList, WriteHashMap};
+use crate::collections::{ReadArrayList, ReadHashMap, WriteHashMap};
 use crate::core::Core;
 use crate::cursor::{ReadCursor, WriteCursor};
 use crate::data::Data;
@@ -56,12 +56,15 @@ impl<C: Core> std::fmt::Debug for History<'_, C> {
 }
 
 impl<'a, C: Core> History<'a, C> {
-    /// Opens the history at the root of `db`, initializing an empty one if
-    /// the database is empty. Returns [`Error::UnexpectedTag`] if the root
-    /// is something other than an array list, or its latest moment is
-    /// something other than a hash map.
+    /// Opens the history at the root of `db`. An empty database is an empty
+    /// history, which the first [`History::transact`] initializes. Returns
+    /// [`Error::UnexpectedTag`] if the root is something other than an array
+    /// list, or its latest moment is something other than a hash map.
+    ///
+    /// Opening a history never writes, so it works on a database opened with
+    /// [`Database::open_read_only`].
     pub fn new(db: &'a Database<C>) -> Result<Self> {
-        let list = WriteArrayList::new(&mut db.root_cursor())?;
+        let list = ReadArrayList::new(db.root_cursor())?;
         check_moment(list.get_slot(-1)?.unwrap_or_default())?;
         Ok(History { db })
     }
