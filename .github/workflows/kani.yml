@@ -1,0 +1,44 @@
+name: Kani
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  proof:
+    name: ${{ matrix.harness }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        harness:
+          - tag_from_u8_is_inverse_of_as_u8
+          - slot_roundtrip
+          - slot_decoding_is_canonical
+          - header_roundtrip
+          - collection_headers_roundtrip
+          - root_header_and_trailer_roundtrip
+          - key_value_pair_roundtrip
+          - node_header_is_bounded
+          - node_encoding_has_block_size
+          - array_list_shift_is_log16
+          - hash_nibble_is_nibble_of_big_endian_hash
+          - resolve_index_is_in_range
+          - check_rank_is_in_range
+          - crc64_matches_bitwise_definition
+          - new_database_reopens
+          - open_arbitrary_bytes
+          - hash_map_matches_model
+          - transactions_do_not_change_history
+          - array_list_matches_model
+          - linked_array_list_matches_model
+          - sorted_map_matches_model
+          - corrupt_hash_map_never_panics
+          - corrupt_sorted_map_never_panics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1
+        with:
+          args: --harness ${{ matrix.harness }} --exact

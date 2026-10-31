@@ -64,6 +64,8 @@ mod file_offset_map;
 mod format;
 mod hasher;
 mod path;
+#[cfg(kani)]
+mod proofs;
 mod slot;
 mod sorted;
 

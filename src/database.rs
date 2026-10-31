@@ -80,7 +80,7 @@ pub(crate) fn is_root(slot_ptr: &SlotPointer) -> bool {
 
 /// Resolves a possibly-negative index against `size`, or returns
 /// [`Error::KeyNotFound`] if it's out of range.
-fn resolve_index(index: i64, size: i64) -> Result<i64> {
+pub(crate) fn resolve_index(index: i64, size: i64) -> Result<i64> {
     if index >= size || index < -size {
         return Err(Error::KeyNotFound);
     }
@@ -89,7 +89,7 @@ fn resolve_index(index: i64, size: i64) -> Result<i64> {
 
 /// The nibble of the big-endian hash at `offset` nibbles from its least
 /// significant end.
-fn hash_nibble(hash: &[u8], offset: u8) -> usize {
+pub(crate) fn hash_nibble(hash: &[u8], offset: u8) -> usize {
     let offset = offset as usize;
     if offset / 2 >= hash.len() {
         return 0;
@@ -98,8 +98,15 @@ fn hash_nibble(hash: &[u8], offset: u8) -> usize {
     (if offset % 2 == 0 { byte & 0xf } else { byte >> 4 }) as usize
 }
 
+#[cfg(not(kani))]
 fn random_u64() -> Result<u64> {
     getrandom::u64().map_err(|err| Error::Io(io::Error::other(err.to_string())))
+}
+
+// kani can't call into the OS, so proofs cover every possible random value
+#[cfg(kani)]
+fn random_u64() -> Result<u64> {
+    Ok(kani::any())
 }
 
 impl<C: Core> Database<C> {
