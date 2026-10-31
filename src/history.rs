@@ -60,8 +60,14 @@ impl<'a, C: Core> History<'a, C> {
     /// the database is empty. Returns [`Error::UnexpectedTag`] if the root
     /// is something other than an array list, or its latest moment is
     /// something other than a hash map.
+    ///
+    /// Opening an existing history doesn't write, so it works on a database
+    /// opened with [`Database::open_read_only`].
     pub fn new(db: &'a Database<C>) -> Result<Self> {
-        let list = WriteArrayList::new(&mut db.root_cursor())?;
+        if db.read_root_slot()?.is_empty() {
+            WriteArrayList::new(&mut db.root_cursor())?;
+        }
+        let list = ReadArrayList::new(db.root_cursor())?;
         check_moment(list.get_slot(-1)?.unwrap_or_default())?;
         Ok(History { db })
     }

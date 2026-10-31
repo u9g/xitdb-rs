@@ -293,3 +293,17 @@ fn values_from_transact_are_independent_of_the_moment() {
     assert_eq!(foo, b"foo");
     assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"changed-value!!");
 }
+
+#[test]
+fn opens_a_read_only_history() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    {
+        let db = Database::open(tmp.path()).unwrap();
+        History::new(&db).unwrap().transact(|moment| moment.put("foo", "foo")).unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open_read_only(tmp.path()).unwrap();
+    let history = History::new(&db).unwrap();
+    assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"foo");
+    assert_eq!(history.count().unwrap(), 1);
+}
