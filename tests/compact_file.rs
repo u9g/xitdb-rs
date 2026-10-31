@@ -73,8 +73,6 @@ impl Core for FailingCore {
     }
 }
 
-type DynCore = Box<dyn Core + Send>;
-
 fn buffered(file: File) -> DynCore {
     Box::new(CoreBufferedFile::new(file))
 }
@@ -115,14 +113,13 @@ fn compact_file_shrinks_and_keeps_data() -> Result<()> {
 fn compact_file_with_dyn_core_and_file_offset_map() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("db");
-    let open = |file| Box::new(CoreBufferedFile::new(file)) as Box<dyn Core + Send>;
-    let mut db = Database::new(open(open_rw(&path)?), Hasher::sha1())?;
+    let mut db = Database::open(&path)?.into_dyn();
     append_moments(&db, 0, 10)?;
 
     let scratch = Database::new(CoreFile::new(tempfile::tempfile()?), Hasher::sha1())?;
     scratch.run_context(|cursor| {
         let mut offsets = FileOffsetMap::new(cursor)?;
-        db.compact_file(&path, &mut offsets, open)
+        db.compact_file(&path, &mut offsets, buffered)
     })?;
 
     assert_eq!(last_n(&db)?, (1, 9));

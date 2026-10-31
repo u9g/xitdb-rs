@@ -56,7 +56,8 @@ impl<C: Core> Database<C> {
     /// `<path>.compacting-<random>`, and renamed over `path`, so `path` holds
     /// either the original or the complete compacted database, even after a
     /// crash. `open` wraps a file in a core (for example,
-    /// `CoreBufferedFile::new`); it is called for the new file, and for the
+    /// `CoreBufferedFile::new`, or `|file| Box::new(CoreBufferedFile::new(file)) as DynCore`
+    /// for a [`DynCore`](crate::DynCore)); it is called for the new file, and for the
     /// original again if the rename fails. `offset_map` is used as in
     /// [`Database::compact`]. `self` keeps its hasher.
     ///
@@ -80,8 +81,10 @@ impl<C: Core> Database<C> {
     /// * Other `Database`s with the file open keep reading the old file, so
     ///   they must reopen `path` to see the compacted one. A writer in
     ///   another process would keep committing to the old file, and those
-    ///   commits would be lost, so hold the exclusive write lock across the
-    ///   compaction, and have other writers reopen `path` after taking it.
+    ///   commits would be lost, so hold the exclusive lock on the separate
+    ///   lock file (see [`CoreBufferedFile::open`](crate::CoreBufferedFile::open))
+    ///   across the compaction, and have other writers reopen `path` after
+    ///   taking it.
     /// * Symlinks in `path` are resolved first, so the real file is
     ///   replaced, but other hard links to it keep the old file.
     /// * The new file gets the original's permission bits, but not its
