@@ -276,4 +276,81 @@ pub fn writer_finish<S: Store>(
     Ok(slot)
 }
 
+/// The bytes short `value` packs into: the value, zeros, then the format
+/// tag in the last two bytes if there is one.
+pub open spec fn short_packed(value: Seq<u8>, format_tag: Option<[u8; 2]>) -> Seq<u8> {
+    Seq::new(8, |i: int| if i < value.len() {
+        value[i]
+    } else if format_tag is Some && i >= 6 {
+        format_tag.unwrap()@[i - 6]
+    } else {
+        0u8
+    })
+}
+
+/// `WriteData` for short bytes: the slot holding them inline.
+pub fn short_bytes_slot(value: &[u8], format_tag: Option<[u8; 2]>) -> (r: Slot)
+    requires
+        value@.len() <= (if format_tag is Some { 6int } else { 8int }),
+        forall|i: int| 0 <= i < value@.len() ==> #[trigger] value@[i] != 0,
+    ensures
+        r.tag == Tag::ShortBytes,
+        r.full == (format_tag is Some),
+        crate::bytes::u64_be_spec(crate::bytes::i2u(r.value)) == short_packed(value@, format_tag),
+{
+    let mut buf = [0u8; 8];
+    let mut i: usize = 0;
+    while i < value.len()
+        invariant
+            i <= value@.len() <= 8,
+            forall|k: int| 0 <= k < i ==> #[trigger] buf@[k] == value@[k],
+            forall|k: int| i <= k < 8 ==> #[trigger] buf@[k] == 0,
+        decreases value.len() - i,
+    {
+        buf[i] = value[i];
+        i += 1;
+    }
+    if let Some(tag) = format_tag {
+        buf[6] = tag[0];
+        buf[7] = tag[1];
+    }
+    let v = crate::bytes::u64_from_be_bytes(buf.as_slice()) as i64;
+    proof {
+        crate::bytes::lemma_u64_be_roundtrip(buf@);
+        crate::bytes::lemma_i64_u64_roundtrip(v, crate::bytes::be_u64_spec(buf@));
+        assert(buf@ =~= short_packed(value@, format_tag));
+    }
+    Slot::new(v, Tag::ShortBytes).with_full(format_tag.is_some())
+}
+
+/// Unpacking short bytes gives back the value and format tag they were
+/// packed from.
+pub proof fn lemma_short_bytes_roundtrip(value: Seq<u8>, format_tag: Option<[u8; 2]>, buf: Seq<u8>, len: int)
+    requires
+        value.len() <= (if format_tag is Some { 6int } else { 8int }),
+        forall|i: int| 0 <= i < value.len() ==> #[trigger] value[i] != 0,
+        buf == short_packed(value, format_tag),
+        0 <= len <= (if format_tag is Some { 6int } else { 8int }),
+        forall|i: int| 0 <= i < len ==> #[trigger] buf[i] != 0,
+        len < (if format_tag is Some { 6int } else { 8int }) ==> buf[len] == 0,
+    ensures
+        len == value.len(),
+        buf.subrange(0, len) == value,
+        format_tag is Some ==> buf[6] == format_tag.unwrap()@[0] && buf[7] == format_tag.unwrap()@[1],
+{
+    let total: int = if format_tag is Some { 6 } else { 8 };
+    if len < value.len() {
+        assert(0 <= len < 8);
+        assert(buf[len] == value[len]);
+        assert(false);
+    }
+    if len > value.len() {
+        let n = value.len() as int;
+        assert(0 <= n < total);
+        assert(buf[n] == 0u8);
+        assert(false);
+    }
+    assert(buf.subrange(0, len) =~= value);
+}
+
 } // verus!

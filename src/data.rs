@@ -72,14 +72,9 @@ impl<'a> Data<'a> {
             Data::Uint(value) => Slot::new(*value as i64, Tag::Uint),
             Data::Int(value) => Slot::new(*value, Tag::Int),
             Data::Float(value) => Slot::new(value.to_bits() as i64, Tag::Float),
-            Data::Bytes(bytes) if bytes.is_short() => {
-                let mut buf = [0u8; 8];
-                buf[..bytes.value.len()].copy_from_slice(&bytes.value);
-                if let Some(format_tag) = bytes.format_tag {
-                    buf[6..].copy_from_slice(&format_tag);
-                }
-                Slot::new(i64::from_be_bytes(buf), Tag::ShortBytes).with_full(bytes.format_tag.is_some())
-            }
+            // verified in cursor_store.rs, which proves that reading it back
+            // gives the same bytes and format tag
+            Data::Bytes(bytes) if bytes.is_short() => crate::cursor_store::short_bytes_slot(&bytes.value, bytes.format_tag),
             Data::Bytes(bytes) => return Encoded::Long(bytes),
         };
         Encoded::Inline(if slot.tag == Tag::None { slot.with_full(true) } else { slot })
