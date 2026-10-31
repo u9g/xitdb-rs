@@ -58,6 +58,7 @@ mod btree_join;
 mod collections;
 mod commit_store;
 mod compact;
+mod compact_store;
 mod core;
 mod arith;
 mod array_list_store;
