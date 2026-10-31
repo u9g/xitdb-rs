@@ -294,16 +294,45 @@ fn values_from_transact_are_independent_of_the_moment() {
     assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"changed-value!!");
 }
 
+// Opens `path` read-only and checks that opening its history and reading it leaves the file
+// byte for byte as it was.
+fn read_only_history(path: &std::path::Path, check: impl FnOnce(&History<'_, CoreBufferedFile>)) {
+    let before = std::fs::read(path).unwrap();
+    let db = Database::open_read_only(path).unwrap();
+    check(&History::new(&db).unwrap());
+    drop(db);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
 #[test]
-fn opens_a_read_only_history() {
+fn opens_a_read_only_history_without_writing() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    {
-        let db = Database::open(tmp.path()).unwrap();
-        History::new(&db).unwrap().transact(|moment| moment.put("foo", "foo")).unwrap();
-        db.close().unwrap();
-    }
-    let db = Database::open_read_only(tmp.path()).unwrap();
+    let db = Database::open(tmp.path()).unwrap();
+    History::new(&db).unwrap().transact(|moment| moment.put("foo", "foo")).unwrap();
+    db.close().unwrap();
+    read_only_history(tmp.path(), |history| {
+        assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"foo");
+        assert_eq!(history.count().unwrap(), 1);
+    });
+}
+
+#[test]
+fn opens_a_read_only_empty_history_without_writing() {
+    // a writer created the file but has not transacted yet
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    Database::open(tmp.path()).unwrap().close().unwrap();
+    read_only_history(tmp.path(), |history| {
+        assert_eq!(history.count().unwrap(), 0);
+        assert!(history.moment(-1).unwrap().is_none());
+        assert!(read(&history.latest().unwrap(), "foo").is_none());
+    });
+}
+
+#[test]
+fn transact_initializes_an_empty_history() {
+    let db = new_db();
     let history = History::new(&db).unwrap();
-    assert_eq!(read(&history.latest().unwrap(), "foo").unwrap(), b"foo");
+    assert_eq!(history.count().unwrap(), 0);
+    history.transact(|moment| moment.put("foo", "foo")).unwrap();
     assert_eq!(history.count().unwrap(), 1);
 }
