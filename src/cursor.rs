@@ -7,7 +7,9 @@ use crate::database::{ContextFn, Database, is_root};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode};
-use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::iter_store::{self, IterKind, IterLevel, IterState};
+use crate::store::DbStore;
+use crate::slot::{Slot, SlotPointer, Tag};
 use crate::sorted::short_bytes_value;
 
 /// A read-only pointer to a slot in the database.
@@ -124,39 +126,10 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     /// Reads a byte array along with its format tag.
     pub fn read_bytes_object(&self, max_size: Option<u64>) -> Result<Bytes<'static>> {
         let slot_ptr = self.resolved()?;
-        let too_long = |size: u64| max_size.is_some_and(|max| size > max);
-        match slot_ptr.slot.tag {
-            Tag::None => Ok(Bytes::default()),
-            Tag::Bytes => {
-                let value_size = self.db.read_i64_at(slot_ptr.slot.value)?;
-                if value_size < 0 {
-                    return Err(Error::ExpectedUnsignedLong);
-                }
-                if too_long(value_size as u64) {
-                    return Err(Error::StreamTooLong);
-                }
-                let mut value = vec![0u8; self.db.checked_len(slot_ptr.slot.value + 8, value_size)?];
-                self.db.seek(slot_ptr.slot.value + 8)?;
-                self.db.read_bytes(&mut value)?;
-                let format_tag = if slot_ptr.slot.full {
-                    let mut tag = [0u8; 2];
-                    self.db.read_bytes(&mut tag)?;
-                    Some(tag)
-                } else {
-                    None
-                };
-                Ok(Bytes { value: value.into(), format_tag })
-            }
-            Tag::ShortBytes => {
-                let (buf, len) = short_bytes_value(slot_ptr.slot);
-                if too_long(len as u64) {
-                    return Err(Error::StreamTooLong);
-                }
-                let format_tag = slot_ptr.slot.full.then(|| [buf[6], buf[7]]);
-                Ok(Bytes { value: buf[..len].to_vec().into(), format_tag })
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        // verified in cursor_store.rs
+        let (value, format_tag) =
+            crate::cursor_store::read_bytes_value(&mut DbStore::new(self.db), slot_ptr.slot, max_size)?;
+        Ok(Bytes { value: value.into(), format_tag })
     }
 
     /// For a cursor to a key-value pair (as yielded when iterating a map or
@@ -164,8 +137,9 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     pub fn read_key_value_pair(&self) -> Result<ReadKvPairCursor<'a, C>> {
         let slot_ptr = self.resolved()?;
         let kv = self.db.read_kv_pair(slot_ptr.slot)?;
-        let key_slot_pos = slot_ptr.slot.value + self.db.kv_key_offset(slot_ptr.slot.tag);
-        let value_slot_pos = key_slot_pos + SLOT_LENGTH as i64;
+        // verified in cursor_store.rs
+        let (key_slot_pos, value_slot_pos) =
+            crate::cursor_store::kv_slot_positions(slot_ptr.slot.value, self.db.kv_key_offset(slot_ptr.slot.tag))?;
         Ok(ReadKvPairCursor {
             value_cursor: ReadCursor::new(SlotPointer::new(Some(value_slot_pos), kv.value_slot), self.db),
             key_cursor: ReadCursor::new(SlotPointer::new(Some(key_slot_pos), kv.key_slot), self.db),
@@ -176,21 +150,9 @@ impl<'a, C: Core> ReadCursor<'a, C> {
     /// An incremental reader for a byte array.
     pub fn reader(&self) -> Result<CursorReader<'a, C>> {
         let slot_ptr = self.resolved()?;
-        match slot_ptr.slot.tag {
-            Tag::Bytes => {
-                let size = self.db.read_i64_at(slot_ptr.slot.value)?;
-                let start_position = slot_ptr.slot.value + 8;
-                let size = self.db.checked_len(start_position, size)? as u64;
-                let start_position = start_position as u64;
-                Ok(CursorReader { db: self.db, size, start_position, relative_position: 0, inline: None })
-            }
-            Tag::ShortBytes => {
-                // short bytes are stored in the slot itself, which we already have
-                let (buf, len) = short_bytes_value(slot_ptr.slot);
-                Ok(CursorReader { db: self.db, size: len as u64, start_position: 0, relative_position: 0, inline: Some(buf) })
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        // verified in cursor_store.rs
+        let (start_position, size, inline) = crate::cursor_store::reader_bounds(&mut DbStore::new(self.db), slot_ptr.slot)?;
+        Ok(CursorReader { db: self.db, size, start_position, relative_position: 0, inline })
     }
 
     /// Whether writing `data` here would leave the slot as it is. Anything
@@ -303,10 +265,9 @@ impl<C: Core> CursorReader<'_, C> {
     /// Fills `buf`, or returns [`Error::EndOfStream`] if there aren't
     /// enough bytes left.
     pub fn read_fully(&mut self, buf: &mut [u8]) -> Result<()> {
-        if self.size < self.relative_position || self.size - self.relative_position < buf.len() as u64 {
-            return Err(Error::EndOfStream);
-        }
-        let start = self.start_position + self.relative_position;
+        // verified in cursor_store.rs
+        let start = crate::cursor_store::reader_range(self.size, self.start_position, self.relative_position, buf.len())
+            .ok_or(Error::EndOfStream)?;
         match &self.inline {
             Some(inline) => buf.copy_from_slice(&inline[start as usize..start as usize + buf.len()]),
             None => self.db.read_at(start as i64, buf)?,
@@ -383,107 +344,24 @@ impl<C: Core> io::Seek for CursorReader<'_, C> {
     }
 }
 
-// CursorIterator - stack-based tree traversal
-
-#[derive(Clone, Copy)]
-struct IterLevel {
-    position: i64,
-    block: [Slot; SLOT_COUNT],
-    index: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IterKind {
-    Empty,
-    // a fixed number of items in an array list or b-tree
-    Counted,
-    // hash maps and sets, which are walked until the stack is empty
-    Map,
-}
+// CursorIterator - stack-based tree traversal, verified in iter_store.rs
 
 /// Iterates over the items of a collection, yielding read-only cursors.
 pub struct CursorIterator<'a, C: Core> {
     db: &'a Database<C>,
-    kind: IterKind,
-    size: i64,
-    index: i64,
-    stack: Vec<IterLevel>,
-    // skips a b-tree node's kind+num header, or 0 for the radix trie
-    node_offset: i64,
-    // for array lists, the stack depth of the leaf blocks. every slot in them
-    // is an item, even an empty one, so they are counted even when empty.
-    // otherwise, empty slots past the end of a list that was sliced and then
-    // appended to without being written would be followed by stale items.
-    leaf_depth: Option<usize>,
-    done: bool,
-}
-
-/// Resolves a possibly-negative start index against `size` to a 0-based
-/// rank. Negatives count from the end (-1 is the last entry); anything out
-/// of range returns `None` (yield nothing).
-fn resolve_start_index(index: i64, size: i64) -> Option<i64> {
-    let resolved = if index < 0 { index + size } else { index };
-    (0..size).contains(&resolved).then_some(resolved)
+    state: IterState,
 }
 
 impl<'a, C: Core> CursorIterator<'a, C> {
     fn empty(db: &'a Database<C>) -> CursorIterator<'a, C> {
-        CursorIterator {
-            db,
-            kind: IterKind::Empty,
-            size: 0,
-            index: 0,
-            stack: Vec::new(),
-            node_offset: 0,
-            leaf_depth: None,
-            done: true,
-        }
-    }
-
-    fn level(&self, position: i64) -> Result<IterLevel> {
-        Ok(IterLevel { position, block: self.db.read_index_block(position)?, index: 0 })
+        CursorIterator { db, state: iter_store::empty_state() }
     }
 
     pub(crate) fn new(cursor: &ReadCursor<'a, C>) -> Result<CursorIterator<'a, C>> {
         let cursor = cursor.resolved_cursor()?;
         let db = cursor.db;
-        let slot = cursor.slot_ptr.slot;
-        let mut it = CursorIterator::empty(db);
-        match slot.tag {
-            Tag::None => {}
-            Tag::ArrayList => {
-                let header = db.read_array_list_header(slot.value)?;
-                it.kind = IterKind::Counted;
-                it.size = header.size;
-                it.stack = vec![it.level(header.ptr)?];
-                it.leaf_depth = Some(array_list_shift(header.size - 1) as usize + 1);
-            }
-            Tag::LinkedArrayList | Tag::SortedMap | Tag::SortedSet => {
-                // backed by a b-tree: read the header, then walk from the root
-                // node's value/child slots (skipping its kind+num header)
-                let header = db.read_btree_header(slot.value)?;
-                it.kind = IterKind::Counted;
-                it.size = header.size;
-                it.node_offset = BTREE_NODE_HEADER_SIZE as i64;
-                it.stack = vec![it.level(header.root_ptr + BTREE_NODE_HEADER_SIZE as i64)?];
-            }
-            Tag::HashMap | Tag::HashSet => {
-                it.kind = IterKind::Map;
-                it.stack = vec![it.level(slot.value)?];
-            }
-            Tag::CountedHashMap | Tag::CountedHashSet => {
-                it.kind = IterKind::Map;
-                it.stack = vec![it.level(slot.value + 8)?];
-            }
-            _ => return Err(Error::UnexpectedTag),
-        }
-        it.done = it.kind == IterKind::Empty;
-        Ok(it)
-    }
-
-    // starts a counted iterator at `index` with a stack from a seek
-    fn seeked(db: &'a Database<C>, size: i64, index: i64, node_offset: i64, stack: Vec<IterLevel>) -> Self {
-        CursorIterator { db, kind: IterKind::Counted, size, index, stack, node_offset, leaf_depth: None, done: false }
+        let state = iter_store::new_state(&mut DbStore::new(db), cursor.slot_ptr.slot)?;
+        Ok(CursorIterator { db, state })
     }
 
     /// An array list iterator that starts at `start_index`, descending the
@@ -499,30 +377,14 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             _ => return Err(Error::UnexpectedTag),
         }
         let header = db.read_array_list_header(slot.value)?;
-        let Some(idx) = resolve_start_index(start_index, header.size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, header.size) else {
             return Ok(CursorIterator::empty(db));
         };
-        let mut shift = array_list_shift(header.size - 1);
-        // descend the radix trie, pushing one level per tier with its index
-        // set to that tier's child slot
-        let mut stack = Vec::new();
-        let mut pos = header.ptr;
-        loop {
-            let block = db.read_index_block(pos)?;
-            let i = ((idx >> (shift as u32 * BIT_COUNT)) & MASK) as usize;
-            stack.push(IterLevel { position: pos, block, index: i });
-            if shift == 0 {
-                break;
-            }
-            // every tier above the leaf is a populated index slot for any
-            // index < size, so this child always exists
-            pos = block[i].value;
-            shift -= 1;
-        }
+        let stack = iter_store::array_list_seek(&mut DbStore::new(db), header, idx)?;
         let leaf_depth = stack.len();
-        let mut it = CursorIterator::seeked(db, header.size, idx, 0, stack);
-        it.leaf_depth = Some(leaf_depth);
-        Ok(it)
+        let mut state = iter_store::seeked_state(&mut DbStore::new(db), header.size, idx, 0, stack)?;
+        state.leaf_depth = Some(leaf_depth);
+        Ok(CursorIterator { db, state })
     }
 
     /// A linked array list iterator that starts at `start_index`.
@@ -536,28 +398,12 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             _ => return Err(Error::UnexpectedTag),
         }
         let header = db.read_btree_header(slot.value)?;
-        let Some(idx) = resolve_start_index(start_index, header.size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, header.size) else {
             return Ok(CursorIterator::empty(db));
         };
-        let mut stack = Vec::new();
-        let mut node_ptr = header.root_ptr;
-        let mut rem = idx;
-        loop {
-            let node = db.read_btree_node(node_ptr)?;
-            let position = node_ptr + BTREE_NODE_HEADER_SIZE as i64;
-            if node.kind == BTreeNodeKind::Leaf {
-                stack.push(IterLevel { position, block: node.values, index: check_rank(rem, node.num, false)? });
-                break;
-            }
-            let mut i = 0;
-            while i + 1 < node.num && rem >= node.counts[i] {
-                rem -= node.counts[i];
-                i += 1;
-            }
-            stack.push(IterLevel { position, block: node.children, index: i });
-            node_ptr = node.children[i].value;
-        }
-        Ok(CursorIterator::seeked(db, header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack))
+        let stack = iter_store::linked_array_list_seek(&mut DbStore::new(db), header, idx)?;
+        let state = iter_store::seeked_state(&mut DbStore::new(db), header.size, idx, BTREE_NODE_HEADER_SIZE as i64, stack)?;
+        Ok(CursorIterator { db, state })
     }
 
     fn sorted_root(cursor: &ReadCursor<'a, C>) -> Result<Option<(i64, i64)>> {
@@ -573,7 +419,9 @@ impl<'a, C: Core> CursorIterator<'a, C> {
     }
 
     fn levels(path: crate::sorted::NodePath) -> Vec<IterLevel> {
-        path.into_iter().map(|(position, block, index)| IterLevel { position, block, index }).collect()
+        path.into_iter()
+            .map(|(position, block, index)| IterLevel { position, block, index: index.min(SLOT_COUNT) })
+            .collect()
     }
 
     /// A sorted map iterator that starts at the entry with rank
@@ -585,11 +433,12 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             // an unwritten map is none (like iter()): yield nothing
             return Ok(CursorIterator::empty(db));
         };
-        let Some(idx) = resolve_start_index(start_index, size) else {
+        let Some(idx) = iter_store::resolve_start_index(start_index, size) else {
             return Ok(CursorIterator::empty(db));
         };
         let stack = Self::levels(db.sorted_path_from_index(root_ptr, idx)?);
-        Ok(CursorIterator::seeked(db, size, idx, BTREE_NODE_HEADER_SIZE as i64, stack))
+        let state = iter_store::seeked_state(&mut DbStore::new(db), size, idx, BTREE_NODE_HEADER_SIZE as i64, stack)?;
+        Ok(CursorIterator { db, state })
     }
 
     /// A sorted map iterator that starts at the first entry with a key >=
@@ -601,38 +450,8 @@ impl<'a, C: Core> CursorIterator<'a, C> {
             return Ok(CursorIterator::empty(db));
         };
         let (path, before) = db.sorted_path_from_key(root_ptr, start_key)?;
-        Ok(CursorIterator::seeked(db, size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path)))
-    }
-
-    // the next slot, or None once the stack is exhausted. empty slots are
-    // skipped, except in array list leaf blocks.
-    fn next_internal(&mut self) -> Result<Option<SlotPointer>> {
-        while let Some(level) = self.stack.last_mut() {
-            if level.index >= level.block.len() {
-                self.stack.pop();
-                if let Some(parent) = self.stack.last_mut() {
-                    parent.index += 1;
-                }
-                continue;
-            }
-
-            let next_slot = level.block[level.index];
-            if next_slot.tag == Tag::Index {
-                // node_offset skips a b-tree node's kind+num header
-                let next_pos = next_slot.value + self.node_offset;
-                let level = self.level(next_pos)?;
-                self.stack.push(level);
-                continue;
-            }
-
-            level.index += 1;
-            if !next_slot.is_empty() || self.leaf_depth == Some(self.stack.len()) {
-                let level = self.stack.last().expect("checked above");
-                let position = level.position + ((level.index - 1) * SLOT_LENGTH) as i64;
-                return Ok(Some(SlotPointer::new(Some(position), next_slot)));
-            }
-        }
-        Ok(None)
+        let state = iter_store::seeked_state(&mut DbStore::new(db), size, before, BTREE_NODE_HEADER_SIZE as i64, Self::levels(path))?;
+        Ok(CursorIterator { db, state })
     }
 }
 
@@ -640,27 +459,27 @@ impl<'a, C: Core> Iterator for CursorIterator<'a, C> {
     type Item = Result<ReadCursor<'a, C>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.state.done {
             return None;
         }
         loop {
-            if self.kind == IterKind::Counted {
-                if self.index >= self.size {
-                    self.done = true;
+            if self.state.kind == IterKind::Counted {
+                if self.state.index >= self.state.size {
+                    self.state.done = true;
                     return None;
                 }
-                self.index += 1;
+                self.state.index += 1;
             }
-            match self.next_internal() {
+            match iter_store::next_internal(&mut DbStore::new(self.db), &mut self.state) {
                 Err(err) => {
-                    self.done = true;
+                    self.state.done = true;
                     return Some(Err(err));
                 }
                 // an empty array list item counts toward the size, but has no value
                 Ok(Some(slot_ptr)) if slot_ptr.slot.is_empty() => {}
                 Ok(Some(slot_ptr)) => return Some(Ok(ReadCursor::new(slot_ptr, self.db))),
                 Ok(None) => {
-                    self.done = true;
+                    self.state.done = true;
                     return None;
                 }
             }
@@ -1026,11 +845,9 @@ impl<'a, C: Core> WriteCursor<'a, C> {
             return Err(Error::CursorNotWriteable);
         }
         let db = self.read.db;
-        if db.tx_start.get().is_none() {
-            return Err(Error::ExpectedTxStart);
-        }
-        let ptr_pos = db.append(&0i64.to_be_bytes())?;
-        let start_position = db.len()?;
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
+        // verified in cursor_store.rs
+        let (ptr_pos, start_position) = crate::cursor_store::writer_begin(&mut DbStore::new(db), limit)?;
         Ok(CursorWriter {
             parent: self,
             size: 0,
@@ -1101,21 +918,19 @@ impl<C: Core> CursorWriter<'_, '_, C> {
 
     fn write_bytes(&mut self, buf: &[u8]) -> Result<()> {
         self.check_writable()?;
-        if self.size < self.relative_position {
-            return Err(Error::EndOfStream);
-        }
         let db = self.parent.read.db;
-        let new_position = self.relative_position + buf.len() as i64;
-
-        // another allocation may now follow this byte array.
-        // extending it would overwrite that allocation.
-        if new_position > self.size && db.len()? != self.start_position + self.size {
-            return Err(Error::UnexpectedWriterPosition);
-        }
-
-        db.write_at(self.start_position + self.relative_position, buf)?;
-        self.relative_position = new_position;
-        self.size = self.size.max(self.relative_position);
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
+        // verified in cursor_store.rs
+        let (relative_position, size) = crate::cursor_store::writer_write(
+            &mut DbStore::new(db),
+            self.start_position,
+            self.size,
+            self.relative_position,
+            buf,
+            limit,
+        )?;
+        self.relative_position = relative_position;
+        self.size = size;
         Ok(())
     }
 
@@ -1134,24 +949,19 @@ impl<C: Core> CursorWriter<'_, '_, C> {
     pub fn finish(&mut self) -> Result<()> {
         self.check_writable()?;
         let db = self.parent.read.db;
-        if let Some(format_tag) = self.format_tag {
-            self.slot = self.slot.with_full(true);
-            let format_tag_pos = db.len()?;
-            if self.start_position + self.size != format_tag_pos {
-                return Err(Error::UnexpectedWriterPosition);
-            }
-            db.write_at(format_tag_pos, &format_tag)?;
-        }
-
-        db.write_i64_at(self.slot.value, self.size)?;
-
         let position = self.parent.read.slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-        db.write_slot_at(position, self.slot)?;
-
+        let limit = db.tx_floor.get().ok_or(Error::ExpectedTxStart)?;
+        // verified in cursor_store.rs
+        self.slot = crate::cursor_store::writer_finish(
+            &mut DbStore::new(db),
+            self.slot,
+            self.start_position,
+            self.size,
+            self.format_tag,
+            position,
+            limit,
+        )?;
         self.parent.read.slot_ptr = self.parent.read.slot_ptr.with_slot(self.slot);
-        if db.tx_start.get().is_none() {
-            db.core().sync()?;
-        }
         Ok(())
     }
 }

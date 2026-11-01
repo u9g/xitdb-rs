@@ -8,10 +8,13 @@ use crate::core::{CoreBufferedFile, CoreMemory};
 use crate::cursor::WriteCursor;
 use crate::data::{Data, Encoded};
 use crate::error::{Error, Result};
+use vstd::prelude::*;
 use crate::format::*;
 use crate::hasher::Hasher;
 use crate::path::{HashMapGetTarget, PathPart, WriteMode, hash_map_tag, sorted_map_tag};
-use crate::slot::{SLOT_LENGTH, Slot, SlotPointer, Tag};
+use crate::slot::{Slot, SlotPointer, Tag};
+use crate::map_store::MapTarget;
+use crate::store::{DbStore, IoSink, IoSource};
 
 /// A function run inside a write, with a cursor to the slot the path led to.
 pub(crate) type ContextFn<'f, 'a, C> =
@@ -54,6 +57,10 @@ pub struct Database<C: Core> {
     hasher: Hasher,
     header: Cell<Header>,
     pub(crate) tx_start: Cell<Option<i64>>,
+    // where the current transaction started: everything before it is
+    // committed. tx_start can move past it (freezing, concatenation), but
+    // this doesn't.
+    pub(crate) tx_floor: Cell<Option<i64>>,
     pub(crate) transaction: Cell<Option<Transaction>>,
     next_transaction_id: Cell<u64>,
 }
@@ -80,25 +87,25 @@ pub(crate) fn is_root(slot_ptr: &SlotPointer) -> bool {
     slot_ptr.position == Some(ROOT_HEADER_START)
 }
 
+verus! {
+
 /// Resolves a possibly-negative index against `size`, or returns
 /// [`Error::KeyNotFound`] if it's out of range.
-fn resolve_index(index: i64, size: i64) -> Result<i64> {
+fn resolve_index(index: i64, size: i64) -> (r: Result<i64>)
+    ensures
+        r is Err <==> !(-size <= index < size),
+        r matches Ok(i) ==> 0 <= i < size && i == if index < 0 { size + index } else { index as int },
+{
+    if size < 0 {
+        return Err(Error::KeyNotFound);
+    }
     if index >= size || index < -size {
         return Err(Error::KeyNotFound);
     }
     Ok(if index < 0 { size + index } else { index })
 }
 
-/// The nibble of the big-endian hash at `offset` nibbles from its least
-/// significant end.
-fn hash_nibble(hash: &[u8], offset: u8) -> usize {
-    let offset = offset as usize;
-    if offset / 2 >= hash.len() {
-        return 0;
-    }
-    let byte = hash[hash.len() - 1 - offset / 2];
-    (if offset % 2 == 0 { byte & 0xf } else { byte >> 4 }) as usize
-}
+} // verus!
 
 fn random_u64() -> Result<u64> {
     getrandom::u64().map_err(|err| Error::Io(io::Error::other(err.to_string())))
@@ -153,6 +160,7 @@ impl<C: Core> Database<C> {
             }),
             hasher,
             tx_start: Cell::new(None),
+            tx_floor: Cell::new(None),
             transaction: Cell::new(None),
             next_transaction_id: Cell::new(1),
         };
@@ -171,14 +179,10 @@ impl<C: Core> Database<C> {
                 magic_number: MAGIC_NUMBER,
             };
             db.header.set(header);
-            db.write_bytes(&header.to_bytes())?;
-            // write the root header and commit an empty root, so the
-            // file ends with a trailer like after any transaction
-            db.write_bytes(&RootHeader { file_size: 0, root: Slot::default() }.to_bytes())?;
-            // the first commit's ID is 0, so a new database's bytes only
-            // depend on its file ID
-            db.commit_root(Slot::default(), 0)?;
-            db.core().sync()?;
+            // write the header and the root header and commit an empty
+            // root, so the file ends with a trailer like after any
+            // transaction. verified in commit_store.rs
+            crate::commit_store::init_file(&mut DbStore::new(&db), header)?;
         } else {
             let header = db.read_and_validate_header()?;
             db.header.set(header);
@@ -247,6 +251,7 @@ impl<C: Core> Database<C> {
             hasher: self.hasher,
             header: self.header,
             tx_start: self.tx_start,
+            tx_floor: self.tx_floor,
             transaction: self.transaction,
             next_transaction_id: self.next_transaction_id,
         }
@@ -282,65 +287,22 @@ impl<C: Core> Database<C> {
         self.write_bytes(buf)
     }
 
-    /// Writes `buf` at the end and returns its position.
-    pub(crate) fn append(&self, buf: &[u8]) -> Result<i64> {
-        let pos = self.len()?;
-        self.write_at(pos, buf)?;
-        Ok(pos)
-    }
-
-    /// Validates the length of a byte array read from disk before a buffer
-    /// is allocated for it, so corrupt data can't cause a huge allocation.
-    /// Small lengths aren't checked against the end of the database, which
-    /// would cost a syscall on some cores; reading them fails anyway if
-    /// they run past the end.
-    pub(crate) fn checked_len(&self, pos: i64, len: i64) -> Result<usize> {
-        const UNCHECKED_LEN: i64 = 1 << 16;
-        if len < 0 {
-            return Err(Error::ExpectedUnsignedLong);
-        }
-        if len > UNCHECKED_LEN && pos.checked_add(len).is_none_or(|end| end > self.len().unwrap_or(0)) {
-            return Err(Error::InvalidDatabase);
-        }
-        usize::try_from(len).map_err(|_| Error::InvalidDatabase)
-    }
-
     pub(crate) fn read_i64_at(&self, pos: i64) -> Result<i64> {
         let mut buf = [0u8; 8];
         self.read_at(pos, &mut buf)?;
         Ok(i64::from_be_bytes(buf))
     }
 
-    pub(crate) fn write_i64_at(&self, pos: i64, value: i64) -> Result<()> {
-        self.write_at(pos, &value.to_be_bytes())
-    }
-
     pub(crate) fn read_slot_at(&self, pos: i64) -> Result<Slot> {
-        let mut buf = [0u8; SLOT_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        Slot::from_bytes(&buf)
-    }
-
-    pub(crate) fn write_slot_at(&self, pos: i64, slot: Slot) -> Result<()> {
-        self.write_at(pos, &slot.to_bytes())
-    }
-
-    pub(crate) fn read_index_block(&self, pos: i64) -> Result<[Slot; SLOT_COUNT]> {
-        let mut buf = [0u8; INDEX_BLOCK_SIZE];
-        self.read_at(pos, &mut buf)?;
-        decode_slots(&buf)
+        crate::array_list_store::read_slot_at(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn read_array_list_header(&self, pos: i64) -> Result<ArrayListHeader> {
-        let mut buf = [0u8; ARRAY_LIST_HEADER_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        ArrayListHeader::from_bytes(&buf)
+        crate::path_store::read_array_list_header(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn read_btree_header(&self, pos: i64) -> Result<BTreeHeader> {
-        let mut buf = [0u8; BTREE_HEADER_LENGTH];
-        self.read_at(pos, &mut buf)?;
-        BTreeHeader::from_bytes(&buf)
+        crate::path_store::read_btree_header(&mut DbStore::new(self), pos)
     }
 
     pub(crate) fn hash_size(&self) -> usize {
@@ -412,9 +374,8 @@ impl<C: Core> Database<C> {
 
     /// This database's [`ReplicaState`].
     pub fn replica_state(&self) -> Result<ReplicaState> {
-        let committed_size = self.committed_size()?;
-        let trailer = self.read_root_trailer(committed_size)?;
-        Ok(ReplicaState { committed_size, checksum: trailer.checksum })
+        // verified in commit_store.rs
+        crate::commit_store::replica_state(&mut DbStore::new(self), self.header.get().file_id)
     }
 
     /// Where to start sending committed bytes to a replica in `state`.
@@ -422,15 +383,8 @@ impl<C: Core> Database<C> {
     /// database, or 0 if it must be replaced, because it's a replica of
     /// another file or it has diverged from this one.
     pub fn replication_start(&self, state: ReplicaState) -> Result<i64> {
-        let committed_size = self.committed_size()?;
-        if state.committed_size > committed_size {
-            return Ok(0);
-        }
-        match self.read_root_trailer(state.committed_size) {
-            Ok(trailer) if trailer.checksum == state.checksum => Ok(state.committed_size),
-            Ok(_) | Err(Error::InvalidDatabase | Error::UnexpectedTag) => Ok(0),
-            Err(err) => Err(err),
-        }
+        // verified in commit_store.rs
+        crate::commit_store::replication_start(&mut DbStore::new(self), self.header.get().file_id, state)
     }
 
     /// Writes the committed bytes from `start` up to `end` to `w`. `start`
@@ -440,33 +394,9 @@ impl<C: Core> Database<C> {
     /// matching `end` is written, making the bytes a complete database by
     /// themselves.
     pub fn read_committed(&self, start: i64, end: i64, w: &mut impl io::Write) -> Result<()> {
-        let committed_size = self.committed_size()?;
-        if start < 0 || start > end || end > committed_size {
-            return Err(Error::InvalidRange);
-        }
-        if start > 0 && start < ROOT_HEADER_END {
-            return Err(Error::InvalidRange);
-        }
-        if start == 0 {
-            let trailer = self.read_root_trailer(end)?;
-            self.stream_bytes(w, 0, ROOT_HEADER_START)?;
-            w.write_all(&RootHeader { file_size: end, root: trailer.root }.to_bytes())?;
-            return self.stream_bytes(w, ROOT_HEADER_END, end - ROOT_HEADER_END);
-        }
-        self.stream_bytes(w, start, end - start)
-    }
-
-    // writes length bytes, starting at start, to w
-    fn stream_bytes(&self, w: &mut impl io::Write, start: i64, mut length: i64) -> Result<()> {
-        self.seek(start)?;
-        let mut buf = vec![0u8; length.clamp(0, 4096) as usize];
-        while length > 0 {
-            let chunk = length.min(buf.len() as i64) as usize;
-            self.read_bytes(&mut buf[..chunk])?;
-            w.write_all(&buf[..chunk])?;
-            length -= chunk as i64;
-        }
-        Ok(())
+        // verified in commit_store.rs
+        let mut sink = IoSink::new(w);
+        crate::commit_store::read_committed(&mut DbStore::new(self), &mut sink, start, end, self.header.get().file_id)
     }
 
     /// Writes `length` bytes from `r` at `start` and commits them. They
@@ -484,15 +414,9 @@ impl<C: Core> Database<C> {
             self.truncate()?;
         }
 
-        self.seek(start)?;
-        let mut buf = vec![0u8; length.clamp(0, 4096) as usize];
-        let mut remaining = length;
-        while remaining > 0 {
-            let chunk = remaining.min(buf.len() as i64) as usize;
-            r.read_exact(&mut buf[..chunk])?;
-            self.write_bytes(&buf[..chunk])?;
-            remaining -= chunk as i64;
-        }
+        // verified in commit_store.rs
+        let mut source = IoSource::new(r);
+        crate::commit_store::write_replicated(&mut DbStore::new(self), &mut source, start, length)?;
 
         if start == 0 {
             // the bytes are a different database, with its own header
@@ -502,10 +426,7 @@ impl<C: Core> Database<C> {
             self.committed_size()?;
         } else if length > 0 {
             // the bytes must end with a trailer. update the root header to match it.
-            let trailer = self.read_root_trailer(start + length)?;
-            self.core().sync()?;
-            self.write_root_header(trailer.root)?;
-            self.core().sync()?;
+            crate::commit_store::finish_replicated(&mut DbStore::new(self), start, length, self.header.get().file_id)?;
         }
         Ok(())
     }
@@ -587,48 +508,25 @@ impl<C: Core> Database<C> {
     /// never change except for the root header (see
     /// [`Database::read_committed`]).
     pub fn committed_size(&self) -> Result<i64> {
-        let header = self.read_root_header()?;
-        let minimum_size = ROOT_HEADER_END + ROOT_TRAILER_LENGTH as i64;
-        if header.file_size < minimum_size {
-            return Err(Error::InvalidDatabase);
-        }
-        if self.len()? < header.file_size {
-            return Err(Error::TruncatedDatabase);
-        }
-        // the committed bytes must end with a trailer matching the header
-        let trailer = self.read_root_trailer(header.file_size)?;
-        if trailer.root != header.root {
-            return Err(Error::InvalidDatabase);
-        }
-        Ok(header.file_size)
+        // verified in commit_store.rs
+        crate::commit_store::committed_size(&mut DbStore::new(self), self.header.get().file_id)
     }
 
     pub(crate) fn truncate(&self) -> Result<()> {
+        // verified in commit_store.rs
+        let file_id = self.header.get().file_id;
         let committed_size = self.committed_size()?;
         if let Some(frozen_at) = self.transaction.get().and_then(|t| t.frozen_at)
             && frozen_at > committed_size
         {
-            // retain frozen bytes without publishing the failed transaction.
-            // discard what follows the frozen bytes, then commit the current
-            // root again after them, so they end with a trailer
-            if self.len()? > frozen_at {
-                self.core().set_length(frozen_at as u64)?;
-            }
-            let root = self.read_root_slot()?;
-            self.commit_root(root, random_u64()?)?;
-            self.core().sync()?;
-            return Ok(());
+            // retain frozen bytes without publishing the failed transaction
+            return crate::commit_store::truncate_to_frozen(&mut DbStore::new(self), frozen_at, random_u64()?, file_id);
         }
-        if self.len()? > committed_size {
-            self.core().set_length(committed_size as u64)?;
-        }
-        Ok(())
+        crate::commit_store::truncate_to_committed(&mut DbStore::new(self), committed_size)
     }
 
     pub(crate) fn read_root_header(&self) -> Result<RootHeader> {
-        let mut buf = [0u8; ROOT_HEADER_LENGTH];
-        self.read_at(ROOT_HEADER_START, &mut buf)?;
-        RootHeader::from_bytes(&buf)
+        crate::commit_store::read_root_header(&mut DbStore::new(self))
     }
 
     // the most recently committed root slot
@@ -636,75 +534,6 @@ impl<C: Core> Database<C> {
         Ok(self.read_root_header()?.root)
     }
 
-    // the trailer that ends at end
-    pub(crate) fn read_root_trailer(&self, end: i64) -> Result<RootTrailer> {
-        if end < ROOT_TRAILER_LENGTH as i64 {
-            return Err(Error::InvalidDatabase);
-        }
-        let trailer_pos = end - ROOT_TRAILER_LENGTH as i64;
-        let mut buf = [0u8; ROOT_TRAILER_LENGTH];
-        self.read_at(trailer_pos, &mut buf)?;
-        // check the checksum before decoding the root, because a corrupt
-        // trailer can hold an unknown tag
-        let checksum = read_u64(&buf[SLOT_LENGTH + 8..]);
-        let commit_id = read_u64(&buf[SLOT_LENGTH..SLOT_LENGTH + 8]);
-        let root_bytes: [u8; SLOT_LENGTH] = buf[..SLOT_LENGTH].try_into().unwrap();
-        let expected = crate::crc64::checksum(&{
-            let mut data = [0u8; 24 + SLOT_LENGTH];
-            data[0..8].copy_from_slice(&self.header.get().file_id.to_be_bytes());
-            data[8..16].copy_from_slice(&trailer_pos.to_be_bytes());
-            data[16..16 + SLOT_LENGTH].copy_from_slice(&root_bytes);
-            data[16 + SLOT_LENGTH..].copy_from_slice(&commit_id.to_be_bytes());
-            data
-        });
-        if checksum != expected {
-            return Err(Error::InvalidDatabase);
-        }
-        RootTrailer::from_bytes(&buf)
-    }
-
-    // completes a transaction by appending a trailer for root and updating
-    // the root header. callers must sync afterwards to make the header
-    // itself durable.
-    pub(crate) fn commit_root(&self, root: Slot, commit_id: u64) -> Result<()> {
-        let trailer_pos = self.len()?;
-        let trailer = RootTrailer::new(self.header.get().file_id, trailer_pos, root, commit_id);
-        self.write_at(trailer_pos, &trailer.to_bytes())?;
-
-        // flush and fsync before updating the header, because updating
-        // the header is what completes the transaction. without the
-        // fsync, the OS could persist the header before the data it
-        // points to, so a crash could commit a transaction whose data
-        // never reached disk.
-        self.core().sync()?;
-
-        self.write_root_header(root)
-    }
-
-    // points the root header at root, which must be in the trailer that ends
-    // the file.
-    fn write_root_header(&self, root: Slot) -> Result<()> {
-        let file_size = self.len()?;
-        self.write_at(ROOT_HEADER_START, &RootHeader { file_size, root }.to_bytes())
-    }
-
-    // whether the data at ptr predates this transaction, or the writing
-    // cursor's freeze point, so it must be copied before it is modified.
-    // writes only happen inside a transaction.
-    pub(crate) fn is_old(&self, ptr: i64, frozen_at: i64) -> Result<bool> {
-        let tx_start = self.tx_start.get().ok_or(Error::ExpectedTxStart)?;
-        Ok(ptr < tx_start.max(frozen_at))
-    }
-
-    // copies an index block to the end unless it was made in this transaction
-    fn copy_index_block_if_old(&self, ptr: i64, frozen_at: i64) -> Result<i64> {
-        if !self.is_old(ptr, frozen_at)? {
-            return Ok(ptr);
-        }
-        let mut block = [0u8; INDEX_BLOCK_SIZE];
-        self.read_at(ptr, &mut block)?;
-        self.append(&block)
-    }
 
     fn check_hash<'h>(&self, hash: &'h [u8]) -> Result<&'h [u8]> {
         if hash.len() != self.hash_size() {
@@ -725,16 +554,19 @@ impl<C: Core> Database<C> {
         Ok(())
     }
 
-    // copy frozen collection storage before mutation to preserve existing readers
+    // copy frozen or committed collection storage before mutation to
+    // preserve existing readers. a path can reach a collection without its
+    // init part (such as through a copied hash map), and a collection from a
+    // past transaction must not change in place.
     fn copy_collection_if_frozen(
         &self,
         slot_ptr: SlotPointer,
         init: PathPart<'_>,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        if let Some(tx_frozen_at) = self.transaction.get().and_then(|t| t.frozen_at)
-            && slot_ptr.slot.value < tx_frozen_at
-        {
+        let frozen = self.transaction.get().and_then(|t| t.frozen_at).is_some_and(|f| slot_ptr.slot.value < f);
+        let committed = self.tx_floor.get().is_some_and(|floor| slot_ptr.slot.value < floor);
+        if frozen || committed {
             return self.read_part(init, WriteMode::ReadWrite, &[init], 0, slot_ptr, frozen_at, &mut None);
         }
         Ok(slot_ptr)
@@ -816,6 +648,8 @@ impl<C: Core> Database<C> {
         let scratch_pos = self.len()?;
         self.tx_start.set(Some(scratch_pos));
         let _reset_tx_start = ResetOnDrop(&self.tx_start);
+        self.tx_floor.set(Some(scratch_pos));
+        let _reset_tx_floor = ResetOnDrop(&self.tx_floor);
         // the copy is the transaction's root, so it stays writable after freezing
         if let Some(mut active) = self.transaction.get() {
             active.root_position = Some(scratch_pos);
@@ -823,8 +657,9 @@ impl<C: Core> Database<C> {
             self.transaction.set(Some(active));
         }
 
-        // the transaction works on a copy of the root slot
-        self.write_slot_at(scratch_pos, root)?;
+        // the transaction works on a copy of the root slot, appended.
+        // verified in commit_store.rs
+        let scratch_pos = crate::commit_store::begin_transaction(&mut DbStore::new(self), root)?;
         let mut root_ptr = SlotPointer::new(Some(scratch_pos), root);
 
         // every collection expects its init part to copy its header or root
@@ -836,9 +671,15 @@ impl<C: Core> Database<C> {
 
         let mut result = self.read_slot_pointer(write_mode, path, path_i, root_ptr, frozen_at, ctx)?;
 
-        // the copy now holds the new root, so commit it
-        let next_root = self.read_slot_at(scratch_pos)?;
-        self.commit_root(next_root, random_u64()?)?;
+        // the copy now holds the new root, so commit it. verified in
+        // commit_store.rs
+        let commit_id = random_u64()?;
+        let next_root = crate::commit_store::finish_transaction(
+            &mut DbStore::new(self),
+            scratch_pos,
+            commit_id,
+            self.header.get().file_id,
+        )?;
 
         // a path that ends at the root (such as an init or a write) returns
         // a root cursor, so it can be used for later transactions
@@ -871,39 +712,10 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let array_list_start = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let start = self.len()?;
-                        let header = ArrayListHeader {
-                            ptr: start + ARRAY_LIST_HEADER_LENGTH as i64,
-                            size: 0,
-                        };
-                        self.write_at(start, &header.to_bytes())?;
-                        self.write_bytes(&[0u8; INDEX_BLOCK_SIZE])?;
-                        start
-                    }
-                    Tag::ArrayList => {
-                        let mut start = slot_ptr.slot.value;
-                        // copy it to the end unless it was made in this transaction
-                        if self.is_old(start, frozen_at)? {
-                            let header = self.read_array_list_header(start)?;
-                            let mut block = [0u8; INDEX_BLOCK_SIZE];
-                            self.read_at(header.ptr, &mut block)?;
-                            let new_start = self.len()?;
-                            let header = ArrayListHeader {
-                                ptr: new_start + ARRAY_LIST_HEADER_LENGTH as i64,
-                                size: header.size,
-                            };
-                            self.write_at(new_start, &header.to_bytes())?;
-                            self.write_bytes(&block)?;
-                            start = new_start;
-                        }
-                        start
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(array_list_start, Tag::ArrayList));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -935,8 +747,10 @@ impl<C: Core> Database<C> {
                 let start = slot_ptr.slot.value;
                 let orig_header = self.read_array_list_header(start)?;
                 let (header, appended) = self.read_array_list_slot_append(orig_header, write_mode, frozen_at)?;
-                // update the header before callbacks can freeze it
-                self.write_at(start, &header.to_bytes())?;
+                // update the header before callbacks can freeze it. verified
+                // in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_array_list_header(&mut DbStore::new(self), start, header, limit)?;
                 // the appended moment becomes the transaction's root, so it
                 // stays writable after freezing. the top-level history is the
                 // list held by the copy of the root slot.
@@ -960,8 +774,10 @@ impl<C: Core> Database<C> {
                 let start = slot_ptr.slot.value;
                 let orig_header = self.read_array_list_header(start)?;
                 let slice_header = self.read_array_list_slice(orig_header, size, frozen_at)?;
-                // update the header before callbacks can freeze it
-                self.write_at(start, &slice_header.to_bytes())?;
+                // update the header before callbacks can freeze it. verified
+                // in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_array_list_header(&mut DbStore::new(self), start, slice_header, limit)?;
                 next(slot_ptr, ctx)
             }
 
@@ -970,23 +786,10 @@ impl<C: Core> Database<C> {
                     return Err(Error::WriteNotAllowed);
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let header_ptr = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        // create an empty tree: a single empty leaf plus a header
-                        let root_ptr = self.write_btree_node(&BTreeNode::empty(BTreeNodeKind::Leaf, 0))?;
-                        self.append(&BTreeHeader { root_ptr, size: 0 }.to_bytes())?
-                    }
-                    Tag::LinkedArrayList => {
-                        // copy the header into this transaction unless it was made
-                        // in it, so past moments still pointing at the old header
-                        // are unaffected. b-tree nodes are copied on write, so
-                        // only the header needs copying.
-                        self.copy_header_if_old(slot_ptr.slot.value, frozen_at)?
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(header_ptr, Tag::LinkedArrayList));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::linked_array_list_init(&mut DbStore::new(self), position, slot_ptr.slot, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -1009,43 +812,31 @@ impl<C: Core> Database<C> {
                     return next(final_slot_ptr, ctx);
                 }
 
-                // path-copy down to the value slot so the write is persistent
-                let write_slot = self.btree_get_for_write(header.root_ptr, rank, frozen_at)?;
-                // update the header before callbacks can freeze it
-                if write_slot.node_ptr != header.root_ptr {
-                    let new_header = BTreeHeader { root_ptr: write_slot.node_ptr, size: header.size };
-                    self.write_at(header_ptr, &new_header.to_bytes())?;
-                }
-                next(SlotPointer::new(Some(write_slot.value_position), write_slot.slot), ctx)
+// path-copy down to the value slot so the write is persistent,
+                // updating the header before callbacks can freeze it.
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let slot_ptr =
+                    crate::path_store::linked_get_for_write(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListAppend => {
-                let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
-                let _ = slot_ptr;
-                let result = self.btree_insert(header.root_ptr, header.size, frozen_at)?;
-                let new_root_ptr = self.btree_make_root(result.join)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size + 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
-                // fill in the value via the rest of the path
-                next(SlotPointer::new(Some(result.value_position), Slot::default()), ctx)
+                let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
+                // the header is updated before the value is filled in via the
+                // rest of the path. verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let slot_ptr =
+                    crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, header.size, limit, copy_at)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListSlice { offset, size } => {
                 let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
-                // bounds-checked without overflow (offset + size could wrap)
-                if offset < 0 || size < 0 || offset > header.size || size > header.size - offset {
-                    return Err(Error::KeyNotFound);
-                }
-                // slice = drop [0, offset) then keep [0, size) of what's left
-                let after_offset = self.btree_split(header.root_ptr, offset)?;
-                let sliced = self.btree_split(after_offset.1, size)?;
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: sliced.0, size }.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::linked_slice(&mut DbStore::new(self), header_ptr, header, offset, size, limit)?;
                 next(slot_ptr, ctx)
             }
 
@@ -1064,48 +855,29 @@ impl<C: Core> Database<C> {
                 // instead of overwriting a node that is still referenced
                 // elsewhere.
                 self.tx_start.set(Some(self.len()?));
-                let new_root_ptr = self.btree_join(header_a.root_ptr, header_b.root_ptr)?;
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header_a.size + header_b.size };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::linked_concat(&mut DbStore::new(self), header_ptr, header_a, header_b, limit)?;
                 next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListInsert(index) => {
                 let (_, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
-                let result = self.btree_insert(header.root_ptr, rank, frozen_at)?;
-                let new_root_ptr = self.btree_make_root(result.join)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size + 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
-                next(SlotPointer::new(Some(result.value_position), Slot::default()), ctx)
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let slot_ptr = crate::path_store::linked_insert(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
+                next(slot_ptr, ctx)
             }
 
             PathPart::LinkedArrayListRemove(index) => {
                 let (slot_ptr, header_ptr, header) = self.linked_array_list_for_write(write_mode, slot_ptr, frozen_at)?;
                 let rank = resolve_index(index, header.size)?;
-                let new_root_ptr = if header.size == 1 {
-                    self.btree_new_root()?
-                } else {
-                    let mut root = self.btree_remove(header.root_ptr, rank, frozen_at)?;
-                    let mut new_root_ptr = self.btree_write_node(&root, header.root_ptr, frozen_at)?;
-                    // a root left with one child is replaced by it
-                    while root.kind == BTreeNodeKind::Branch && root.num == 1 {
-                        new_root_ptr = root.children[0].value;
-                        root = self.read_btree_node(new_root_ptr)?;
-                    }
-                    new_root_ptr
-                };
-                // update the header before recursing into the rest of the
-                // path, so that a failure there leaves the tree and header
-                // consistent
-                let new_header = BTreeHeader { root_ptr: new_root_ptr, size: header.size - 1 };
-                self.write_at(header_ptr, &new_header.to_bytes())?;
+                // the header is updated before recursing into the rest of the
+                // path. verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                crate::path_store::linked_remove(&mut DbStore::new(self), header_ptr, header, rank, limit, copy_at)?;
                 next(slot_ptr, ctx)
             }
 
@@ -1115,35 +887,10 @@ impl<C: Core> Database<C> {
                 }
                 let tag = hash_map_tag(counted, set);
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-                let map_start = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let map_start = self.len()?;
-                        self.seek(map_start)?;
-                        if counted {
-                            self.write_bytes(&0i64.to_be_bytes())?;
-                        }
-                        self.write_bytes(&[0u8; INDEX_BLOCK_SIZE])?;
-                        map_start
-                    }
-                    Tag::HashMap | Tag::HashSet | Tag::CountedHashMap | Tag::CountedHashSet => {
-                        let is_counted = matches!(slot_ptr.slot.tag, Tag::CountedHashMap | Tag::CountedHashSet);
-                        if counted != is_counted {
-                            return Err(Error::UnexpectedTag);
-                        }
-                        let mut map_start = slot_ptr.slot.value;
-                        // copy it to the end unless it was made in this transaction
-                        if self.is_old(map_start, frozen_at)? {
-                            let len = INDEX_BLOCK_SIZE + if counted { 8 } else { 0 };
-                            let mut buf = vec![0u8; len];
-                            self.read_at(map_start, &mut buf)?;
-                            map_start = self.append(&buf)?;
-                        }
-                        map_start
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(map_start, tag));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::hash_map_init(&mut DbStore::new(self), position, slot_ptr.slot, counted, tag, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -1160,12 +907,13 @@ impl<C: Core> Database<C> {
                 if write_mode == ReadWrite {
                     slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::HashMapInit { counted, set }, frozen_at)?;
                 }
-                let index_pos = slot_ptr.slot.value + if counted { 8 } else { 0 };
+                let index_pos = crate::path_store::map_index_pos(slot_ptr.slot.value, counted)?;
                 let hash = self.check_hash(target.hash())?;
                 let res = self.read_map_slot(index_pos, hash, 0, write_mode, target, frozen_at)?;
                 if write_mode == ReadWrite && counted && res.is_empty {
-                    let count = self.read_i64_at(slot_ptr.slot.value)?;
-                    self.write_i64_at(slot_ptr.slot.value, count.wrapping_add(1))?;
+                    // verified in path_store.rs
+                    let limit = self.write_limit(frozen_at)?;
+                    crate::path_store::update_map_count(&mut DbStore::new(self), slot_ptr.slot.value, true, limit)?;
                 }
                 next(res.slot_ptr, ctx)
             }
@@ -1183,7 +931,7 @@ impl<C: Core> Database<C> {
                     _ => return Err(Error::UnexpectedTag),
                 };
                 let slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::HashMapInit { counted, set }, frozen_at)?;
-                let index_pos = slot_ptr.slot.value + if counted { 8 } else { 0 };
+                let index_pos = crate::path_store::map_index_pos(slot_ptr.slot.value, counted)?;
                 let hash = self.check_hash(hash)?;
                 let key_found = match self.remove_map_slot(index_pos, hash, 0, frozen_at) {
                     Ok(_) => true,
@@ -1194,8 +942,9 @@ impl<C: Core> Database<C> {
                     return Err(Error::KeyNotFound);
                 }
                 if counted {
-                    let count = self.read_i64_at(slot_ptr.slot.value)?;
-                    self.write_i64_at(slot_ptr.slot.value, count.wrapping_sub(1))?;
+                    // verified in path_store.rs
+                    let limit = self.write_limit(frozen_at)?;
+                    crate::path_store::update_map_count(&mut DbStore::new(self), slot_ptr.slot.value, false, limit)?;
                 }
                 Ok(slot_ptr)
             }
@@ -1206,22 +955,10 @@ impl<C: Core> Database<C> {
                 }
                 let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
                 let tag = sorted_map_tag(set);
-                let header_ptr = match slot_ptr.slot.tag {
-                    Tag::None => {
-                        let root_ptr = self.write_sorted_node(&SortedNode::empty(BTreeNodeKind::Leaf, 0))?;
-                        self.append(&BTreeHeader { root_ptr, size: 0 }.to_bytes())?
-                    }
-                    Tag::SortedMap | Tag::SortedSet => {
-                        if slot_ptr.slot.tag != tag {
-                            return Err(Error::UnexpectedTag);
-                        }
-                        // copy the header into this transaction unless it was made in it
-                        self.copy_header_if_old(slot_ptr.slot.value, frozen_at)?
-                    }
-                    _ => return Err(Error::UnexpectedTag),
-                };
-                let next_slot_ptr = SlotPointer::new(Some(position), Slot::new(header_ptr, tag));
-                self.write_slot_at(position, next_slot_ptr.slot)?;
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let next_slot_ptr =
+                    crate::path_store::sorted_map_init(&mut DbStore::new(self), position, slot_ptr.slot, tag, limit, copy_at)?;
                 next(next_slot_ptr, ctx)
             }
 
@@ -1246,15 +983,20 @@ impl<C: Core> Database<C> {
                     return next(target_slot, ctx);
                 }
 
-                let result = self.sorted_put(header.root_ptr, key, frozen_at)?;
-                let new_root_ptr = self.sorted_grow_root(&result)?;
-                // update the header before filling in the value, so that a
-                // failure in the rest of the path leaves the tree and header
-                // consistent (the entry exists with an empty value) rather
-                // than inserted-but-uncounted
-                let size = header.size + i64::from(result.added);
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: new_root_ptr, size }.to_bytes())?;
-                let target_slot = self.sorted_target_slot(result.kv_slot, target)?;
+                // the entry for the key, inserted if new, with the header
+                // updated before the value is filled in. verified in
+                // path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                let kv_slot = crate::path_store::sorted_get_for_write(
+                    &mut DbStore::new(self),
+                    header_ptr,
+                    header,
+                    key,
+                    limit,
+                    copy_at,
+                    self.hash_size(),
+                )?;
+                let target_slot = self.sorted_target_slot(kv_slot, target)?;
                 next(target_slot, ctx)
             }
 
@@ -1287,11 +1029,9 @@ impl<C: Core> Database<C> {
                 let slot_ptr = self.copy_collection_if_frozen(slot_ptr, PathPart::SortedMapInit { set }, frozen_at)?;
                 let header_ptr = slot_ptr.slot.value;
                 let header = self.read_btree_header(header_ptr)?;
-                let (node_ptr, found) = self.sorted_remove(header.root_ptr, key, frozen_at)?;
-                if !found {
-                    return Err(Error::KeyNotFound);
-                }
-                self.write_at(header_ptr, &BTreeHeader { root_ptr: node_ptr, size: header.size - 1 }.to_bytes())?;
+                // verified in path_store.rs
+                let (limit, copy_at) = self.write_bounds(frozen_at)?;
+                crate::path_store::sorted_remove_key(&mut DbStore::new(self), header_ptr, header, key, limit, copy_at, self.hash_size())?;
                 Ok(slot_ptr)
             }
 
@@ -1311,7 +1051,9 @@ impl<C: Core> Database<C> {
                         writer.slot
                     }
                 };
-                self.write_slot_at(position, slot)?;
+                // verified in path_store.rs
+                let limit = self.write_limit(frozen_at)?;
+                crate::path_store::write_data_slot(&mut DbStore::new(self), position, slot, limit)?;
                 next(SlotPointer::new(slot_ptr.position, slot), ctx)
             }
         }
@@ -1338,207 +1080,81 @@ impl<C: Core> Database<C> {
     }
 
     // copies a b-tree header to the end unless it was made in this transaction
-    fn copy_header_if_old(&self, header_ptr: i64, frozen_at: i64) -> Result<i64> {
-        if !self.is_old(header_ptr, frozen_at)? {
-            return Ok(header_ptr);
-        }
-        let mut buf = [0u8; BTREE_HEADER_LENGTH];
-        self.read_at(header_ptr, &mut buf)?;
-        self.append(&buf)
+    // the bounds of a write: nothing before the transaction's start may
+    // change (the verified guarantee), and what a path reaches before
+    // max(tx_start, frozen_at) is copied rather than changed in place. a
+    // collection's own header or root block, once in the transaction, is
+    // still written in place after a freeze. writes only happen inside a
+    // transaction.
+    fn write_bounds(&self, frozen_at: i64) -> Result<(i64, i64)> {
+        self.tx_bounds(frozen_at).ok_or(Error::ExpectedTxStart)
+    }
+
+    fn tx_bounds(&self, frozen_at: i64) -> Option<(i64, i64)> {
+        Some((self.tx_floor.get()?, self.tx_start.get()?.max(frozen_at)))
+    }
+
+    // the bound below which nothing changes: the transaction's start
+    fn write_limit(&self, frozen_at: i64) -> Result<i64> {
+        Ok(self.write_bounds(frozen_at)?.0)
     }
 
     // hash map
 
+    // verified in map_store.rs
     fn read_map_slot(
         &self,
         index_pos: i64,
         key_hash: &[u8],
-        key_offset: u8,
+        key_offset: usize,
         write_mode: WriteMode,
         target: HashMapGetTarget<'_>,
         frozen_at: i64,
     ) -> Result<HashMapGetResult> {
-        let max_offset = self.hash_size() * 8 / BIT_COUNT as usize;
-        if key_offset as usize > max_offset {
-            return Err(Error::KeyOffsetExceeded);
-        }
-
-        let i = hash_nibble(key_hash, key_offset);
-        let slot_pos = index_pos + (SLOT_LENGTH * i) as i64;
-        let slot = self.read_slot_at(slot_pos)?;
-        let ptr = slot.value;
-
-        // the slot pointer that the target asks for, given the entry's
-        // slot and where its kv pair is
-        let target_slot_ptr = |slot: Slot, kv_pos: i64, kv: &KeyValuePair| {
-            let key_slot_pos = kv_pos + self.hash_size() as i64;
-            let value_slot_pos = key_slot_pos + SLOT_LENGTH as i64;
-            match target {
-                HashMapGetTarget::KvPair(_) => SlotPointer::new(Some(slot_pos), slot),
-                HashMapGetTarget::Key(_) => SlotPointer::new(Some(key_slot_pos), kv.key_slot),
-                HashMapGetTarget::Value(_) => SlotPointer::new(Some(value_slot_pos), kv.value_slot),
-            }
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        let target = match target {
+            HashMapGetTarget::KvPair(_) => MapTarget::KvPair,
+            HashMapGetTarget::Key(_) => MapTarget::Key,
+            HashMapGetTarget::Value(_) => MapTarget::Value,
         };
-
-        match slot.tag {
-            Tag::None => match write_mode {
-                WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                WriteMode::ReadWrite => {
-                    // write hash and key/val slots
-                    let kv = KeyValuePair {
-                        value_slot: Slot::default(),
-                        key_slot: Slot::default(),
-                        hash: key_hash.to_vec(),
-                    };
-                    let hash_pos = self.append(&kv.to_bytes())?;
-                    // point slot to hash pos
-                    let next_slot = Slot::new(hash_pos, Tag::KvPair);
-                    self.write_slot_at(slot_pos, next_slot)?;
-                    Ok(HashMapGetResult { slot_ptr: target_slot_ptr(next_slot, hash_pos, &kv), is_empty: true })
-                }
-            },
-
-            Tag::Index => {
-                let mut next_ptr = ptr;
-                if write_mode == WriteMode::ReadWrite {
-                    next_ptr = self.copy_index_block_if_old(ptr, frozen_at)?;
-                    if next_ptr != ptr {
-                        // make slot point to the copied block
-                        self.write_slot_at(slot_pos, Slot::new(next_ptr, Tag::Index))?;
-                    }
-                }
-                self.read_map_slot(next_ptr, key_hash, key_offset + 1, write_mode, target, frozen_at)
-            }
-
-            Tag::KvPair => {
-                let mut buf = vec![0u8; key_value_pair_length(self.hash_size())];
-                self.read_at(ptr, &mut buf)?;
-                let kv = KeyValuePair::from_bytes(&buf, self.hash_size())?;
-
-                if kv.hash == key_hash {
-                    if write_mode == WriteMode::ReadWrite && self.is_old(ptr, frozen_at)? {
-                        let hash_pos = self.append(&kv.to_bytes())?;
-                        let next_slot = Slot::new(hash_pos, Tag::KvPair);
-                        self.write_slot_at(slot_pos, next_slot)?;
-                        return Ok(HashMapGetResult {
-                            slot_ptr: target_slot_ptr(next_slot, hash_pos, &kv),
-                            is_empty: false,
-                        });
-                    }
-                    return Ok(HashMapGetResult { slot_ptr: target_slot_ptr(slot, ptr, &kv), is_empty: false });
-                }
-
-                // hash collision - different keys
-                match write_mode {
-                    WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                    WriteMode::ReadWrite => {
-                        if key_offset as usize + 1 >= max_offset {
-                            return Err(Error::KeyOffsetExceeded);
-                        }
-                        let next_i = hash_nibble(&kv.hash, key_offset + 1);
-                        let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-                        self.write_slot_at(next_index_pos + (SLOT_LENGTH * next_i) as i64, slot)?;
-                        let res = self.read_map_slot(next_index_pos, key_hash, key_offset + 1, write_mode, target, frozen_at)?;
-                        self.write_slot_at(slot_pos, Slot::new(next_index_pos, Tag::Index))?;
-                        Ok(res)
-                    }
-                }
-            }
-
-            _ => Err(Error::UnexpectedTag),
-        }
+        let write = write_mode == WriteMode::ReadWrite;
+        let res = crate::map_store::read_map_slot_checked(
+            &mut DbStore::new(self),
+            index_pos,
+            key_hash,
+            key_offset,
+            write,
+            target,
+            limit,
+            copy_at,
+            self.hash_size(),
+        )?;
+        Ok(HashMapGetResult { slot_ptr: res.slot_ptr, is_empty: res.is_empty })
     }
 
-    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: u8, frozen_at: i64) -> Result<Slot> {
-        if key_offset as usize > self.hash_size() * 8 / BIT_COUNT as usize {
-            return Err(Error::KeyOffsetExceeded);
-        }
-
-        // read block
-        let mut slot_block = self.read_index_block(index_pos)?;
-        let i = hash_nibble(key_hash, key_offset);
-        let slot_pos = index_pos + (SLOT_LENGTH * i) as i64;
-        let slot = slot_block[i];
-
-        let next_slot = match slot.tag {
-            Tag::None => return Err(Error::KeyNotFound),
-            Tag::Index => self.remove_map_slot(slot.value, key_hash, key_offset + 1, frozen_at)?,
-            Tag::KvPair => {
-                let mut buf = vec![0u8; key_value_pair_length(self.hash_size())];
-                self.read_at(slot.value, &mut buf)?;
-                let kv = KeyValuePair::from_bytes(&buf, self.hash_size())?;
-                if kv.hash != key_hash {
-                    return Err(Error::KeyNotFound);
-                }
-                Slot::default()
-            }
-            _ => return Err(Error::UnexpectedTag),
-        };
-
-        // if we're the root node, just write the new slot and finish
-        if key_offset == 0 {
-            self.write_slot_at(slot_pos, next_slot)?;
-            return Ok(Slot::new(index_pos, Tag::Index));
-        }
-
-        // get slot to return if there is only one used slot in this index block
-        slot_block[i] = next_slot;
-        let mut slot_to_return = Some(Slot::default());
-        for block_slot in slot_block {
-            if block_slot.tag == Tag::None {
-                continue;
-            }
-            if let Some(existing) = slot_to_return
-                && existing.tag != Tag::None
-            {
-                slot_to_return = None;
-                break;
-            }
-            slot_to_return = Some(block_slot);
-        }
-        if let Some(slot_to_return) = slot_to_return
-            && matches!(slot_to_return.tag, Tag::None | Tag::KvPair)
-        {
-            return Ok(slot_to_return);
-        }
-
-        // there was more than one used slot, or a single INDEX slot,
-        // so we must keep this index block. update the slot in it,
-        // copying the block first unless it belongs to this transaction.
-        let next_index_pos = self.copy_index_block_if_old(index_pos, frozen_at)?;
-        self.write_slot_at(next_index_pos + (SLOT_LENGTH * i) as i64, next_slot)?;
-        Ok(Slot::new(next_index_pos, Tag::Index))
+    // verified in map_store.rs
+    fn remove_map_slot(&self, index_pos: i64, key_hash: &[u8], key_offset: usize, frozen_at: i64) -> Result<Slot> {
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::map_store::remove_map_slot_checked(&mut DbStore::new(self), index_pos, key_hash, key_offset, limit, copy_at, self.hash_size())
     }
 
     // array list
 
+    // verified in array_list_store.rs
     fn read_array_list_slot_append(
         &self,
         header: ArrayListHeader,
-        write_mode: WriteMode,
+        _write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<(ArrayListHeader, SlotPointer)> {
-        let mut index_pos = header.ptr;
-        let key = header.size;
-
-        let prev_shift = array_list_shift(key - 1);
-        let next_shift = array_list_shift(key);
-
-        if prev_shift != next_shift {
-            // root overflow
-            let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-            self.write_slot_at(next_index_pos, Slot::new(index_pos, Tag::Index))?;
-            index_pos = next_index_pos;
-        }
-
-        let slot_ptr = self.read_array_list_slot(index_pos, key, next_shift, write_mode, frozen_at)?;
-        // clear values left by a rollback or slice
-        let slot_ptr = slot_ptr.with_slot(Slot::default());
-        let position = slot_ptr.position.ok_or(Error::CursorNotWriteable)?;
-        self.write_slot_at(position, slot_ptr.slot)?;
-        Ok((ArrayListHeader { ptr: index_pos, size: header.size + 1 }, slot_ptr))
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::array_list_store::read_array_list_slot_append(&mut DbStore::new(self), header, limit, copy_at)
     }
 
+    // verified in array_list_store.rs
     fn read_array_list_slot(
         &self,
         index_pos: i64,
@@ -1547,64 +1163,16 @@ impl<C: Core> Database<C> {
         write_mode: WriteMode,
         frozen_at: i64,
     ) -> Result<SlotPointer> {
-        if shift >= MAX_BRANCH_LENGTH {
-            return Err(Error::MaxShiftExceeded);
-        }
-
-        let i = (key >> (shift as u32 * BIT_COUNT)) & MASK;
-        let slot_pos = index_pos + SLOT_LENGTH as i64 * i;
-        let slot = self.read_slot_at(slot_pos)?;
-
-        if shift == 0 {
-            return Ok(SlotPointer::new(Some(slot_pos), slot));
-        }
-
-        match slot.tag {
-            Tag::None => match write_mode {
-                WriteMode::ReadOnly => Err(Error::KeyNotFound),
-                WriteMode::ReadWrite => {
-                    let next_index_pos = self.append(&[0u8; INDEX_BLOCK_SIZE])?;
-                    self.write_slot_at(slot_pos, Slot::new(next_index_pos, Tag::Index))?;
-                    self.read_array_list_slot(next_index_pos, key, shift - 1, write_mode, frozen_at)
-                }
-            },
-            Tag::Index => {
-                let ptr = slot.value;
-                let mut next_ptr = ptr;
-                if write_mode == WriteMode::ReadWrite {
-                    next_ptr = self.copy_index_block_if_old(ptr, frozen_at)?;
-                    if next_ptr != ptr {
-                        // make slot point to the copied block
-                        self.write_slot_at(slot_pos, Slot::new(next_ptr, Tag::Index))?;
-                    }
-                }
-                self.read_array_list_slot(next_ptr, key, shift - 1, write_mode, frozen_at)
-            }
-            _ => Err(Error::UnexpectedTag),
-        }
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        let write = write_mode == WriteMode::ReadWrite;
+        crate::array_list_store::read_array_list_slot_checked(&mut DbStore::new(self), index_pos, key, shift, write, limit, copy_at)
     }
 
+    // verified in array_list_store.rs
     fn read_array_list_slice(&self, header: ArrayListHeader, size: i64, frozen_at: i64) -> Result<ArrayListHeader> {
-        if size > header.size || size < 0 {
-            return Err(Error::KeyNotFound);
-        }
-
-        let prev_shift = array_list_shift(header.size - 1);
-        let next_shift = array_list_shift(size - 1);
-
-        if prev_shift == next_shift {
-            return Ok(ArrayListHeader { ptr: header.ptr, size });
-        }
-
-        let mut shift = prev_shift;
-        let mut index_pos = header.ptr;
-        while shift > next_shift {
-            index_pos = self.read_slot_at(index_pos)?.value;
-            shift -= 1;
-        }
-        // the new root may still belong to a past moment. unlike child
-        // nodes, root nodes are written directly, so copy it now.
-        let index_pos = self.copy_index_block_if_old(index_pos, frozen_at)?;
-        Ok(ArrayListHeader { ptr: index_pos, size })
+        let bounds = self.tx_bounds(frozen_at);
+        let (limit, copy_at) = (bounds.map(|b| b.0), bounds.map_or(0, |b| b.1));
+        crate::array_list_store::read_array_list_slice(&mut DbStore::new(self), header, size, limit, copy_at)
     }
 }

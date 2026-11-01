@@ -53,29 +53,45 @@ struct ReadmeDoctests;
 
 mod btree;
 mod bulk;
+mod btree_io;
+mod btree_join;
 mod collections;
+mod commit_store;
 mod compact;
+mod compact_store;
 mod core;
+mod arith;
+mod array_list_store;
+mod bytes;
 mod crc64;
 mod cursor;
+mod cursor_store;
 mod data;
 mod database;
 mod error;
 mod file_offset_map;
 mod format;
+mod map_store;
 mod hasher;
 mod history;
 mod index;
 mod migrate;
+mod iter_store;
 mod path;
 mod record;
 #[cfg(feature = "serde")]
 mod replica_serde;
+mod path_store;
 mod slot;
+mod snapshot;
+mod store;
+#[cfg(test)]
+mod termination_tests;
 mod sorted;
 #[cfg(feature = "serde")]
 mod structured;
 mod typed;
+mod sorted_store;
 
 pub use crate::collections::{KeyIterator, KvPairIterator};
 pub use crate::collections::{

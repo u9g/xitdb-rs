@@ -108,3 +108,82 @@ fn corrupt_btree_size_is_an_error() -> Result<()> {
     assert!(matches!(list.iter_from(100), Err(Error::InvalidBTreeNode)));
     Ok(())
 }
+
+/// A negative subtree count can only come from a corrupt file. It used to
+/// overflow the rank arithmetic when descending the tree (a panic in debug
+/// builds); now reading the node fails.
+#[test]
+fn linked_array_list_rejects_negative_counts() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    db.run_context(|cursor| {
+        let mut list = WriteLinkedArrayList::new(cursor)?;
+        for i in 0..40u64 {
+            list.append(i)?;
+        }
+        Ok(())
+    })?;
+    let mut bytes = db.into_core().into_bytes();
+    // the root slot points at the list's header, which points at its root node
+    let header_pos = i64::from_be_bytes(bytes[21..29].try_into().unwrap()) as usize;
+    let root_ptr = i64::from_be_bytes(bytes[header_pos + 8..header_pos + 16].try_into().unwrap()) as usize;
+    assert_eq!(bytes[root_ptr], 1, "the root is a branch");
+    let counts = root_ptr + 2 + 9 * 16;
+    bytes[counts..counts + 8].copy_from_slice(&i64::MIN.to_be_bytes());
+
+    let db = Database::new(CoreMemory::from_bytes(bytes), Hasher::sha1())?;
+    let list = ReadLinkedArrayList::new(db.root_cursor())?;
+    assert!(matches!(list.get_cursor(30), Err(Error::InvalidBTreeNode)));
+    Ok(())
+}
+
+/// Hashes longer than 127 bytes have more than 255 nibbles, so the offset
+/// into the hash that the hash map walks must not be a `u8`: two keys whose
+/// hashes differ only in their most significant byte overflowed it, which
+/// panicked in debug builds and recursed forever in release builds.
+#[test]
+fn hash_map_with_long_hashes() -> Result<()> {
+    let hasher = Hasher::new(|data: &[u8]| {
+        let mut hash = vec![0u8; 129];
+        hash[0] = data.first().copied().unwrap_or(0);
+        hash
+    });
+    let db = Database::new(CoreMemory::new(), hasher)?;
+    db.run_context(|cursor| {
+        let mut map = WriteHashMap::new(cursor)?;
+        map.put("a", "1")?;
+        map.put("b", "2")?;
+        Ok(())
+    })?;
+    let map = ReadHashMap::new(db.root_cursor())?;
+    assert_eq!(map.get_cursor("a")?.unwrap().read_bytes(None)?, b"1");
+    assert_eq!(map.get_cursor("b")?.unwrap().read_bytes(None)?, b"2");
+    assert!(map.get_cursor("c")?.is_none());
+    Ok(())
+}
+
+/// Changing a list reached through a copied hash map, without its init
+/// part, must copy the list rather than change the previous moment's.
+#[test]
+fn remove_without_init_keeps_old_moment() -> Result<()> {
+    let db = Database::new(CoreMemory::new(), Hasher::sha1())?;
+    let mut root = db.root_cursor();
+    let key = db.digest(b"list");
+    let kv = PathPart::HashMapGet(HashMapGetTarget::Value(&key));
+    let map = PathPart::HashMapInit { counted: false, set: false };
+    let list = PathPart::LinkedArrayListInit;
+    let append = PathPart::LinkedArrayListAppend;
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListAppend, map, kv, list, append, PathPart::WriteData(&Data::Uint(1))])?;
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListGet(-1), map, kv, list, append, PathPart::WriteData(&Data::Uint(2))])?;
+    fn count(db: &Database<CoreMemory>, kv: PathPart, i: i64) -> Result<i64> {
+        let c = db.root_cursor().read_path(&[PathPart::ArrayListGet(i), kv])?.unwrap();
+        Ok(ReadLinkedArrayList::new(c)?.count()?)
+    }
+    assert_eq!(count(&db, kv, 0)?, 2);
+    let last = Data::from(root.read_path_slot(&[PathPart::ArrayListGet(-1)])?);
+    // a new moment copies the map, then removes from its list without
+    // initializing it
+    root.write_path(&[PathPart::ArrayListInit, PathPart::ArrayListAppend, PathPart::WriteData(&last), map, kv, PathPart::LinkedArrayListRemove(0)])?;
+    assert_eq!(count(&db, kv, 0)?, 2);
+    assert_eq!(count(&db, kv, 1)?, 1);
+    Ok(())
+}
