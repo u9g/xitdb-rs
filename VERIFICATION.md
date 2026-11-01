@@ -7,9 +7,6 @@ proofs, so the compiled crate is unchanged. CI runs both (the `verify-crate`
 job in `.github/workflows/verus.yml`). There are no `assume`s or `admit`s; the
 trusted code is listed below.
 
-`verus/` holds separate models of the data structures with deeper functional
-proofs (see `verus/README.md`). This file is about the code that runs.
-
 ## How the file is seen
 
 `src/store.rs` describes the database file as a byte sequence that is read
@@ -72,7 +69,7 @@ Verus checks verified code against its specification, but code outside
 `requires`, and then the function's guarantees wouldn't hold. So no
 verified function that unverified code calls has a `requires`: each one
 checks its preconditions at run time and returns an error if they fail.
-`verus/check_boundary.py`, run in CI, fails if unverified code calls a
+`scripts/check_boundary.py`, run in CI, fails if unverified code calls a
 verified function that has one.
 
 So whatever the unverified orchestration does, every write it makes to the

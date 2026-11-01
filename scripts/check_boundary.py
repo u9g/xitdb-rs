@@ -11,7 +11,7 @@ Functions are matched by name: `Type::f(` against methods of `Type`,
 known, so this errs on the side of failing), and `f(` against free
 functions. Test modules (`*_tests.rs`) are skipped.
 
-Run from the repository root: python verus/check_boundary.py
+Run from the repository root: python scripts/check_boundary.py
 """
 
 import pathlib

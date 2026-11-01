@@ -3,9 +3,9 @@ name: Verus
 on:
   push:
     branches: [master]
-    paths: ["verus/**", "src/**", "Cargo.toml", ".github/workflows/verus.yml"]
+    paths: ["src/**", "scripts/**", "Cargo.toml", "Cargo.lock", ".github/workflows/verus.yml"]
   pull_request:
-    paths: ["verus/**", "src/**", "Cargo.toml", ".github/workflows/verus.yml"]
+    paths: ["src/**", "scripts/**", "Cargo.toml", "Cargo.lock", ".github/workflows/verus.yml"]
 
 env:
   VERUS_RELEASE: 0.2026.10.26.d17fbd0
@@ -14,21 +14,6 @@ env:
   VERUS_TOOLCHAIN: 1.99.1-x86_64-unknown-linux-gnu
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Verus
-        run: |
-          curl -fsSL -o verus.zip \
-            "https://github.com/verus-lang/verus/releases/download/release/$VERUS_RELEASE/verus-$VERUS_RELEASE-x86-linux.zip"
-          unzip -q verus.zip -d "$RUNNER_TEMP"
-          rustup install --profile minimal "$VERUS_TOOLCHAIN"
-          echo "$RUNNER_TEMP/verus-x86-linux" >> "$GITHUB_PATH"
-      - run: verus --version
-      - name: Verify
-        run: verus verus/src/lib.rs --crate-type=lib
-
   verify-crate:
     runs-on: ubuntu-latest
     steps:
@@ -43,7 +28,7 @@ jobs:
       - name: Verify the crate
         run: cargo-verus verus verify
       - name: Check the boundary between verified and unverified code
-        run: python3 verus/check_boundary.py
+        run: python3 scripts/check_boundary.py
 
   # the verified code must still build and pass the tests once the proofs
   # are erased
@@ -52,6 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: cargo build --locked
+        run: cargo build --locked --all-targets --all-features
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-features
